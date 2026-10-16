@@ -7,18 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-handl-language = {path = "../handl-language" }
-handl-platform = {path = "../platform" }
-handl-plugin-engine-exec = {path = "../plugin-engine-exec" }
-handl-plugin-engine-typecheck = {path = "../plugin-engine-typecheck" }
-plugin-engine = { path = "../plugin-engine" }
-handl-plugin-lib-tag = { workspace = true }
-serde_json = { workspace = true }
+handl-language = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-platform = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-engine-exec = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-engine-typecheck = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+plugin-engine = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-lib-tag = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+serde_json = "1"
 
 [dev-dependencies]
-handl-plugin-engine-exec-tree-walk = {path = "../plugin-engine-exec-tree-walk" }
-handl-plugin-engine-lex-pattern = {path = "../plugin-engine-lex-pattern" }
-handl-plugin-engine-parse = {path = "../plugin-engine-parse" }
-handl-plugin-engine-parse-pratt = {path = "../plugin-engine-parse-pratt" }
-handl-plugin-module = {path = "../plugin-module" }
-handl-kit-data-canonical = { workspace = true }
+handl-plugin-engine-exec-tree-walk = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-engine-lex-pattern = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-engine-parse = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-engine-parse-pratt = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-plugin-module = { git = "https://github.com/handl-lang/platform", rev = "5df37a70d3ee6636d8250e938cd2b3c920a28550" }
+handl-kit-data-canonical = { git = "https://github.com/handl-lang/lang", rev = "4f0f2faa4f70381552491cb3f25fd6a82d819937" }
