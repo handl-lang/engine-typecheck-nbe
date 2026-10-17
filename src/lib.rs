@@ -527,11 +527,19 @@ impl NbeTypecheckEngine {
                     LangError::engine("typecheck: Tag missing 'value' field")
                 })?;
                 let val = self.eval_type_scheme_td(lang, ast, node_ref, &value, ctx, incoming)?;
+                // Mirror `handl_language::tag_value` (ADR-0055): an untagged
+                // object payload spreads and gains `__tag__`; anything else
+                // wraps under `value`. Unlike `tag_value` — which *rejects*
+                // an already-tagged payload to prevent `__tag__` forgery —
+                // a scheme tagging an existing tag value (e.g. wrapping
+                // `type.number` in a data-constructor tag) wraps it under
+                // `value` so the inner tag is preserved rather than
+                // clobbered by the outer insert.
                 let mut map = match val {
-                    Value::Object(m) => m.clone(),
-                    _ => {
+                    Value::Object(m) if !m.contains_key("__tag__") => m.clone(),
+                    other => {
                         let mut m = serde_json::Map::new();
-                        m.insert("value".to_string(), val);
+                        m.insert("value".to_string(), other);
                         m
                     }
                 };
@@ -893,6 +901,16 @@ impl NbeTypecheckEngine {
                 };
                 match ctx.lookup(name).cloned() {
                     Some(ty) => Ok(ty),
+                    // Ambient globals (`Language::globals`, globals.yaml)
+                    // are ordinary identifiers bound to *values* — e.g.
+                    // `true`/`false` are the canonical booleans, not
+                    // keywords — so a name absent from Γ but present in
+                    // the globals table synthesizes the global value's
+                    // JSON type (the same dispatch `json_type_construct`
+                    // applies to literal `value` nodes).
+                    None if lang.globals.contains_key(name) => {
+                        self.construct_json_type(&lang.globals[name], ctx)
+                    }
                     None => {
                         // Fall back to the host-function namespace: a bare
                         // name that resolves via the module chain (e.g.
@@ -1065,20 +1083,7 @@ impl NbeTypecheckEngine {
                 let inc = incoming.as_ref().ok_or_else(|| {
                     LangError::engine("typecheck: json_type_construct requires an incoming value")
                 })?;
-                let tag = match inc {
-                    Value::Number(_) => "type.number",
-                    Value::String(_) => "type.string",
-                    Value::Bool(_) => "type.bool",
-                    Value::Null => "type.null",
-                    Value::Array(_) => "type.array",
-                    Value::Object(_) => "type.object",
-                };
-                ctx.registry.construct(tag, &Value::Null).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: json_type_construct: failed to mint type value for tag '{}'",
-                        tag
-                    ))
-                })
+                self.construct_json_type(inc, ctx)
             }
             "payload_field" => {
                 // Extract a field from the current node's payload. `lit` is
@@ -4056,6 +4061,26 @@ impl NbeTypecheckEngine {
             .ok_or_else(|| {
                 LangError::engine("typecheck: construct_record: failed to mint type.record")
             })
+    }
+
+    /// Mint the type value matching a JSON value's shape — the dispatch the
+    /// `json_type_construct` judgment op applies to literal `value` nodes,
+    /// shared with `lookup`'s ambient-globals fallback.
+    fn construct_json_type(&self, v: &Value, ctx: &TypecheckContext) -> Result<Value, LangError> {
+        let tag = match v {
+            Value::Number(_) => "type.number",
+            Value::String(_) => "type.string",
+            Value::Bool(_) => "type.bool",
+            Value::Null => "type.null",
+            Value::Array(_) => "type.array",
+            Value::Object(_) => "type.object",
+        };
+        ctx.registry.construct(tag, &Value::Null).ok_or_else(|| {
+            LangError::engine(format!(
+                "typecheck: construct_json_type: failed to mint type value for tag '{}'",
+                tag
+            ))
+        })
     }
 
     // `effect_row_to_type_value` was removed by ADR-0125: it converted the

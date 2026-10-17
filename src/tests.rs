@@ -8809,20 +8809,27 @@ fn type_function_with_effects(param: Value, body: Value, effects: Value) -> Valu
 }
 
 // ---------------------------------------------------------------------------
-// 1. infer_effect_row of a Handle scheme produces a type.effects value with
-//    the right ops, attached to the resulting type.function.
+// 1. A Handle scheme evaluates its handler-eliminated body. Compile-time
+//    effect-row inference (the `infer_effect_row` → `effects` field
+//    attachment this test originally asserted) was deliberately removed:
+//    `handl_language::effects`/`infer_effect_row` were deleted when the
+//    grade slot became the kernel `dim` field (ADR-0119), `types.yaml`'s
+//    `handle` rule is a bare `synth_child(0)`, and the ADR-0125 parity
+//    oracle does no effect inference — see the `Handle` arm note in
+//    `eval_type_scheme_td`. The contract is now: eliminate handlers via
+//    `Term::eliminate_handlers`, evaluate the handler-free body, and
+//    attach NO `effects` field.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn effect_row_handle_attaches_effects_to_function_type() {
+fn effect_row_handle_evaluates_eliminated_body() {
     let engine = engine();
     let mut lang = Language::new();
     // A type rule whose scheme is a Handle. The body constructs
     // type.function{param: type.number, body: type.string}; the target is
-    // "map"; the impl is a trivial const(type.number). infer_effect_row of
-    // this scheme is {map} (the Handle target). After elimination the body
-    // is unchanged (no bare arr("map") references), so the result is
-    // type.function{...} with an attached effects field.
+    // "map"; the impl is a trivial const(type.number). After elimination
+    // the body is unchanged (no bare arr("map") references), so the result
+    // is the body's type.function — with no inferred `effects` field.
     lang.types
         .merge(TypeRuleDef::new(
             "type.handler",
@@ -8861,26 +8868,20 @@ fn effect_row_handle_attaches_effects_to_function_type() {
     ast.push(AstNode::new("handler"));
     let req = TypecheckRequest::new(ast);
     let result = engine.typecheck(&lang, &req).unwrap();
-    // The result should be type.function with param=type.number,
-    // body=type.string, and effects=type.effects{ops:["map"], rest:null}.
+    // The result is the body's type.function{param: number, body: string}
+    // and carries no `effects` field — effect-row inference was removed
+    // (ADR-0119/ADR-0125).
     assert_eq!(
         result.typ.get("__tag__").and_then(|t| t.as_str()),
         Some("type.function")
     );
     assert_eq!(result.typ.get("param"), Some(&type_number()));
     assert_eq!(result.typ.get("body"), Some(&type_string()));
-    let effects = result
-        .typ
-        .get("effects")
-        .expect("effects field should be present");
-    assert_eq!(
-        effects.get("__tag__").and_then(|t| t.as_str()),
-        Some("type.effects")
+    assert!(
+        result.typ.get("effects").is_none(),
+        "effects inference was removed; no effects field should be attached: {:?}",
+        result.typ
     );
-    let ops = effects.get("ops").and_then(|o| o.as_array()).unwrap();
-    assert_eq!(ops.len(), 1);
-    assert_eq!(ops[0], Value::from("map"));
-    assert_eq!(effects.get("rest"), Some(&Value::Null));
 }
 
 // ---------------------------------------------------------------------------
@@ -9071,30 +9072,25 @@ fn function_with_mismatched_effects_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. infer_effect_row of a nested Handle scheme (Seq of two handles) unions
-//     the targets, producing a type.effects with multiple ops.
+// 10. Nested Handle schemes eliminate all handlers and evaluate the
+//     handler-free body. This originally asserted that `infer_effect_row`
+//     unioned the targets ({log, map, serialize}) into an attached
+//     `effects` field — that inference was deliberately removed (ADR-0119/
+//     ADR-0125; see the `Handle` arm note and test 1 above), so the pinned
+//     contract is now: the Seq's final result and no `effects` field.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn effect_row_nested_handles_union_ops() {
+fn effect_row_nested_handles_evaluate_eliminated_body() {
     let engine = engine();
     let mut lang = Language::new();
-    // A type rule whose scheme is a Seq of two Handles. The first handle
-    // targets "map", the second targets "serialize". The body of each
-    // constructs type.function{param: type.number, body: type.string}.
-    // infer_effect_row of the Seq is {map, serialize}. After elimination,
-    // the Seq evaluates to the second handle's result (threaded), which is
-    // a type.function — so the effects field is attached with both ops.
-    //
-    // Actually, the Seq threads fst's result into snd. The top-level scheme
-    // is a Seq, not a Handle, so infer_effect_row is computed only on Handle
-    // nodes. To get the union, we wrap the Seq in a Handle whose body is the
-    // Seq. The outer Handle's target adds one more op. Instead, let's use a
-    // single Handle whose body is a Seq of two sub-handles.
-    //
-    // Simpler: a Handle whose body is a Seq(handle(..., "map", ...),
-    // handle(..., "serialize", ...)). The outer Handle targets "log".
-    // infer_effect_row = {log, map, serialize}.
+    // A Handle whose body is a Seq(handle(..., "map", ...),
+    // handle(..., "serialize", ...)); the outer Handle targets "log".
+    // Each handle's body constructs
+    // type.function{param: type.number, body: type.string}. Elimination
+    // rewrites the bare arr() references away, the Seq threads fst's
+    // result into snd, and the result is the last handle's type.function —
+    // with no inferred `effects` field.
     let make_fun = arr_judgment_lit(
         "construct",
         vec![
@@ -9146,42 +9142,20 @@ fn effect_row_nested_handles_union_ops() {
     ast.push(AstNode::new("nhandler"));
     let req = TypecheckRequest::new(ast);
     let result = engine.typecheck(&lang, &req).unwrap();
-    // The result should be type.function with effects containing
-    // {log, map, serialize}.
+    // The result is the Seq's final value — the last handle's
+    // type.function{param: number, body: string} — and carries no
+    // `effects` field (effect-row inference was removed, ADR-0119/0125).
     assert_eq!(
         result.typ.get("__tag__").and_then(|t| t.as_str()),
         Some("type.function")
     );
-    let effects = result
-        .typ
-        .get("effects")
-        .expect("effects field should be present");
-    assert_eq!(
-        effects.get("__tag__").and_then(|t| t.as_str()),
-        Some("type.effects")
-    );
-    let ops = effects.get("ops").and_then(|o| o.as_array()).unwrap();
-    let op_names: Vec<String> = ops
-        .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
+    assert_eq!(result.typ.get("param"), Some(&type_number()));
+    assert_eq!(result.typ.get("body"), Some(&type_string()));
     assert!(
-        op_names.contains(&"map".to_string()),
-        "ops should contain 'map': {:?}",
-        op_names
+        result.typ.get("effects").is_none(),
+        "effects inference was removed; no effects field should be attached: {:?}",
+        result.typ
     );
-    assert!(
-        op_names.contains(&"serialize".to_string()),
-        "ops should contain 'serialize': {:?}",
-        op_names
-    );
-    assert!(
-        op_names.contains(&"log".to_string()),
-        "ops should contain 'log': {:?}",
-        op_names
-    );
-    assert_eq!(op_names.len(), 3);
-    assert_eq!(effects.get("rest"), Some(&Value::Null));
 }
 
 // ===========================================================================
@@ -9907,7 +9881,7 @@ fn b2_parametric_predicate_call_proven() {
     let ast = divisible_by_call_ast(6);
     let proof =
         engine.check_predicate_symbolic(&lang, &ast, AstRef::new(8), AstRef::new(9), 100_000);
-    assert_eq!(proof.verdict, Verdict::Proven);
+    assert_eq!(proof.verdict, Verdict::Proven, "reason: {}", proof.reason);
 }
 
 #[test]
@@ -9918,7 +9892,7 @@ fn b2_parametric_predicate_call_disproved() {
     let ast = divisible_by_call_ast(7);
     let proof =
         engine.check_predicate_symbolic(&lang, &ast, AstRef::new(8), AstRef::new(9), 100_000);
-    assert_eq!(proof.verdict, Verdict::Disproved);
+    assert_eq!(proof.verdict, Verdict::Disproved, "reason: {}", proof.reason);
 }
 
 #[test]

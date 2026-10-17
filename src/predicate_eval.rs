@@ -16,16 +16,16 @@
 //! known, so the predicate is *run* rather than reasoned about symbolically.
 //! Symbolic normalization for dependent annotations (B2) is a later step.
 //!
-//! # Closure body-index preservation
+//! # Closure bodies are self-contained (ADR-0106)
 //!
-//! A closure value carries a `body` index into the AST it was created from.
-//! To evaluate `predicate(expr)` we build a synthetic AST by **cloning the
-//! entire original AST** and appending a `call` node whose children are
-//! `[type_expr_idx, expr_idx]`. Cloning preserves all original indices, so
-//! when the `call` eval scheme evaluates the type-expression child (creating
-//! the closure) and then applies it, the closure's body index is valid in the
-//! cloned AST. Building a fresh 3-node AST would break this: the body index
-//! would point outside the new arena.
+//! A closure value carries its body as a `body_def` `{"__ast__": <arena>}`
+//! value — a standalone arena with every free variable substituted at mint
+//! time — plus a `binds` map for the residual bindings that could not be
+//! substituted (rec binders, non-serializable captures). The B2 symbolic
+//! path decodes that arena directly, so it no longer depends on indices
+//! into the caller's AST. (The B1 path below still clones the original
+//! AST before appending the `call` node the eval engine runs — harmless,
+//! since indices are preserved and the subtree is self-contained.)
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Proof, Value, Verdict};
 use handl_plugin_engine_exec::EvalRequest;
@@ -819,8 +819,9 @@ impl super::NbeTypecheckEngine {
     /// rich formats — Phase 3.2). If it is any other kind (e.g. `call` for
     /// a named/parametric predicate like `DivisibleBy(3)`), the type
     /// expression is *evaluated* via the bound eval engine to obtain the
-    /// closure value; the closure's `body` index and captured `env` are then
-    /// used for symbolic normalization (Phase 3.1).
+    /// closure value; the closure's self-contained `body_def` arena and
+    /// residual `binds` are then used for symbolic normalization
+    /// (Phase 3.1, ADR-0106 arrow shape).
     /// `expr_ref` points to the annotated expression node.
     pub(crate) fn check_predicate_symbolic(
         &self,
@@ -866,24 +867,51 @@ impl super::NbeTypecheckEngine {
                     Ok(s) => s,
                     Err(e) => return Proof::blocked(format!("subtree error: {}", e)),
                 };
-                let req = EvalRequest::new(sub.clone());
+                let req = EvalRequest::new(sub);
                 match self.eval_engine.eval(lang, &req) {
                     Ok(type_val) if Self::is_closure_value(&type_val) => {
-                        let params: Vec<String> = type_val
-                            .get("params")
-                            .and_then(|p| p.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let body_idx =
-                            type_val.get("body").and_then(|b| b.as_u64()).unwrap_or(0) as usize;
-                        let param_name =
-                            params.into_iter().next().unwrap_or_else(|| "_".to_string());
-                        let env = type_val.get("env").cloned();
-                        (sub, body_idx, param_name, env)
+                        // ADR-0106 arrow value: the closure is self-contained
+                        // data — `body_def` carries the body as a tagged
+                        // `{"__ast__": <arena>}` value with every free
+                        // variable already substituted at mint time (the
+                        // Pratt layout puts the body root at the last node),
+                        // and `binds` carries the residual bindings that
+                        // could not be substituted (rec binders,
+                        // non-serializable captures). Decoding through
+                        // `TaggedValue` resolves `__bindsref__` shared-map
+                        // markers for free.
+                        let arrow = handl_value::TaggedValue::from(type_val);
+                        let handl_value::TaggedValue::Arrow {
+                            params,
+                            body_def,
+                            binds,
+                            ..
+                        } = arrow
+                        else {
+                            return Proof::blocked(
+                                "type expression did not evaluate to an arrow value",
+                            );
+                        };
+                        let body_ast =
+                            handl_language::as_ast(&handl_value::tagged_to_value(&body_def));
+                        let body_ast = match body_ast {
+                            Some(a) if !a.is_empty() => a,
+                            _ => {
+                                return Proof::blocked(
+                                    "closure body_def is missing or empty (expected \
+                                     {\"__ast__\": <arena>})",
+                                );
+                            }
+                        };
+                        let body_idx = body_ast.len() - 1;
+                        let param_name = params.first().cloned().unwrap_or_else(|| "_".to_string());
+                        let env = Value::Object(
+                            binds
+                                .iter()
+                                .map(|(k, v)| (k.to_string(), handl_value::tagged_to_value(v)))
+                                .collect(),
+                        );
+                        (body_ast, body_idx, param_name, Some(env))
                     }
                     Ok(other) => {
                         return Proof::blocked(format!(
@@ -905,8 +933,9 @@ impl super::NbeTypecheckEngine {
         let mut env = HashMap::new();
         env.insert(param_name.clone(), expr_sym);
 
-        // Add captured env bindings from the closure (if any). These are
-        // concrete values (e.g. `k = 3` for `DivisibleBy(3)`).
+        // Add the closure's residual `binds` (if any). Serializable captures
+        // were already substituted into `body_def` at mint time — e.g. `k = 3`
+        // for `DivisibleBy(3)` — so only non-substitutable bindings land here.
         if let Some(captured) = captured_env {
             if let Some(obj) = captured.as_object() {
                 for (k, v) in obj {
@@ -919,7 +948,7 @@ impl super::NbeTypecheckEngine {
 
         // Translate the predicate body to a symbolic expression. The body
         // index is valid in `body_ast` (the original AST for `function` nodes,
-        // or the subtree for evaluated closures).
+        // or the closure's `body_def` arena for evaluated closures).
         let body_sym = ast_to_sym(&body_ast, AstRef::new(body_idx), &env);
 
         // Normalize to a fixed point.
