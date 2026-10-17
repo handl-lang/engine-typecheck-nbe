@@ -7,12 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-handl-language = { git = "https://github.com/handl-lang/platform", branch = "main" }
+handl-language = { git = "https://github.com/handl-lang/kernel", branch = "main" }
 handl-platform = { git = "https://github.com/handl-lang/platform", branch = "main" }
 handl-plugin-engine-exec = { git = "https://github.com/handl-lang/platform", branch = "main" }
 handl-plugin-engine-typecheck = { git = "https://github.com/handl-lang/platform", branch = "main" }
-handl-value = { git = "https://github.com/handl-lang/platform", branch = "main" }
-plugin-engine = { git = "https://github.com/handl-lang/platform", branch = "main" }
+handl-value = { git = "https://github.com/handl-lang/kernel", branch = "main" }
+plugin-engine = { git = "https://github.com/handl-lang/kernel", branch = "main" }
 handl-plugin-lib-tag = { git = "https://github.com/handl-lang/platform", branch = "main" }
 serde_json = "1"
 
