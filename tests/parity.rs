@@ -26,12 +26,12 @@
 
 use handl_kit_data_canonical;
 use handl_language::{LangError, Language, Value};
-use handl_plugin_engine_exec_tree_walk::TreeWalkEngine;
-use handl_plugin_engine_lex_pattern::lex as lex_src;
-use handl_plugin_engine_parse::{ParserEngine, ParserRequest};
-use handl_plugin_engine_parse_pratt::PrattEngine;
-use handl_plugin_engine_typecheck::{TypecheckEngine, TypecheckRequest};
-use handl_plugin_engine_typecheck_nbe::NbeTypecheckEngine;
+use hnl_engine_exec_tree_walk::TreeWalkEngine;
+use hnl_engine_lex_pattern::lex as lex_src;
+use hnl_engine_parse::{ParserEngine, ParserRequest};
+use hnl_engine_parse_pratt::PrattEngine;
+use hnl_engine_typecheck::{TypecheckEngine, TypecheckRequest};
+use hnl_engine_typecheck_nbe::NbeTypecheckEngine;
 use serde_json::json;
 
 // ---------------------------------------------------------------------------

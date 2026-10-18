@@ -5,9 +5,9 @@
 //! that handler, returning the `Number` type.
 
 use handl_language::{ArrSource, Ast, Language, Term, Value};
-use handl_plugin_engine_exec_tree_walk::TreeWalkEngine;
-use handl_plugin_engine_typecheck_nbe::{NbeTypecheckEngine, TypeModel};
-use plugin_engine::{Model, ModelCtx};
+use hnl_engine_exec_tree_walk::TreeWalkEngine;
+use hnl_engine_typecheck_nbe::{NbeTypecheckEngine, TypeModel};
+use hnl_engine::{Model, ModelCtx};
 use serde_json::json;
 
 /// The canonical `type.number` value minted by `handl.canonical`.
@@ -59,12 +59,12 @@ fn add_handler() -> Value {
 }
 
 fn model_ctx<'a>(lang: &'a Language, ast: &'a Ast, handler_stack: Vec<Value>) -> ModelCtx<'a> {
-    let lang_view: &dyn plugin_engine::LanguageView = lang;
-    let ast_view: &dyn plugin_engine::AstView = ast;
+    let lang_view: &dyn hnl_engine::LanguageView = lang;
+    let ast_view: &dyn hnl_engine::AstView = ast;
     ModelCtx {
         ast: ast_view,
         lang: lang_view,
-        current_node: &plugin_engine::AstNode,
+        current_node: &hnl_engine::AstNode,
         node_ref: 0,
         handler_stack,
     }

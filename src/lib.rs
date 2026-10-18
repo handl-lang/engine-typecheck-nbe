@@ -1,4 +1,4 @@
-//! # handl-plugin-engine-typecheck-nbe
+//! # hnl-engine-typecheck-nbe
 //!
 //! A **data-driven, normalization-based typecheck engine** implementing the
 //! [`TypecheckEngine`] trait (ADR-0054 — Generic Typecheck Engine).
@@ -92,12 +92,12 @@ use std::rc::Rc;
 use handl_language::{
     ArrSource, Ast, AstNode, AstRef, LangError, Language, Proof, Term, Value, Verdict,
 };
-use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
-use handl_plugin_engine_typecheck::{
+use hnl_engine_exec::{EvalEngine, EvalRequest};
+use hnl_engine_typecheck::{
     TypecheckDiagnostic, TypecheckEngine, TypecheckRequest, TypecheckResult,
 };
 use handl_plugin_lib_tag::TypeRegistry;
-use plugin_engine::TermData;
+use hnl_engine::TermData;
 
 mod predicate_eval;
 mod totality_check;
@@ -5160,10 +5160,10 @@ pub fn read_termination_metadata(node: &handl_language::AstNode) -> Option<Termi
 }
 
 // ---------------------------------------------------------------------------
-// plugin_engine::Model adapter
+// hnl_engine::Model adapter
 // ---------------------------------------------------------------------------
 
-/// A `plugin_engine::Model` adapter around the NBE typecheck engine.
+/// A `hnl_engine::Model` adapter around the NBE typecheck engine.
 ///
 /// It evaluates bare [`Term`] schemes by mounting them on a minimal dummy
 /// AST / Language context and reusing the existing typecheck evaluation logic.
@@ -5177,7 +5177,7 @@ impl TypeModel {
 
     /// Grade-based `Op` dispatch for the typecheck model.
     ///
-    /// Mirrors [`ValueModel::dispatch_op`](handl_plugin_engine_exec_tree_walk).
+    /// Mirrors [`ValueModel::dispatch_op`](hnl_engine_exec_tree_walk).
     /// Looks up the `op` declaration for the required grade, verifies the
     /// incoming value carries that grade, then searches `ctx.handler_stack`
     /// and `ctx.lang.handler_for_grade(grade)` for a `Handler` providing an
@@ -5187,8 +5187,8 @@ impl TypeModel {
         op: &str,
         args: &[Term],
         incoming: Value,
-        ctx: &mut plugin_engine::ModelCtx,
-    ) -> Result<Option<Value>, plugin_engine::LangError> {
+        ctx: &mut hnl_engine::ModelCtx,
+    ) -> Result<Option<Value>, hnl_engine::LangError> {
         // Look up the op declaration and the required grade, if any.
         let required_grade = ctx
             .lang
@@ -5204,14 +5204,14 @@ impl TypeModel {
                 .map(|arr| arr.iter().filter_map(Value::as_str).collect::<Vec<_>>())
                 .unwrap_or_default();
             if !grades.contains(&grade.as_str()) {
-                return Err(plugin_engine::LangError::NotImplemented);
+                return Err(hnl_engine::LangError::NotImplemented);
             }
         }
 
         // Evaluate the argument sub-terms with `incoming`.
         let mut arg_vals = Vec::with_capacity(args.len());
         for arg in args {
-            arg_vals.push(plugin_engine::Model::run(self, arg, incoming.clone(), ctx)?);
+            arg_vals.push(hnl_engine::Model::run(self, arg, incoming.clone(), ctx)?);
         }
 
         // Search the handler stack from top to bottom for a `Handler` whose
@@ -5250,25 +5250,25 @@ impl TypeModel {
         };
 
         let impl_term: Term = serde_json::from_value(impl_json)
-            .map_err(|_| plugin_engine::LangError::NotImplemented)?;
+            .map_err(|_| hnl_engine::LangError::NotImplemented)?;
         let handler_in = if arg_vals.is_empty() {
             incoming
         } else {
             serde_json::json!({ "__pair__": [incoming, arg_vals] })
         };
-        plugin_engine::Model::run(self, &impl_term, handler_in, ctx).map(Some)
+        hnl_engine::Model::run(self, &impl_term, handler_in, ctx).map(Some)
     }
 }
 
-impl plugin_engine::Model for TypeModel {
+impl hnl_engine::Model for TypeModel {
     type Value = Value;
 
     fn run(
         &self,
         term: &Term,
         incoming: Self::Value,
-        ctx: &mut plugin_engine::ModelCtx,
-    ) -> Result<Self::Value, plugin_engine::LangError> {
+        ctx: &mut hnl_engine::ModelCtx,
+    ) -> Result<Self::Value, hnl_engine::LangError> {
         // Thin `&Term` entry point (ADR-0103): convert once to `TermData` and
         // dispatch on the tag. Sub-terms that must recurse through the
         // `Model::run(&Term)` trait boundary are converted back via
@@ -5277,8 +5277,8 @@ impl plugin_engine::Model for TypeModel {
         let td = TermData::from_term(term);
         match td.tag() {
             "Rewrite" => {
-                let target = td.get_term("target").ok_or(plugin_engine::LangError::NotImplemented)?;
-                let target_term = target.to_term().map_err(|_| plugin_engine::LangError::NotImplemented)?;
+                let target = td.get_term("target").ok_or(hnl_engine::LangError::NotImplemented)?;
+                let target_term = target.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
                 self.run(&target_term, incoming, ctx)
             }
             // `Child { role }` (ADR-0081): resolve the named child role to a
@@ -5290,7 +5290,7 @@ impl plugin_engine::Model for TypeModel {
             // objects, so the recursive `eval_type_scheme` call — which needs
             // the concrete `Ast`/`Language` — recovers them via `as_any`
             // downcasts. Non-`handl_language` views return `NotImplemented`.
-            // TODO: give `plugin_engine::LangError` a payload so real errors
+            // TODO: give `hnl_engine::LangError` a payload so real errors
             // can be propagated instead of collapsed to `NotImplemented`.
             "Child" => {
                 let role = td.get_str("role").unwrap_or("");
@@ -5298,32 +5298,32 @@ impl plugin_engine::Model for TypeModel {
                     .ast
                     .as_any()
                     .downcast_ref::<Ast>()
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let lang = ctx
                     .lang
                     .as_any()
                     .downcast_ref::<Language>()
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let kind = ctx
                     .ast
                     .node_kind(ctx.node_ref)
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let child_idx = ctx
                     .lang
                     .child_role_index(kind, role)
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let child_ref = ctx
                     .ast
                     .node_child(ctx.node_ref, child_idx)
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let child_kind = ctx
                     .ast
                     .node_kind(child_ref)
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let scheme = ctx
                     .lang
                     .type_rule(child_kind)
-                    .ok_or(plugin_engine::LangError::NotImplemented)?;
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let mut tctx = TypecheckContext::new(&self.0.registry_id, self.0.globals.clone());
                 self.0
                     .eval_type_scheme(
@@ -5334,15 +5334,15 @@ impl plugin_engine::Model for TypeModel {
                         &mut tctx,
                         Some(incoming),
                     )
-                    .map_err(|_| plugin_engine::LangError::NotImplemented)
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)
             }
             "Path" => {
-                let a = td.get_term("from").ok_or(plugin_engine::LangError::NotImplemented)?;
-                let b = td.get_term("to").ok_or(plugin_engine::LangError::NotImplemented)?;
-                let b_term = b.to_term().map_err(|_| plugin_engine::LangError::NotImplemented)?;
+                let a = td.get_term("from").ok_or(hnl_engine::LangError::NotImplemented)?;
+                let b = td.get_term("to").ok_or(hnl_engine::LangError::NotImplemented)?;
+                let b_term = b.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
                 let b_val = self.run(&b_term, incoming.clone(), ctx)?;
                 if b_val.is_null() {
-                    let a_term = a.to_term().map_err(|_| plugin_engine::LangError::NotImplemented)?;
+                    let a_term = a.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
                     self.run(&a_term, incoming, ctx)
                 } else {
                     Ok(b_val)
@@ -5358,7 +5358,7 @@ impl plugin_engine::Model for TypeModel {
             // handler before falling back to the type-native dispatch.
             "Op" => {
                 let name = td.get_str("name").unwrap_or("");
-                let source = td.arr_source().ok_or(plugin_engine::LangError::NotImplemented)?;
+                let source = td.arr_source().ok_or(hnl_engine::LangError::NotImplemented)?;
                 let op_name = match source {
                     ArrSource::Native => name.to_string(),
                     ArrSource::Foreign(n) => n.clone(),
@@ -5367,7 +5367,7 @@ impl plugin_engine::Model for TypeModel {
                 let args: Vec<Term> = td
                     .get_term_list("args")
                     .iter()
-                    .map(|t| t.to_term().map_err(|_| plugin_engine::LangError::NotImplemented))
+                    .map(|t| t.to_term().map_err(|_| hnl_engine::LangError::NotImplemented))
                     .collect::<Result<_, _>>()?;
                 if let Some(v) = self.dispatch_type_op(&op_name, &args, incoming.clone(), ctx)? {
                     return Ok(v);
@@ -5379,13 +5379,13 @@ impl plugin_engine::Model for TypeModel {
                 let mut tctx = TypecheckContext::new(&self.0.registry_id, self.0.globals.clone());
                 self.0
                     .eval_type_scheme(&lang, &ast, node_ref, term, &mut tctx, Some(incoming))
-                    .map_err(|_| plugin_engine::LangError::NotImplemented)
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)
             }
             "Handle" => {
-                let body = td.get_term("body").ok_or(plugin_engine::LangError::NotImplemented)?;
-                let impl_ = td.get_term("impl_").ok_or(plugin_engine::LangError::NotImplemented)?;
-                let impl_term = impl_.to_term().map_err(|_| plugin_engine::LangError::NotImplemented)?;
-                let body_term = body.to_term().map_err(|_| plugin_engine::LangError::NotImplemented)?;
+                let body = td.get_term("body").ok_or(hnl_engine::LangError::NotImplemented)?;
+                let impl_ = td.get_term("impl_").ok_or(hnl_engine::LangError::NotImplemented)?;
+                let impl_term = impl_.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
+                let body_term = body.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
                 let handler = self.run(&impl_term, incoming.clone(), ctx)?;
                 ctx.push_handler(handler);
                 let result = self.run(&body_term, incoming, ctx);
@@ -5400,7 +5400,7 @@ impl plugin_engine::Model for TypeModel {
                 let mut tctx = TypecheckContext::new(&self.0.registry_id, self.0.globals.clone());
                 self.0
                     .eval_type_scheme(&lang, &ast, node_ref, term, &mut tctx, Some(incoming))
-                    .map_err(|_| plugin_engine::LangError::NotImplemented)
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)
             }
         }
     }
@@ -5409,12 +5409,12 @@ impl plugin_engine::Model for TypeModel {
         &self,
         source: &Term,
         target: &Term,
-        witness: &plugin_engine::RewriteWitness,
+        witness: &hnl_engine::RewriteWitness,
         incoming: &Self::Value,
-        ctx: &mut plugin_engine::ModelCtx,
-    ) -> Result<plugin_engine::RewriteResult<Self::Value>, plugin_engine::LangError> {
+        ctx: &mut hnl_engine::ModelCtx,
+    ) -> Result<hnl_engine::RewriteResult<Self::Value>, hnl_engine::LangError> {
         let (source, target, is_rewrite) = match witness {
-            plugin_engine::RewriteWitness::Named(name) => {
+            hnl_engine::RewriteWitness::Named(name) => {
                 if let Some(rule) = ctx.lang.law(name) {
                     let law_source = rule
                         .get("source")
@@ -5424,7 +5424,7 @@ impl plugin_engine::Model for TypeModel {
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
                     match (law_source, law_target) {
                         (Some(s), Some(t)) => (s, t, false),
-                        _ => return Ok(plugin_engine::RewriteResult::Unsupported),
+                        _ => return Ok(hnl_engine::RewriteResult::Unsupported),
                     }
                 } else if let Some(rule) = ctx.lang.rewrite_rule(name) {
                     let rewrite_source = rule
@@ -5435,7 +5435,7 @@ impl plugin_engine::Model for TypeModel {
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
                     match (rewrite_source, rewrite_target) {
                         (Some(s), Some(t)) => (s, t, true),
-                        _ => return Ok(plugin_engine::RewriteResult::Unsupported),
+                        _ => return Ok(hnl_engine::RewriteResult::Unsupported),
                     }
                 } else {
                     (source.clone(), target.clone(), false)
@@ -5446,16 +5446,16 @@ impl plugin_engine::Model for TypeModel {
         if TermData::from_term(&source).is_tag("Rewrite")
             || TermData::from_term(&target).is_tag("Rewrite")
         {
-            return Ok(plugin_engine::RewriteResult::Unsupported);
+            return Ok(hnl_engine::RewriteResult::Unsupported);
         }
         let a = self.run(&source, incoming.clone(), ctx)?;
         let b = self.run(&target, incoming.clone(), ctx)?;
         if a == b {
-            Ok(plugin_engine::RewriteResult::Equal(b))
+            Ok(hnl_engine::RewriteResult::Equal(b))
         } else if is_rewrite {
-            Ok(plugin_engine::RewriteResult::Rewritten(b))
+            Ok(hnl_engine::RewriteResult::Rewritten(b))
         } else {
-            Ok(plugin_engine::RewriteResult::NotEqual)
+            Ok(hnl_engine::RewriteResult::NotEqual)
         }
     }
 }

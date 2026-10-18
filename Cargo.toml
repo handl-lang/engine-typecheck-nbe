@@ -1,5 +1,5 @@
 [package]
-name = "handl-plugin-engine-typecheck-nbe"
+name = "hnl-engine-typecheck-nbe"
 version.workspace = true
 edition.workspace = true
 description = "A **data-driven, normalization-based typecheck engine** implementing the [`TypecheckEngine`] trait (ADR-0054 — Generic Typecheck Engine)."
@@ -9,17 +9,17 @@ repository.workspace = true
 [dependencies]
 handl-language = { git = "https://github.com/handl-lang/kernel", branch = "main" }
 handl-platform = { git = "https://github.com/handl-lang/platform", branch = "main" }
-handl-plugin-engine-exec = { git = "https://github.com/handl-lang/platform", branch = "main" }
-handl-plugin-engine-typecheck = { git = "https://github.com/handl-lang/platform", branch = "main" }
+hnl-engine-exec = { git = "https://github.com/handl-lang/engine-exec", branch = "main" }
+hnl-engine-typecheck = { git = "https://github.com/handl-lang/engine-typecheck", branch = "main" }
 handl-value = { git = "https://github.com/handl-lang/kernel", branch = "main" }
-plugin-engine = { git = "https://github.com/handl-lang/kernel", branch = "main" }
+hnl-engine = { git = "https://github.com/handl-lang/engine", branch = "main" }
 handl-plugin-lib-tag = { git = "https://github.com/handl-lang/platform", branch = "main" }
 serde_json = "1"
 
 [dev-dependencies]
-handl-plugin-engine-exec-tree-walk = { git = "https://github.com/handl-lang/platform", branch = "main" }
-handl-plugin-engine-lex-pattern = { git = "https://github.com/handl-lang/platform", branch = "main" }
-handl-plugin-engine-parse = { git = "https://github.com/handl-lang/platform", branch = "main" }
-handl-plugin-engine-parse-pratt = { git = "https://github.com/handl-lang/platform", branch = "main" }
+hnl-engine-exec-tree-walk = { git = "https://github.com/handl-lang/engine-exec-tree-walk", branch = "main" }
+hnl-engine-lex-pattern = { git = "https://github.com/handl-lang/engine-lex-pattern", branch = "main" }
+hnl-engine-parse = { git = "https://github.com/handl-lang/engine-parse", branch = "main" }
+hnl-engine-parse-pratt = { git = "https://github.com/handl-lang/engine-parse-pratt", branch = "main" }
 handl-plugin-module = { git = "https://github.com/handl-lang/platform", branch = "main" }
 handl-kit-data-canonical = { git = "https://github.com/handl-lang/lang", branch = "main" }

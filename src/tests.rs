@@ -6,10 +6,10 @@
 use super::*;
 use handl_language::fragments::{AstShapeDef, ChildRoleSpec, EvalSchemeDef, TypeRuleDef};
 use handl_language::{ArrSource, Ast, AstNode, Language, Term, Value};
-use plugin_engine::TermData;
+use hnl_engine::TermData;
 use handl_platform::ModuleLookup;
-use handl_plugin_engine_exec_tree_walk::TreeWalkEngine;
-use handl_plugin_engine_typecheck::{TypecheckEngine, TypecheckRequest};
+use hnl_engine_exec_tree_walk::TreeWalkEngine;
+use hnl_engine_typecheck::{TypecheckEngine, TypecheckRequest};
 use handl_plugin_module::ModuleRegistry;
 use serde_json::json;
 use std::collections::HashMap;
