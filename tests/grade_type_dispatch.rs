@@ -81,7 +81,7 @@ fn add_term() -> Term {
 
 #[test]
 fn grade_type_dispatch_returns_number_type() {
-    let mut lang = handl_kit_data_canonical::language_from_yaml().unwrap();
+    let mut lang = handl_kit_data_prelude::language_from_yaml().unwrap();
     lang.register_op("add", add_op_decl());
     lang.register_handler("Addable", add_handler());
 

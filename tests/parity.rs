@@ -1,7 +1,7 @@
 //! Canonical parity tests for the data-driven NBE typecheck engine.
 //!
 //! These tests assemble the **full canonical language** (all `types.yaml`
-//! rules via `handl_kit_data_canonical::assemble`) and verify that the
+//! rules via `handl_kit_data_prelude::assemble`) and verify that the
 //! data-driven [`NbeTypecheckEngine`] produces the correct synthesized types
 //! for a representative suite of expressions.
 //!
@@ -24,7 +24,7 @@
 //! `node_payload`, `json_type_construct`, `payload_field`, `bind`, `result`,
 //! `synth_last_child`), none of which require the eval engine.
 
-use handl_kit_data_canonical;
+use handl_kit_data_prelude;
 use handl_language::{LangError, Language, Value};
 use hnl_engine_exec_tree_walk::TreeWalkEngine;
 use hnl_engine_lex_pattern::lex as lex_src;
@@ -41,7 +41,7 @@ use serde_json::json;
 /// Build the full canonical [`Language`] (all `types.yaml` rules) via the
 /// data-driven canonical kit.
 fn lang() -> Language {
-    let kit = handl_kit_data_canonical::assemble().expect("canonical assembly");
+    let kit = handl_kit_data_prelude::assemble().expect("canonical assembly");
     kit.lang().clone()
 }
 

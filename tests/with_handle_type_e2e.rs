@@ -73,7 +73,7 @@ fn model_ctx<'a>(lang: &'a Language, ast: &'a Ast, handler_stack: Vec<Value>) ->
 #[test]
 fn with_handle_returns_number_type() {
     // 1. Build a `handl_language::Language` from the canonical kit.
-    let mut lang = handl_kit_data_canonical::language_from_yaml().unwrap();
+    let mut lang = handl_kit_data_prelude::language_from_yaml().unwrap();
 
     // 2. Register the `add` op and `Addable` handler.
     lang.register_op("add", add_op_decl());
