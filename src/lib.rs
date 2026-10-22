@@ -313,8 +313,11 @@ impl NbeTypecheckEngine {
         // or `refl`/a witness against `Path` goes through the dependent
         // introduction rules rather than synth-then-unify.
         if let Some(res) = self.dep_check_intro(lang, ast, node_ref, expected, ctx) {
-            res?;
-            ctx.node_types.insert(node_ref.index(), expected.clone());
+            // Record the *returned* type, not `expected`: the dependent
+            // intro may carry extra fields the expected type lacks (e.g.
+            // a transport node's `via` Path witness — proof-relevant).
+            let ty = res?;
+            ctx.node_types.insert(node_ref.index(), ty);
             return Ok(());
         }
         if let Some(check_scheme) = &rule.check {
@@ -1428,142 +1431,14 @@ impl NbeTypecheckEngine {
                         let _ = self.synth_node(lang, ast, AstRef::new(child_idx), ctx)?;
                         continue;
                     }
-                    // Extract (name, value_ref, optional annotation) from the
-                    // assign node. Supports both v0.1 (payload.name + child 0)
-                    // and legacy (children [var|type-annot, value]) shapes.
-                    let assign_children = child_node
-                        .payload
-                        .get("children")
-                        .and_then(|c| c.as_array())
-                        .ok_or_else(|| {
-                            LangError::engine(
-                                "typecheck: synth_block: assign has no children array",
-                            )
-                        })?;
-                    let (name, value_ref, ann_ref) = if let Some(n) =
-                        child_node.payload.get("name").and_then(|v| v.as_str())
-                    {
-                        // v0.1: name in payload, value is child 0.
-                        if assign_children.is_empty() {
-                            return Err(LangError::engine(
-                                "typecheck: synth_block: assign with payload.name needs a value child",
-                            ));
-                        }
-                        let vidx = assign_children[0].as_u64().ok_or_else(|| {
-                            LangError::engine(
-                                "typecheck: synth_block: assign value index is not a u64",
-                            )
-                        })? as usize;
-                        (n.to_string(), AstRef::new(vidx), None)
-                    } else {
-                        // Legacy: children [lhs, value] where lhs is a
-                        // `var` or a `type-annot`.
-                        if assign_children.len() < 2 {
-                            return Err(LangError::engine(
-                                "typecheck: synth_block: assign needs at least 2 children",
-                            ));
-                        }
-                        let lhs_idx = assign_children[0].as_u64().ok_or_else(|| {
-                            LangError::engine(
-                                "typecheck: synth_block: assign lhs index is not a u64",
-                            )
-                        })? as usize;
-                        let vidx = assign_children[1].as_u64().ok_or_else(|| {
-                            LangError::engine(
-                                "typecheck: synth_block: assign value index is not a u64",
-                            )
-                        })? as usize;
-                        let lhs_node = ast.get(AstRef::new(lhs_idx)).ok_or_else(|| {
-                            LangError::engine(format!(
-                                "typecheck: synth_block: lhs node {} out of bounds",
-                                lhs_idx
-                            ))
-                        })?;
-                        if is_type_annot(lang, &lhs_node) {
-                            let ta_children = lhs_node
-                                .payload
-                                .get("children")
-                                .and_then(|c| c.as_array())
-                                .ok_or_else(|| {
-                                    LangError::engine(
-                                        "typecheck: synth_block: type-annot has no children",
-                                    )
-                                })?;
-                            if ta_children.len() < 2 {
-                                return Err(LangError::engine(
-                                    "typecheck: synth_block: type-annot needs 2 children",
-                                ));
-                            }
-                            let inner_var_idx = ta_children[0].as_u64().ok_or_else(|| {
-                                LangError::engine(
-                                    "typecheck: synth_block: type-annot var index is not a u64",
-                                )
-                            })? as usize;
-                            let type_expr_idx = ta_children[1].as_u64().ok_or_else(|| {
-                                LangError::engine(
-                                    "typecheck: synth_block: type-annot type index is not a u64",
-                                )
-                            })? as usize;
-                            let inner_var =
-                                ast.get(AstRef::new(inner_var_idx)).ok_or_else(|| {
-                                    LangError::engine(format!(
-                                        "typecheck: synth_block: inner var node {} out of bounds",
-                                        inner_var_idx
-                                    ))
-                                })?;
-                            let n = inner_var.payload.as_str().ok_or_else(|| {
-                                LangError::engine(
-                                    "typecheck: synth_block: inner var payload is not a string",
-                                )
-                            })?;
-                            (
-                                n.to_string(),
-                                AstRef::new(vidx),
-                                Some(AstRef::new(type_expr_idx)),
-                            )
-                        } else {
-                            let n = lhs_node.payload.as_str().ok_or_else(|| {
-                                LangError::engine(
-                                    "typecheck: synth_block: var payload is not a string",
-                                )
-                            })?;
-                            (n.to_string(), AstRef::new(vidx), None)
-                        }
-                    };
-                    let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
-                    let bound_type = if let Some(ann_ref) = ann_ref {
-                        let type_expr_node = ast.get(ann_ref).ok_or_else(|| {
-                            LangError::engine(format!(
-                                "typecheck: synth_block: type-expr node {} out of bounds",
-                                ann_ref.index()
-                            ))
-                        })?;
-                        // Dependent annotations (families, `Pi`/`Sigma`,
-                        // `Path`, index terms) interpret through the
-                        // dep-aware path; the legacy `type.*` spellings
-                        // remain the fallback.
-                        let ann = self
-                            .dep_synth_type(lang, ast, ann_ref.index(), ctx)
-                            .or_else(|_| {
-                                interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)
-                            })?;
-                        // Dependent annotations check the *value* against
-                        // the former (Pi/Sigma/Family/Path intros live in
-                        // `dep_check_intro`); everything else unifies.
-                        if matches!(
-                            ann.get("__tag__").and_then(Value::as_str),
-                            Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app")
-                        ) {
-                            let _ = value_type;
-                            self.check_node(lang, ast, value_ref, &ann, ctx)?;
-                        } else {
-                            self.dep_unify(&value_type, &ann, ctx)?;
-                        }
-                        ann
-                    } else {
-                        value_type
-                    };
-                    ctx.extend(name, bound_type);
+                    // `synth_assign` owns the assign judgment: it extracts
+                    // (name, value, annot) across the payload-name /
+                    // 2-child / 3-child / arrow-annot (`f : A ~> B`)
+                    // shapes and — for dependent annotations — checks the
+                    // value *against* the former without a pre-synth
+                    // (ADR-0152: a pre-synth would check `match` arms under
+                    // an unsolved-meta scrutinee with empty `results`).
+                    self.synth_assign_judgment(lang, ast, &child_node, ctx)?;
                 }
                 self.synth_node(lang, ast, AstRef::new(last_idx), ctx)
             }
@@ -1687,137 +1562,11 @@ impl NbeTypecheckEngine {
                         let _ = self.synth_node(lang, ast, AstRef::new(child_idx), ctx)?;
                         continue;
                     }
-                    let assign_children = child_node
-                        .payload
-                        .get("children")
-                        .and_then(|c| c.as_array())
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                "check_block: assign has no children array",
-                                node,
-                            )
-                        })?;
-                    let (name, value_ref, ann_ref) =
-                        if let Some(n) = child_node.payload.get("name").and_then(|v| v.as_str()) {
-                            if assign_children.is_empty() {
-                                return Err(LangError::engine(
-                                    "check_block: assign with payload.name needs a value child",
-                                ));
-                            }
-                            let vidx = assign_children[0].as_u64().ok_or_else(|| {
-                                LangError::engine_node(
-                                    "check_block: assign value index is not a u64",
-                                    node,
-                                )
-                            })? as usize;
-                            (n.to_string(), AstRef::new(vidx), None)
-                        } else {
-                            if assign_children.len() < 2 {
-                                return Err(LangError::engine(
-                                    "check_block: assign needs at least 2 children",
-                                ));
-                            }
-                            let lhs_idx = assign_children[0].as_u64().ok_or_else(|| {
-                                LangError::engine_node(
-                                    "check_block: assign lhs index is not a u64",
-                                    node,
-                                )
-                            })? as usize;
-                            let vidx = assign_children[1].as_u64().ok_or_else(|| {
-                                LangError::engine_node(
-                                    "check_block: assign value index is not a u64",
-                                    node,
-                                )
-                            })? as usize;
-                            let lhs_node = ast.get(AstRef::new(lhs_idx)).ok_or_else(|| {
-                                LangError::engine(format!(
-                                    "check_block: lhs node {} out of bounds",
-                                    lhs_idx
-                                ))
-                            })?;
-                            if is_type_annot(lang, &lhs_node) {
-                                let ta_children = lhs_node
-                                    .payload
-                                    .get("children")
-                                    .and_then(|c| c.as_array())
-                                    .ok_or_else(|| {
-                                        LangError::engine_node(
-                                            "check_block: type-annot has no children",
-                                            node,
-                                        )
-                                    })?;
-                                if ta_children.len() < 2 {
-                                    return Err(LangError::engine(
-                                        "check_block: type-annot needs 2 children",
-                                    ));
-                                }
-                                let inner_var_idx = ta_children[0].as_u64().ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "check_block: type-annot var index is not a u64",
-                                        node,
-                                    )
-                                })? as usize;
-                                let type_expr_idx = ta_children[1].as_u64().ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "check_block: type-annot type index is not a u64",
-                                        node,
-                                    )
-                                })? as usize;
-                                let inner_var =
-                                    ast.get(AstRef::new(inner_var_idx)).ok_or_else(|| {
-                                        LangError::engine(format!(
-                                            "check_block: inner var node {} out of bounds",
-                                            inner_var_idx
-                                        ))
-                                    })?;
-                                let n = inner_var.payload.as_str().ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "check_block: inner var payload is not a string",
-                                        node,
-                                    )
-                                })?;
-                                (
-                                    n.to_string(),
-                                    AstRef::new(vidx),
-                                    Some(AstRef::new(type_expr_idx)),
-                                )
-                            } else {
-                                let n = lhs_node.payload.as_str().ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "check_block: var payload is not a string",
-                                        node,
-                                    )
-                                })?;
-                                (n.to_string(), AstRef::new(vidx), None)
-                            }
-                        };
-                    let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
-                    let bound_type = if let Some(ann_ref) = ann_ref {
-                        let type_expr_node = ast.get(ann_ref).ok_or_else(|| {
-                            LangError::engine(format!(
-                                "check_block: type-expr node {} out of bounds",
-                                ann_ref.index()
-                            ))
-                        })?;
-                        let ann = self
-                            .dep_synth_type(lang, ast, ann_ref.index(), ctx)
-                            .or_else(|_| {
-                                interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)
-                            })?;
-                        if matches!(
-                            ann.get("__tag__").and_then(Value::as_str),
-                            Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app")
-                        ) {
-                            let _ = value_type;
-                            self.check_node(lang, ast, value_ref, &ann, ctx)?;
-                        } else {
-                            self.dep_unify(&value_type, &ann, ctx)?;
-                        }
-                        ann
-                    } else {
-                        value_type
-                    };
-                    ctx.extend(name, bound_type);
+                    // Same judgment as `synth_block` — `synth_assign` owns
+                    // (name, value, annot) extraction and the check-against-
+                    // annotation ordering (no pre-synth for dependent
+                    // formers, ADR-0152).
+                    self.synth_assign_judgment(lang, ast, &child_node, ctx)?;
                 }
                 self.check_node(lang, ast, AstRef::new(last_idx), &expected, ctx)?;
                 Ok(Value::Null)
@@ -1898,15 +1647,19 @@ impl NbeTypecheckEngine {
                 })? as usize;
                 // `motive` role (optional middle child of the 3-child
                 // `return … with` form) — resolved by declared role, not
-                // position.
+                // position. `child_role_index_for`/`role_index_of` return
+                // a *child position*; map it through `children` to the
+                // arena index.
                 let motive_idx = if children.len() >= 3 {
                     lang.child_role_index_for(node, "motive")
                         .ok()
                         .flatten()
-                        .or_else(|| {
-                            role_index_of(lang, &node.kind, "motive").and_then(|i| {
-                                children.get(i).and_then(Value::as_u64).map(|v| v as usize)
-                            })
+                        .or_else(|| role_index_of(lang, &node.kind, "motive"))
+                        .and_then(|pos| {
+                            children
+                                .get(pos)
+                                .and_then(Value::as_u64)
+                                .map(|v| v as usize)
                         })
                         .and_then(|i| {
                             // Guard: a `block`-kinded child is the arms, not
@@ -5013,12 +4766,6 @@ fn is_assign_node(lang: &Language, node: &AstNode) -> bool {
 /// check for role-less shapes.
 fn is_return_node(lang: &Language, node: &AstNode) -> bool {
     role_declared(lang, &node.kind, "value") && !role_declared(lang, &node.kind, "target")
-}
-
-/// Whether `node` is a type annotation: its shape declares an `annot` role.
-/// Falls back to the legacy kind check for role-less shapes.
-fn is_type_annot(lang: &Language, node: &AstNode) -> bool {
-    role_declared(lang, &node.kind, "annot")
 }
 
 /// Whether `node` is a block: its shape declares a `statements` role.

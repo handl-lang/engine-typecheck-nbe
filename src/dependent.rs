@@ -870,18 +870,23 @@ impl NbeTypecheckEngine {
 
     /// The builtin-name table for bare type-position identifiers.
     fn dep_builtin_or_tag(&self, name: &str, ctx: &mut TypecheckContext) -> Result<Value, LangError> {
+        let tag = match name {
+            "Int" | "Nat" | "Number" => "type.number",
+            "Bool" => "type.bool",
+            "String" | "Str" => "type.string",
+            "Unit" => "type.unit",
+            "Type" | "Universe" | "Type0" => "type.universe",
+            "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
+            _ => {
+                return Err(LangError::engine(format!(
+                    "dep_synth_type: unbound type variable '{name}'"
+                )))
+            }
+        };
         let mut m = Map::new();
         Ok(make_tag(
             ctx,
-            match name {
-                "Int" | "Nat" | "Number" => "type.number",
-                "Bool" => "type.bool",
-                "String" | "Str" => "type.string",
-                "Unit" => "type.unit",
-                "Type" | "Universe" | "Type0" => "type.universe",
-                "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
-                _ => "",
-            },
+            tag,
             match name {
                 "Type" | "Universe" | "Type0" => {
                     m.insert("level".to_string(), Value::from(0));
@@ -890,11 +895,6 @@ impl NbeTypecheckEngine {
                 "List" | "Family" | "Pi" | "Sigma" | "Forall" => {
                     m.insert("name".to_string(), Value::String(name.to_string()));
                     std::mem::take(&mut m)
-                }
-                "" => {
-                    return Err(LangError::engine(format!(
-                        "dep_synth_type: unbound type variable '{name}'"
-                    )))
                 }
                 _ => std::mem::take(&mut m),
             },
@@ -1458,7 +1458,22 @@ impl NbeTypecheckEngine {
                 }
                 Ok(())
             }
-            (Some("type.function"), Some("type.function")) => self.unify(a, b, ctx),
+            (Some("type.function"), Some("type.function")) => {
+                // Recurse dependently: `family_app` codomains unify by
+                // index (`unify_index`), which plain `unify` cannot see
+                // inside `args` arrays. `effects` fields, when both are
+                // present, unify through the structural path.
+                let pa = a.get("param").cloned().unwrap_or(Value::Null);
+                let pb = b.get("param").cloned().unwrap_or(Value::Null);
+                self.dep_unify(&pa, &pb, ctx)?;
+                let ba = a.get("body").cloned().unwrap_or(Value::Null);
+                let bb = b.get("body").cloned().unwrap_or(Value::Null);
+                self.dep_unify(&ba, &bb, ctx)?;
+                match (a.get("effects"), b.get("effects")) {
+                    (Some(ea), Some(eb)) => self.unify(ea, eb, ctx),
+                    _ => Ok(()),
+                }
+            }
             (Some("type.function"), Some("type.family_app"))
             | (Some("type.family_app"), Some("type.function")) => Err(LangError::engine(
                 "typecheck: function is not a family member".to_string(),
@@ -2430,10 +2445,16 @@ impl NbeTypecheckEngine {
                     let term = self.node_to_index_term(lang, ast, arg_node, ctx);
                     self.dep_closure_apply_term(lang, ast, &cur, &term, ctx)?
                 }
-                Some("type.family") => {
-                    // Family application in term position → `family_app`
-                    // (the remaining args are index terms).
-                    let mut args = Vec::new();
+                Some("type.family") | Some("type.family_app") => {
+                    // Family application in term position → `family_app`,
+                    // accumulating index terms across curried arguments
+                    // (`Vec(i, Bool)` applies a `type.family`, then extends
+                    // the resulting `family_app` per remaining arg).
+                    let mut args: Vec<Value> = cur
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
                     let t = self.node_index_or_type(lang, ast, arg_idx, ctx)?;
                     args.push(eval_index(&t, ctx));
                     let mut m = Map::new();
@@ -2473,9 +2494,12 @@ impl NbeTypecheckEngine {
 impl NbeTypecheckEngine {
     /// `synth_assign` — typecheck a standalone `assign` node the way
     /// `synth_block` binds a statement: extract `(name, value, annot)` —
-    /// `payload.name` + child 0, or `children [var|type-annot, value]` —
-    /// synth the value, check it against the annotation (dependent
-    /// introductions live in `dep_check_intro`), and bind the name in Γ.
+    /// `payload.name` + child 0, `children [var|type-annot, value]`, the
+    /// 3-child `assign(target, annot, value)` desugared form, or an
+    /// arrow annotation parsed as `function{type-annot(f, A), B}`
+    /// (`f : A ~> B = v`) — check the value against the annotation
+    /// (dependent introductions live in `dep_check_intro`), and bind
+    /// the name in Γ.
     /// Returns `type.unit`. The legacy `type.assign` rule was a bare
     /// `construct type.unit`, so a last-position annotated assign was
     /// never checked — this op is the fix (ADR-0120 dependent structure
@@ -2505,6 +2529,44 @@ impl NbeTypecheckEngine {
                 .ok_or_else(|| LangError::engine("synth_assign: value idx".to_string()))?
                 as usize;
             (n.to_string(), AstRef::new(vidx), None)
+        } else if children.len() >= 3 {
+            // `assign(target, annot, value)` — the 3-child desugared
+            // form: a `var`/`type-annot` target, the type expression in
+            // the middle slot, the value last.
+            let tidx = children[0]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("synth_assign: lhs idx".to_string()))?
+                as usize;
+            let aidx = children[1]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("synth_assign: annot idx".to_string()))?
+                as usize;
+            let vidx = children[2]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("synth_assign: value idx".to_string()))?
+                as usize;
+            let t_node = ast.get(AstRef::new(tidx)).ok_or_else(|| {
+                LangError::engine("synth_assign: lhs out of bounds".to_string())
+            })?;
+            let n = if t_node.kind == "type-annot"
+                || role_child_ref(lang, t_node, "annot").is_some()
+            {
+                let subj = lang
+                    .child_role_index(&t_node.kind, "subject")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                children_of(t_node)
+                    .and_then(|k| k.get(subj))
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(node_name)
+                    .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?
+            } else {
+                node_name(t_node)
+                    .ok_or_else(|| LangError::engine("synth_assign: var name".to_string()))?
+            };
+            (n, AstRef::new(vidx), Some(AstRef::new(aidx)))
         } else {
             if children.len() < 2 {
                 return Err(LangError::engine(
@@ -2540,17 +2602,66 @@ impl NbeTypecheckEngine {
                     .ok_or_else(|| LangError::engine("synth_assign: annot idx".to_string()))?
                     as usize;
                 (iv.to_string(), AstRef::new(vidx), Some(AstRef::new(tidx)))
+            } else if lhs_node.kind == "function" {
+                // `f : A ~> B` — the arrow annotation parses as a
+                // `function` node whose params child is the
+                // `type-annot`; the whole node is the type expression
+                // `A ~> B`, and the name lives in the annot's subject.
+                let params_idx = role_child_ref(lang, lhs_node, "params")
+                    .or_else(|| child_at(ast, lhs_node, 0))
+                    .ok_or_else(|| {
+                        LangError::engine("synth_assign: function lhs has no params".to_string())
+                    })?;
+                let pnode = ast.get(params_idx).ok_or_else(|| {
+                    LangError::engine("synth_assign: params out of bounds".to_string())
+                })?;
+                let pinner = if pnode.kind == "paren" {
+                    child_at(ast, pnode, 0)
+                        .and_then(|i| ast.get(i))
+                        .unwrap_or(pnode)
+                } else {
+                    pnode
+                };
+                if pinner.kind == "type-annot"
+                    || role_child_ref(lang, pinner, "annot").is_some()
+                {
+                    let subj = lang
+                        .child_role_index(&pinner.kind, "subject")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    let iv = children_of(pinner)
+                        .and_then(|k| k.get(subj))
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(node_name)
+                        .ok_or_else(|| {
+                            LangError::engine("synth_assign: annot var".to_string())
+                        })?;
+                    (iv, AstRef::new(vidx), Some(AstRef::new(lhs_idx)))
+                } else {
+                    return Err(LangError::engine(
+                        "synth_assign: function lhs params is not a type-annot".to_string(),
+                    ));
+                }
             } else {
                 let n = node_name(lhs_node)
                     .ok_or_else(|| LangError::engine("synth_assign: var name".to_string()))?;
                 (n.to_string(), AstRef::new(vidx), None)
             }
         };
-        let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
         let bound_type = if let Some(ann_ref) = ann_ref {
             let type_expr_node = ast.get(ann_ref).ok_or_else(|| {
                 LangError::engine("synth_assign: annot out of bounds".to_string())
             })?;
+            // The annotation elaborates *before* the value is judged —
+            // the model's `assign` op checks `v` against `ann` directly
+            // (no pre-synth): dependent introductions (`dep_intro_arrow`)
+            // bind the rigid index vars and `eq_<name>` branch witnesses
+            // in `results` on the way in, so a `match` in the value sees
+            // the refined scrutinee type. Pre-synthesizing would check
+            // the arms under an unsolved-meta scrutinee, where `results`
+            // stays empty and `transport`/`j`/`absurd` cannot resolve.
             let ann = self
                 .dep_synth_type(lang, ast, ann_ref.index(), ctx)
                 .or_else(|_| crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry))?;
@@ -2560,11 +2671,12 @@ impl NbeTypecheckEngine {
             ) {
                 self.check_node(lang, ast, value_ref, &ann, ctx)?;
             } else {
+                let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
                 self.dep_unify(&value_type, &ann, ctx)?;
             }
             ann
         } else {
-            value_type
+            self.synth_node(lang, ast, value_ref, ctx)?
         };
         ctx.extend(name, bound_type);
         let mut m = Map::new();
