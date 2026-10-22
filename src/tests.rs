@@ -11336,7 +11336,7 @@ fn vsubtype_walks_declared_parent() {
             vec![td(arr_judgment_lit(
                 "decl_parent",
                 vec![],
-                json!(["type.nat", "type.int"]),
+                json!(["type.Nat", "type.Int"]),
             ))],
             json!(null),
         ),
@@ -11401,7 +11401,7 @@ fn vbind_vlookup_roundtrip() {
         td(arr_judgment_lit("vlookup", vec![], json!("x"))),
     );
     let result = vscheme(scheme);
-    assert_eq!(result["__sym__"]["name"], json!("int"));
+    assert_eq!(result["__sym__"]["name"], json!("Int"));
 }
 
 #[test]

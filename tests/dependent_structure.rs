@@ -110,6 +110,7 @@ fn typecheck(lang: &Language, ast: Ast) -> hnl_engine_typecheck::TypecheckResult
                 span: None,
             }],
             node_types: std::collections::HashMap::new(),
+            signature: serde_json::Value::Null,
         },
     }
 }

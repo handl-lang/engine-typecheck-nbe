@@ -1758,6 +1758,24 @@ impl NbeTypecheckEngine {
                 })?;
                 self.synth_call_judgment(lang, ast, node, ctx)
             }
+            "synth_import" => {
+                // `stmt.import` binds `m : Sig_m` (the signature record),
+                // named projections, `* as m` (the record), or `*`
+                // (field splice); dynamic specs → `type.unknown`.
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_import: node out of bounds".to_string())
+                })?;
+                self.synth_import_judgment(lang, ast, node, ctx)
+            }
+            "synth_export" => {
+                // `stmt.export` records (name, type) into the module's
+                // `Sig_m` signature record (ctx.exports → TypecheckResult
+                // .signature).
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_export: node out of bounds".to_string())
+                })?;
+                self.synth_export_judgment(lang, ast, node, ctx)
+            }
             "synth_dim_arrow" => {
                 let node = ast.get(node_ref).ok_or_else(|| {
                     LangError::engine("synth_dim_arrow: node out of bounds".to_string())
@@ -2311,6 +2329,58 @@ impl NbeTypecheckEngine {
                 let field_name = field_name.ok_or_else(|| {
                     LangError::engine("record_field_type: field name must be a string for records")
                 })?;
+                // `type.unknown` projects to `type.unknown` — dynamic
+                // imports/`resolve` are statically opaque, so `m.f` on an
+                // unknown record stays unknown rather than erroring.
+                if container_type.get("__tag__").and_then(|t| t.as_str())
+                    == Some("type.unknown")
+                {
+                    return Ok(container_type.clone());
+                }
+                // `type.module_sig` — an *open* signature record: a field
+                // absent from `fields` is probed as `<module>.<name>`
+                // through the module chain (declared signature first,
+                // opaque meta-function when the op resolves unsigned).
+                if container_type.get("__tag__").and_then(|t| t.as_str())
+                    == Some("type.module_sig")
+                {
+                    if let Some(ft) = container_type
+                        .get("fields")
+                        .and_then(|f| f.as_object())
+                        .and_then(|f| f.get(&field_name))
+                    {
+                        return Ok(ft.clone());
+                    }
+                    if let Some(mname) =
+                        container_type.get("module").and_then(Value::as_str)
+                    {
+                        let q = format!("{mname}.{field_name}");
+                        if let Some(mods) = self.modules.as_ref() {
+                            if let Some(sig) = mods.lookup_type_signature(&q) {
+                                return Ok(sig);
+                            }
+                            if mods.lookup(&q).is_some() {
+                                let p = meta_value(ctx.fresh_meta());
+                                let b = meta_value(ctx.fresh_meta());
+                                return ctx
+                                    .registry
+                                    .construct(
+                                        "type.function",
+                                        &serde_json::json!({"param": p, "body": b}),
+                                    )
+                                    .ok_or_else(|| {
+                                        LangError::engine(
+                                            "record_field_type: construct type.function failed",
+                                        )
+                                    });
+                            }
+                        }
+                    }
+                    return Err(LangError::engine(format!(
+                        "record_field_type: field '{}' not found in module signature",
+                        field_name
+                    )));
+                }
                 let fields = container_type
                     .get("fields")
                     .and_then(|f| f.as_object())
@@ -4447,10 +4517,25 @@ impl TypecheckEngine for NbeTypecheckEngine {
         let root_ref = AstRef::new(req.ast.len() - 1);
         let mut ctx = TypecheckContext::new(&self.registry_id, self.globals.clone());
         let typ = self.synth_node(lang, &req.ast, root_ref, &mut ctx)?;
+        // `Sig_m` — the module's signature record of exported names and
+        // their checked types (phase-1 spec WS-B). `import m` binds
+        // `m : Sig_m`; hosts seed an importer's Γ from this value.
+        let mut fields = serde_json::Map::new();
+        for (name, ty) in ctx.exports {
+            fields.insert(name, ty);
+        }
+        let signature = ctx
+            .registry
+            .construct(
+                "type.record",
+                &serde_json::json!({"fields": Value::Object(fields)}),
+            )
+            .unwrap_or(Value::Null);
         Ok(TypecheckResult {
             typ,
             diagnostics: ctx.diagnostics,
             node_types: ctx.node_types,
+            signature,
         })
     }
 
@@ -4521,6 +4606,10 @@ struct TypecheckContext {
     /// tagged types into the domain and judge here — the migration
     /// seam toward full domain evaluation.
     vcheck: checker::Checker,
+    /// Exported `(name, type)` pairs accumulated by `stmt.export`
+    /// statements — the module's signature record `Sig_m` (phase-1
+    /// spec WS-B: a module typechecks to its signature).
+    exports: Vec<(String, Value)>,
 }
 
 impl TypecheckContext {
@@ -4535,6 +4624,7 @@ impl TypecheckContext {
             globals,
             node_types: HashMap::new(),
             vcheck: checker::Checker::new(),
+            exports: Vec::new(),
         }
     }
 

@@ -424,7 +424,7 @@ mod tests {
             "former",
             vec![
                 ct(2),
-                jop("nominal", vec![], Some("type.int".into())),
+                jop("nominal", vec![], Some("type.Int".into())),
             ],
             Some("vec.Vec".into()),
         );
@@ -432,7 +432,7 @@ mod tests {
             "former",
             vec![
                 ct(2),
-                jop("nominal", vec![], Some("type.int".into())),
+                jop("nominal", vec![], Some("type.Int".into())),
             ],
             Some("vec.Vec".into()),
         );
@@ -454,7 +454,7 @@ mod tests {
         // `Vec(1 + 1, Int) ≡ Vec(2, Int)` — index equality is
         // evaluation + conv, not a rewriting solver (0152 §3).
         let ops = JudgmentOps::new();
-        let int = || jop("nominal", vec![], Some("type.int".into()));
+        let int = || jop("nominal", vec![], Some("type.Int".into()));
         let a = jop(
             "former",
             vec![jop("add", vec![ct(1), ct(1)], None), int()],
@@ -507,7 +507,7 @@ mod tests {
             "check",
             vec![
                 jop("universe", vec![], Some(0.into())),
-                jop("nominal", vec![], Some("type.int".into())),
+                jop("nominal", vec![], Some("type.Int".into())),
             ],
             None,
         );

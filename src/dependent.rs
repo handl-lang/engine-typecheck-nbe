@@ -27,7 +27,8 @@ use hnl_engine_typecheck::TypecheckDiagnostic;
 use serde_json::{Map, Value};
 
 use crate::{
-    extract_meta_id, meta_value, role_child_ref, NbeTypecheckEngine, TypecheckContext,
+    extract_meta_id, is_assign_node, meta_value, role_child_ref, NbeTypecheckEngine,
+    TypecheckContext,
 };
 
 /// Build a tagged type value `{"__tag__": tag, "__registry__": id, …fields}`.
@@ -2682,4 +2683,317 @@ impl NbeTypecheckEngine {
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
     }
+}
+
+// ---------------------------------------------------------------------------
+// `stmt.import` / `stmt.export` — module signature records (phase-1 WS-B)
+// ---------------------------------------------------------------------------
+
+/// Whether `spec` is a bare module name (no path separators) — `str`,
+/// `bool`; `"../lib/x"`, `"./mod.hnl"` are file specs.
+fn is_bare_module_name(spec: &str) -> bool {
+    !spec.is_empty()
+        && !spec.contains('/')
+        && !spec.contains('\\')
+        && !spec.ends_with(".hnl")
+        && spec
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+impl NbeTypecheckEngine {
+    /// The `type.unknown` value — dynamic/`resolve` imports bind here
+    /// (phase-1 spec WS-B: `resolve`/dynamic imports → `type.unknown`).
+    fn type_unknown(&self, ctx: &TypecheckContext) -> Value {
+        ctx.registry
+            .construct("type.unknown", &Value::Null)
+            .unwrap_or(Value::Null)
+    }
+
+    /// `Sig_m` — the module signature record for `spec` as a
+    /// `type.module_sig{module, fields}` value. Fields come from the
+    /// module registry's `lookup_module_exports`: each export's declared
+    /// signature, or `type.unknown` when it has none. `None` from the
+    /// registry (no such host/`.hnl` module) → `type.unknown`, the
+    /// dynamic-import fallback.
+    fn module_signature(&self, spec: &str, ctx: &mut TypecheckContext) -> Value {
+        let exports = self
+            .modules
+            .as_ref()
+            .and_then(|m| m.lookup_module_exports(spec));
+        match exports {
+            Some(list) => {
+                let mut fields = Map::new();
+                for (name, sig) in list {
+                    fields.insert(
+                        name,
+                        sig.unwrap_or_else(|| self.type_unknown(ctx)),
+                    );
+                }
+                let mut payload = Map::new();
+                payload.insert("module".to_string(), Value::String(spec.to_string()));
+                payload.insert("fields".to_string(), Value::Object(fields));
+                make_tag(ctx, "type.module_sig", payload)
+            }
+            None => self.type_unknown(ctx),
+        }
+    }
+
+    /// The type of one named field projected out of `Sig_m` — the sig's
+    /// recorded field type, else a `lookup_type_signature` probe for
+    /// `<spec>.<name>`, else an opaque meta-function type when the op
+    /// resolves without a declared signature, else `type.unknown`.
+    fn import_field_type(
+        &self,
+        sig: &Value,
+        spec: &str,
+        name: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Value {
+        if let Some(ft) = sig
+            .get("fields")
+            .and_then(Value::as_object)
+            .and_then(|f| f.get(name))
+        {
+            return ft.clone();
+        }
+        if let Some(mods) = self.modules.as_ref() {
+            let q = format!("{spec}.{name}");
+            if let Some(t) = mods.lookup_type_signature(&q) {
+                return t;
+            }
+            if mods.lookup(&q).is_some() {
+                let p = meta_value(ctx.fresh_meta());
+                let b = meta_value(ctx.fresh_meta());
+                let mut m = Map::new();
+                m.insert("param".to_string(), p);
+                m.insert("body".to_string(), b);
+                return make_tag(ctx, "type.function", m);
+            }
+        }
+        self.type_unknown(ctx)
+    }
+
+    /// `synth_import` — a `stmt.import` node binds names into Γ from the
+    /// imported module's signature record (phase-1 spec WS-B):
+    ///
+    /// - `import m` — binds `m : Sig_m` (the record).
+    /// - `import "<spec>"` — splice import: binds nothing statically.
+    /// - `from "<spec>" import <n>` / `{ a, b as x }` — named field
+    ///   projections (`x : Sig_m.<field>`).
+    /// - `from "<spec>" import *` — splices `Sig_m`'s fields into Γ; for
+    ///   a bare module name also binds `spec : Sig_m` so qualified
+    ///   `spec.f` access keeps working (model parity).
+    /// - `from "<spec>" import * as m` — binds `m : Sig_m` (the record).
+    ///
+    /// Unresolvable/dynamic specs degrade each binding to `type.unknown`.
+    /// Returns `type.unit`.
+    pub(crate) fn synth_import_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let _ = lang;
+        let unit = |ctx: &TypecheckContext| make_tag(ctx, "type.unit", Map::new());
+        let path = node.payload.get("path").and_then(Value::as_str);
+        let alias = node
+            .payload
+            .get("alias")
+            .and_then(Value::as_str)
+            .filter(|a| !a.is_empty());
+        let names = node.payload.get("names").filter(|v| !v.is_null());
+        // `import <name>` — the single child is a `var` carrying the name.
+        let child_var = children_of(node)
+            .and_then(|c| c.first())
+            .and_then(Value::as_u64)
+            .and_then(|i| ast.get(AstRef::new(i as usize)))
+            .and_then(node_name);
+
+        // `import <m>` — `m : Sig_m`, the whole record.
+        if path.is_none() && names.is_none() && alias.is_none() {
+            if let Some(n) = child_var {
+                let sig = self.module_signature(&n, ctx);
+                ctx.extend(n, sig);
+            }
+            return Ok(unit(ctx));
+        }
+        // `import "<spec>"` — splice import: nothing statically bound.
+        if path.is_some() && names.is_none() && alias.is_none() && child_var.is_none() {
+            return Ok(unit(ctx));
+        }
+
+        let spec = path.unwrap_or_default();
+        let sig = if spec.is_empty() {
+            self.type_unknown(ctx)
+        } else {
+            self.module_signature(spec, ctx)
+        };
+
+        // `… import * as m` / `import n as m` — the alias binds the record
+        // (star) or the named field.
+        if let Some(a) = alias {
+            let bound = match names {
+                Some(Value::String(s)) if s != "*" => self.import_field_type(&sig, spec, s, ctx),
+                _ => sig.clone(),
+            };
+            ctx.extend(a.to_string(), bound);
+            return Ok(unit(ctx));
+        }
+
+        match names {
+            // `from "<spec>" import *` — splice fields into Γ.
+            Some(Value::String(s)) if s == "*" => {
+                if let Some(fields) = sig.get("fields").and_then(Value::as_object) {
+                    for (n, t) in fields {
+                        ctx.extend(n.clone(), t.clone());
+                    }
+                }
+                // Bare module-name specs (`str`) also stay usable qualified.
+                if is_bare_module_name(spec) {
+                    ctx.extend(spec.to_string(), sig.clone());
+                }
+            }
+            Some(Value::String(s)) => {
+                let ty = self.import_field_type(&sig, spec, s, ctx);
+                ctx.extend(s.clone(), ty);
+            }
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let (bound, field) = match item {
+                        Value::String(s) => (s.clone(), s.clone()),
+                        Value::Object(o) => {
+                            let a = o.get("as").and_then(Value::as_str).map(String::from);
+                            let n = o.get("name").and_then(Value::as_str).map(String::from);
+                            match (a, n) {
+                                (Some(a), Some(n)) => (a, n),
+                                (None, Some(n)) => (n.clone(), n),
+                                (Some(a), None) => (a.clone(), a),
+                                _ => continue,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    let ty = self.import_field_type(&sig, spec, &field, ctx);
+                    ctx.extend(bound, ty);
+                }
+            }
+            _ => {}
+        }
+        Ok(unit(ctx))
+    }
+
+    /// `synth_export` — a `stmt.export` records the exported name's type
+    /// into the module signature (`ctx.exports` → `Sig_m`). The child is
+    /// a `var` (`export x`), a binding (`export x :: expr` parses as
+    /// `export(assign(x, expr))` — both declares and binds `x`), or a
+    /// signature (`export x: T ~> U` parses as
+    /// `export(function(type-annot{x}, T))`). Returns `type.unit`.
+    pub(crate) fn synth_export_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let unit = |ctx: &TypecheckContext| make_tag(ctx, "type.unit", Map::new());
+        let Some(child_idx) = children_of(node)
+            .and_then(|c| c.first())
+            .and_then(Value::as_u64)
+            .map(|i| i as usize)
+        else {
+            return Ok(unit(ctx));
+        };
+        let child_ref = AstRef::new(child_idx);
+        let Some(child) = ast.get(child_ref) else {
+            return Ok(unit(ctx));
+        };
+        if is_assign_node(lang, child) {
+            // `export x :: expr` — bind `x` in Γ, then record its type.
+            self.synth_assign_judgment(lang, ast, child, ctx)?;
+            if let Some(name) = assign_target_name(lang, ast, child) {
+                let ty = ctx
+                    .lookup(&name)
+                    .cloned()
+                    .unwrap_or_else(|| self.type_unknown(ctx));
+                ctx.exports.push((name, ty));
+            }
+            return Ok(unit(ctx));
+        }
+        if let Some(name) = node_name(child) {
+            // `export x` / `export x from "path"` — re-export an existing
+            // binding; record its Γ type (unknown if unbound — the
+            // `unbound-export` scope lint owns that diagnostic).
+            let ty = ctx
+                .lookup(&name)
+                .cloned()
+                .unwrap_or_else(|| self.type_unknown(ctx));
+            ctx.exports.push((name, ty));
+            return Ok(unit(ctx));
+        }
+        // `export x: T ~> U` — a type signature. The exported name is the
+        // annotation's subject; the signature type is the synthesized
+        // type-expression type of the child.
+        if let Some(name) = signature_name(ast, child) {
+            let ty = self
+                .synth_node(lang, ast, child_ref, ctx)
+                .unwrap_or_else(|_| self.type_unknown(ctx));
+            ctx.exports.push((name, ty));
+        }
+        Ok(unit(ctx))
+    }
+}
+
+/// The name a binding-shaped node's `target` declares (`var`, or the
+/// `subject` of a `type-annot` target) — mirrors the bootstrap scope
+/// pass's `binding_target_name` (ADR-0081 roles).
+fn assign_target_name(lang: &Language, ast: &Ast, node: &AstNode) -> Option<String> {
+    let t_idx = lang
+        .child_role_index(&node.kind, "target")
+        .ok()
+        .flatten()?;
+    let tref = children_of(node)
+        .and_then(|c| c.get(t_idx))
+        .and_then(Value::as_u64)?;
+    let target = ast.get(AstRef::new(tref as usize))?;
+    if let Some(n) = node_name(target) {
+        return Some(n);
+    }
+    let subj = lang
+        .child_role_index(&target.kind, "subject")
+        .ok()
+        .flatten()?;
+    let sref = children_of(target)
+        .and_then(|c| c.get(subj))
+        .and_then(Value::as_u64)?;
+    ast.get(AstRef::new(sref as usize)).and_then(node_name)
+}
+
+/// The declared name of an export signature child — the subject of a
+/// `type-annot` inside the node (e.g. `x` in `function(type-annot{x}, T)`).
+/// Mirrors the bootstrap `signature_name` (first `type-annot` subject).
+fn signature_name(ast: &Ast, node: &AstNode) -> Option<String> {
+    let subj = children_of(node)
+        .and_then(|c| c.first())
+        .and_then(Value::as_u64)
+        .and_then(|i| ast.get(AstRef::new(i as usize)))?;
+    if subj.kind == "type-annot" {
+        return children_of(subj)
+            .and_then(|c| c.first())
+            .and_then(Value::as_u64)
+            .and_then(|i| ast.get(AstRef::new(i as usize)))
+            .and_then(node_name);
+    }
+    if let Some(kids) = children_of(node) {
+        for c in kids {
+            if let Some(i) = c.as_u64()
+                && let Some(n) = ast.get(AstRef::new(i as usize))
+                && let Some(name) = signature_name(ast, n)
+            {
+                return Some(name);
+            }
+        }
+    }
+    None
 }

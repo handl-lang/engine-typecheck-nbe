@@ -36,6 +36,32 @@ pub fn type_sym(seed: &str) -> Rc<Sym> {
     Sym::seeded(seed)
 }
 
+/// The canonical `type.*` seed for a builtin type tag (the `__tag__`
+/// spellings of legacy type values, and the `type.*` tags of the tagged
+/// model). Unknown tags pass through as their own seed — they are former
+/// heads, not builtin nominals.
+pub fn canonical_tag_seed(tag: &str) -> &str {
+    match tag {
+        "int" | "type.int" => "type.Int",
+        "nat" | "type.nat" => "type.Nat",
+        "float" | "type.float" => "type.Float",
+        "number" | "type.number" => "type.Number",
+        "str" | "string" | "type.string" | "type.str" => "type.Str",
+        "bool" | "type.bool" => "type.Bool",
+        "null" | "type.null" => "type.Null",
+        "obj" | "object" | "type.obj" | "type.object" => "type.Obj",
+        "array" | "type.array" => "type.Array",
+        "bytes" | "type.bytes" => "type.Bytes",
+        "arrow" | "function" | "type.arrow" => "type.Arrow",
+        "resource" | "type.resource" => "type.Resource",
+        "unit" | "type.unit" => "type.Unit",
+        "value" | "any" | "type.value" => "type.Value",
+        "type" | "type.type" => "type.Type",
+        "grade" | "type.grade" => "type.Grade",
+        other => other,
+    }
+}
+
 /// A former signature — an explicit telescope (data, not a closure).
 ///
 /// `params[i]` is `(name, type)`; a param's type may mention earlier
@@ -188,7 +214,12 @@ pub struct Checker {
 impl Checker {
     /// A fresh context with no bindings and the builtin former rules
     /// (`type.pi`, `type.hom`) registered — seeded syms, idempotent.
+    /// The builtin `type.*` nominal graph (`Nat <: Int <: Number` and
+    /// the `ty` links, ADR-0154 §2) is ensured so literal-meta solves
+    /// and nominal subtyping see declared links regardless of mint
+    /// order.
     pub fn new() -> Self {
+        handl_value::ensure_builtin_type_nominals();
         let mut c = Self::default();
         c.declare_pi();
         c.declare_hom();
@@ -299,8 +330,8 @@ impl Checker {
     /// over `type.float` descendants.
     pub fn infer_literal(&mut self, tv: &TaggedValue) -> Val {
         let c = match tv {
-            TaggedValue::Float(_) => MetaConstraint::DescendantOf(type_sym("type.float")),
-            _ => MetaConstraint::DescendantOf(type_sym("type.number")),
+            TaggedValue::Float(_) => MetaConstraint::DescendantOf(type_sym("type.Float")),
+            _ => MetaConstraint::DescendantOf(type_sym("type.Number")),
         };
         let m = self.fresh_meta_constrained(Val::Universe(0), c);
         self.meta_val(m)
@@ -371,12 +402,12 @@ impl Checker {
     fn infer_const(&mut self, tv: &TaggedValue) -> Result<Val, TcError> {
         Ok(match tv {
             TaggedValue::Int(_) | TaggedValue::Float(_) => self.infer_literal(tv),
-            TaggedValue::Str(_) => Val::Nominal(type_sym("type.string")),
-            TaggedValue::Bool(_) => Val::Nominal(type_sym("type.bool")),
-            TaggedValue::Null => Val::Nominal(type_sym("type.null")),
-            TaggedValue::Arr(_) => Val::Nominal(type_sym("type.array")),
-            TaggedValue::Obj(_) => Val::Nominal(type_sym("type.obj")),
-            TaggedValue::Bytes(_) => Val::Nominal(type_sym("type.bytes")),
+            TaggedValue::Str(_) => Val::Nominal(type_sym("type.Str")),
+            TaggedValue::Bool(_) => Val::Nominal(type_sym("type.Bool")),
+            TaggedValue::Null => Val::Nominal(type_sym("type.Null")),
+            TaggedValue::Arr(_) => Val::Nominal(type_sym("type.Array")),
+            TaggedValue::Obj(_) => Val::Nominal(type_sym("type.Obj")),
+            TaggedValue::Bytes(_) => Val::Nominal(type_sym("type.Bytes")),
             TaggedValue::Sym(s) => {
                 return self.infer(&Val::Nominal(s.clone()));
             }
@@ -761,15 +792,22 @@ impl Checker {
     }
 
     /// Default every still-unsolved meta to its constraint anchor
-    /// (0154 §5: unresolved literal metas default — integer literals
-    /// take the numeric anchor until a `Nat` former lands with WS-C).
+    /// (0154 §5: unresolved literal metas default — integer literals →
+    /// `Nat`, fraction literals → `Float`). The `type.Number` anchor
+    /// defaults to `type.Nat` (its integral subtype); every other anchor
+    /// is already its own default.
     pub fn default_unsolved(&mut self) {
         for (i, c) in self.meta_constraints.iter().enumerate() {
             if self.metas.solution(i as MetaId).is_some() {
                 continue;
             }
             if let MetaConstraint::DescendantOf(sym) = c {
-                let sym = sym.clone();
+                // 0154 §5: the numeric anchor's default is Nat.
+                let sym = if sym == &type_sym("type.Number") {
+                    type_sym("type.Nat")
+                } else {
+                    sym.clone()
+                };
                 self.metas.solve(i as MetaId, Val::Nominal(sym));
             }
         }
@@ -908,7 +946,11 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                     })
                     .collect();
                 if keyed.is_empty() {
-                    return Val::Nominal(type_sym(tag));
+                    // Builtin type tags lift to the canonical `type.*`
+                    // seeded nominals (ADR-0154 §1 — the same seeds the
+                    // runtime `type.<Name>` ops mint), so a legacy
+                    // `{"__tag__": "int"}` value meets `type.Int`.
+                    return Val::Nominal(type_sym(canonical_tag_seed(tag)));
                 }
                 keyed.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
                 return Val::Former {
@@ -1015,15 +1057,15 @@ mod tests {
     use super::*;
 
     fn number() -> Rc<Sym> {
-        Sym::seeded("type.number")
+        Sym::seeded("type.Number")
     }
 
     fn int() -> Rc<Sym> {
-        Sym::seeded_with_parent("type.int", &number())
+        Sym::seeded_with_parent("type.Int", &number())
     }
 
     fn nat() -> Rc<Sym> {
-        Sym::seeded_with_parent("type.nat", &int())
+        Sym::seeded_with_parent("type.Nat", &int())
     }
 
     #[test]
@@ -1059,8 +1101,8 @@ mod tests {
         // descendant (not via Nat <: Int subtyping).
         c.check(&Val::Const(TaggedValue::Int(1)), &Val::Nominal(int()))
             .unwrap();
-        // `1 : Str` fails — `type.string` is not a number descendant.
-        let strs = Sym::seeded("type.string");
+        // `1 : Str` fails — `type.Str` is not a number descendant.
+        let strs = Sym::seeded("type.Str");
         assert!(c
             .check(&Val::Const(TaggedValue::Int(1)), &Val::Nominal(strs))
             .is_err());
@@ -1075,9 +1117,11 @@ mod tests {
         };
         c.default_unsolved();
         let sol = c.metas.solution(meta).unwrap();
+        // 0154 §5: an unresolved integer literal defaults to `Nat`
+        // (not its `type.Number` anchor).
         assert!(matches!(
             sol,
-            Val::Nominal(s) if s.name() == "number"
+            Val::Nominal(s) if s.name() == "Nat"
         ));
     }
 
@@ -1223,11 +1267,11 @@ mod tests {
         let x = c.bind("x", Val::Nominal(int()));
         // `x : Int` — infer the rigid head.
         let t = c.infer(&x).unwrap();
-        assert!(matches!(t, Val::Nominal(s) if s.name() == "int"));
-        let _y = c.bind("y", Val::Nominal(Sym::seeded("type.string")));
+        assert!(matches!(t, Val::Nominal(s) if s.name() == "Int"));
+        let _y = c.bind("y", Val::Nominal(Sym::seeded("type.Str")));
         // The outer binder's level still resolves after extension.
         let t = c.infer(&x).unwrap();
-        assert!(matches!(t, Val::Nominal(s) if s.name() == "int"));
+        assert!(matches!(t, Val::Nominal(s) if s.name() == "Int"));
     }
 
     #[test]
@@ -1240,7 +1284,7 @@ mod tests {
         let sig = c.declare_former(
             "type.sig",
             Telescope {
-                params: vec![("fields".into(), Val::Nominal(type_sym("type.obj")))],
+                params: vec![("fields".into(), Val::Nominal(type_sym("type.Obj")))],
                 result: Val::Universe(0),
             },
         );
@@ -1358,7 +1402,7 @@ mod tests {
     }
 
     fn bool_s() -> Rc<Sym> {
-        Sym::seeded("type.bool")
+        Sym::seeded("type.Bool")
     }
 
     #[test]
