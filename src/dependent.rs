@@ -159,16 +159,32 @@ pub(crate) fn domain_quote(v: &Val, ctx: &TypecheckContext) -> Value {
 
 /// Whether `v` is a `Former{type.io}` application — either `__former__`
 /// spelling (quote's `{"sym", "args"}` or the surface `{"indices"}`).
+/// Identity is the seeded-sym *handle* (`Sym::seeded("type.io")` spells
+/// its short display name `"io"`, never the full seed — the quoted
+/// `__sym__` payload carries `handle` for exactly this compare); the
+/// name check is a fallback for spellings that drop the handle.
 fn io_headed(v: &Value) -> bool {
-    fn sym_name(s: &Value) -> Option<&str> {
-        s.get("__sym__")
+    fn sym_matches(s: &Value) -> bool {
+        let handle = s
+            .get("__sym__")
+            .and_then(|x| x.get("handle"))
+            .or_else(|| s.get("handle"))
+            .and_then(Value::as_u64);
+        if let Some(h) = handle {
+            // A spelled handle is authoritative — a different sym that
+            // happens to display as "io" must not false-positive.
+            return h == checker::type_sym("type.io").handle();
+        }
+        let name = s
+            .get("__sym__")
             .and_then(|x| x.get("name"))
             .or_else(|| s.get("name"))
-            .and_then(Value::as_str)
+            .and_then(Value::as_str);
+        matches!(name, Some("type.io" | "io"))
     }
     v.get("__former__")
-        .and_then(|f| sym_name(f).or_else(|| f.get("sym").and_then(sym_name)))
-        == Some("type.io")
+        .map(|f| sym_matches(f) || f.get("sym").is_some_and(sym_matches))
+        .unwrap_or(false)
 }
 
 /// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
@@ -1840,6 +1856,32 @@ impl NbeTypecheckEngine {
         b: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        if a == b {
+            return Ok(());
+        }
+        // A solved meta stands for its solution: dereference it before
+        // the meta-solve shortcut so a second constraint on a shared
+        // meta checks against the *solution* — re-solving the cell
+        // would silently overwrite it. This is what rejects the IO
+        // widen: `x ~> x` synths `type.function{?m, ?m}` (param and
+        // body share the meta), so checking it against
+        // `IO(sa) ~> IO(sb)` solves `?m := IO(sa)` at the domain and
+        // leaves `dep_unify(IO(sa), IO(sb))` — signature subtyping
+        // through the IO arm below — at the codomain.
+        let za;
+        let zb;
+        let a = if extract_meta_id(a).is_some() {
+            za = self.zonk(a, ctx);
+            &za
+        } else {
+            a
+        };
+        let b = if extract_meta_id(b).is_some() {
+            zb = self.zonk(b, ctx);
+            &zb
+        } else {
+            b
+        };
         if a == b {
             return Ok(());
         }
