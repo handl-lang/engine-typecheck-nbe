@@ -99,6 +99,7 @@ use hnl_engine_typecheck::{
 use handl_plugin_lib_tag::TypeRegistry;
 use hnl_engine::TermData;
 
+pub mod checker;
 mod predicate_eval;
 mod totality_check;
 
