@@ -101,6 +101,7 @@ use handl_value::{TaggedValue, nbe::Val};
 use hnl_engine::TermData;
 
 pub mod checker;
+mod dependent;
 pub mod judgments;
 mod predicate_eval;
 mod totality_check;
@@ -307,6 +308,15 @@ impl NbeTypecheckEngine {
                 node,
             )
         })?;
+        // Dependent introduction (ADR-0152/0120): checking an arrow
+        // against `type.pi`/`type.family`, a pair against `type.sigma`,
+        // or `refl`/a witness against `Path` goes through the dependent
+        // introduction rules rather than synth-then-unify.
+        if let Some(res) = self.dep_check_intro(lang, ast, node_ref, expected, ctx) {
+            res?;
+            ctx.node_types.insert(node_ref.index(), expected.clone());
+            return Ok(());
+        }
         if let Some(check_scheme) = &rule.check {
             self.eval_type_scheme(
                 lang,
@@ -320,7 +330,7 @@ impl NbeTypecheckEngine {
             Ok(())
         } else {
             let ty = self.synth_node(lang, ast, node_ref, ctx)?;
-            self.unify(&ty, expected, ctx)?;
+            self.dep_unify(&ty, expected, ctx)?;
             ctx.node_types.insert(node_ref.index(), ty);
             Ok(())
         }
@@ -1032,7 +1042,26 @@ impl NbeTypecheckEngine {
                     })?,
                 };
                 match ctx.lookup(name).cloned() {
+                    // A constructor name instantiates its `type.ctor_sig`
+                    // telescope on read — `Succ` is a `type.function`
+                    // ending in the family application (ADR-0152 §2).
+                    Some(ty)
+                        if ty.get("__tag__").and_then(Value::as_str)
+                            == Some("type.ctor_sig") =>
+                    {
+                        self.instantiate_ctor_full(lang, ast, &ty, ctx)
+                    }
                     Some(ty) => Ok(ty),
+                    // `refl` — the canonical `Path` introduction (ADR-0120):
+                    // it inhabits `Path(a, a)` — checking routes through
+                    // `dep_check_intro`; synthesizing it yields the Refl
+                    // marker so `transport`/`j` can resolve it.
+                    None if name == "refl" => ctx
+                        .registry
+                        .construct("Refl", &Value::Null)
+                        .ok_or_else(|| {
+                            LangError::engine("lookup: construct Refl failed")
+                        }),
                     // Ambient globals (`Language::globals`, globals.yaml)
                     // are ordinary identifiers bound to *values* — e.g.
                     // `true`/`false` are the canonical booleans, not
@@ -1363,6 +1392,12 @@ impl NbeTypecheckEngine {
                             )
                         });
                 }
+                // A standalone `assign` node (e.g. the last child of a
+                // block, where the block does not bind it) typechecks
+                // through `synth_assign`: bind the target, synth the
+                // value, and check it against any annotation — the
+                // `construct type.unit` legacy rule never evaluated the
+                // assign's children.
                 let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
                     LangError::engine_node(
                         "typecheck: synth_block: last child index is not a u64",
@@ -1503,8 +1538,27 @@ impl NbeTypecheckEngine {
                                 ann_ref.index()
                             ))
                         })?;
-                        let ann = interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)?;
-                        self.unify(&value_type, &ann, ctx)?;
+                        // Dependent annotations (families, `Pi`/`Sigma`,
+                        // `Path`, index terms) interpret through the
+                        // dep-aware path; the legacy `type.*` spellings
+                        // remain the fallback.
+                        let ann = self
+                            .dep_synth_type(lang, ast, ann_ref.index(), ctx)
+                            .or_else(|_| {
+                                interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)
+                            })?;
+                        // Dependent annotations check the *value* against
+                        // the former (Pi/Sigma/Family/Path intros live in
+                        // `dep_check_intro`); everything else unifies.
+                        if matches!(
+                            ann.get("__tag__").and_then(Value::as_str),
+                            Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app")
+                        ) {
+                            let _ = value_type;
+                            self.check_node(lang, ast, value_ref, &ann, ctx)?;
+                        } else {
+                            self.dep_unify(&value_type, &ann, ctx)?;
+                        }
                         ann
                     } else {
                         value_type
@@ -1745,8 +1799,20 @@ impl NbeTypecheckEngine {
                                 ann_ref.index()
                             ))
                         })?;
-                        let ann = interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)?;
-                        self.unify(&value_type, &ann, ctx)?;
+                        let ann = self
+                            .dep_synth_type(lang, ast, ann_ref.index(), ctx)
+                            .or_else(|_| {
+                                interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)
+                            })?;
+                        if matches!(
+                            ann.get("__tag__").and_then(Value::as_str),
+                            Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app")
+                        ) {
+                            let _ = value_type;
+                            self.check_node(lang, ast, value_ref, &ann, ctx)?;
+                        } else {
+                            self.dep_unify(&value_type, &ann, ctx)?;
+                        }
                         ann
                     } else {
                         value_type
@@ -1793,14 +1859,12 @@ impl NbeTypecheckEngine {
                 Ok(Value::Null)
             }
             "synth_match_arms" => {
-                // Multi-arm unification for `match` nodes. The match node's
-                // children are: [scrutinee, block] where the block's children
-                // are the arm nodes. Each arm is a node with children
-                // [pattern, body]. We synth the body of each arm (child 1 of
-                // each arm node) and unify them all, returning the unified
-                // type. With fewer than 2 children (no arms), returns
-                // `type.unknown`
-                // (ADR-0054 — Term lacks iteration, so this is a judgment op).
+                // Dependent elimination (ADR-0152 §3 — WS-C rewrite):
+                // ctor-pattern arms instantiate `type.ctor_sig`s and refine
+                // the scrutinee's family indices (rigid `var` rewrites +
+                // `eq_<name>` `Path` witnesses); `absurd` arms discharge
+                // decided-impossible index equations; the motive, when
+                // present, is applied per arm at the refined indices.
                 let node = ast.get(node_ref).ok_or_else(|| {
                     LangError::engine(format!(
                         "synth_match_arms: node {} out of bounds",
@@ -1826,10 +1890,37 @@ impl NbeTypecheckEngine {
                             )
                         });
                 }
-                // Child 1 is a `block` node whose children are the arms.
-                // If it is a block, iterate its children; otherwise iterate
-                // match's children 1.. directly (legacy form).
-                let block_idx = children[1].as_u64().ok_or_else(|| {
+                let scrutinee_idx = children[0].as_u64().ok_or_else(|| {
+                    LangError::engine_node(
+                        "synth_match_arms: scrutinee child index is not a u64",
+                        node,
+                    )
+                })? as usize;
+                // `motive` role (optional middle child of the 3-child
+                // `return … with` form) — resolved by declared role, not
+                // position.
+                let motive_idx = if children.len() >= 3 {
+                    lang.child_role_index_for(node, "motive")
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            role_index_of(lang, &node.kind, "motive").and_then(|i| {
+                                children.get(i).and_then(Value::as_u64).map(|v| v as usize)
+                            })
+                        })
+                        .and_then(|i| {
+                            // Guard: a `block`-kinded child is the arms, not
+                            // a motive.
+                            match ast.get(AstRef::new(i)) {
+                                Some(n) if !is_block_node(lang, n) => Some(i),
+                                _ => None,
+                            }
+                        })
+                } else {
+                    None
+                };
+                // The arm block is the last child.
+                let block_idx = children.last().and_then(Value::as_u64).ok_or_else(|| {
                     LangError::engine_node("synth_match_arms: arm child index is not a u64", node)
                 })? as usize;
                 let block_ref = AstRef::new(block_idx);
@@ -1877,80 +1968,72 @@ impl NbeTypecheckEngine {
                             .collect::<Result<Vec<_>, _>>()?
                     }
                 };
-                let scrutinee_idx = children[0].as_u64().ok_or_else(|| {
-                    LangError::engine_node(
-                        "synth_match_arms: scrutinee child index is not a u64",
-                        node,
-                    )
-                })? as usize;
                 let scrutinee_ref = AstRef::new(scrutinee_idx);
                 let scrutinee_type = self.synth_node(lang, ast, scrutinee_ref, ctx)?;
-
-                let mut arm_types: Vec<Value> = Vec::new();
-                for arm_idx in arm_indices {
-                    let arm_ref = AstRef::new(arm_idx);
-                    let arm_node = ast.get(arm_ref).ok_or_else(|| {
-                        LangError::engine(format!(
-                            "synth_match_arms: arm node {} out of bounds",
-                            arm_idx
-                        ))
-                    })?;
-                    // The arm node has children [pattern, body]
-                    let arm_children = arm_node
-                        .payload
-                        .get("children")
-                        .and_then(|c| c.as_array())
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_match_arms: arm node has no children array",
-                                node,
-                            )
-                        })?;
-                    if arm_children.len() < 2 {
-                        return Err(LangError::engine(
-                            "synth_match_arms: arm node needs at least 2 children (pattern, body)",
-                        ));
-                    }
-                    let pattern_idx = arm_children[0].as_u64().ok_or_else(|| {
-                        LangError::engine_node(
-                            "synth_match_arms: pattern child index is not a u64",
-                            node,
-                        )
-                    })? as usize;
-                    let body_idx = arm_children[1].as_u64().ok_or_else(|| {
-                        LangError::engine_node(
-                            "synth_match_arms: body child index is not a u64",
-                            node,
-                        )
-                    })? as usize;
-                    let pattern_ref = AstRef::new(pattern_idx);
-                    let body_ref = AstRef::new(body_idx);
-                    let mark = ctx.mark();
-                    self.bind_pattern_vars(lang, ast, pattern_ref, &scrutinee_type, ctx)?;
-                    let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
-                    ctx.restore(mark);
-                    arm_types.push(body_type);
-                }
-                // Unify all arm types
-                if arm_types.is_empty() {
-                    return ctx
-                        .registry
-                        .construct("type.unknown", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_match_arms: construct failed for type.unknown",
-                                node,
-                            )
-                        });
-                }
-                let unified = arm_types[0].clone();
-                for arm_type in &arm_types[1..] {
-                    self.unify(&unified, arm_type, ctx)?;
-                    // After unification, the unified type might have been
-                    // refined by meta solving; for simplicity, keep the first
-                    // type (metas are solved in-place).
-                }
-                Ok(unified)
+                self.synth_match_dependent(
+                    lang,
+                    ast,
+                    node,
+                    &arm_indices,
+                    scrutinee_idx,
+                    motive_idx,
+                    &scrutinee_type,
+                    ctx,
+                )
+            }
+            "synth_assign" => {
+                // Standalone `assign` — the legacy `type.assign` rule was
+                // a bare `construct type.unit`, so a last-position
+                // `x : T = v` never checked `v`. This op binds the
+                // target, synths the value, and dep-checks annotations.
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_assign: node out of bounds".to_string())
+                })?;
+                self.synth_assign_judgment(lang, ast, node, ctx)
+            }
+            "synth_data" => {
+                // ADR-0152 §1: bind `F : type.family` and each ctor a
+                // `type.ctor_sig` — with checker-owned strict positivity.
+                self.synth_data_judgment(lang, ast, node_ref, ctx)
+            }
+            "synth_call" => {
+                // Curried application: ctor/function/pi chains, dependent
+                // application through `body_closure`s, family_app for
+                // term-position family use.
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_call: node out of bounds".to_string())
+                })?;
+                self.synth_call_judgment(lang, ast, node, ctx)
+            }
+            "synth_dim_arrow" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_dim_arrow: node out of bounds".to_string())
+                })?;
+                self.synth_dim_arrow_judgment(lang, ast, node, ctx)
+            }
+            "synth_transport" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_transport: node out of bounds".to_string())
+                })?;
+                self.synth_transport_judgment(lang, ast, node, ctx)
+            }
+            "synth_j" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_j: node out of bounds".to_string())
+                })?;
+                self.synth_j_judgment(lang, ast, node, ctx)
+            }
+            "synth_flow" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_flow: node out of bounds".to_string())
+                })?;
+                self.synth_flow_judgment(lang, ast, node, ctx)
+            }
+            "synth_axis_flow" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_axis_flow: node out of bounds".to_string())
+                })?;
+                self.synth_axis_flow_judgment(lang, ast, node, ctx)
             }
             "synth_rec" => {
                 // Typecheck a `rec` region (ADR-0074 ID.3 — Paterson loop
@@ -2203,9 +2286,15 @@ impl NbeTypecheckEngine {
                     ))
                 })?;
 
-                // Try the existing type-syntax path first (handles
-                // `type.number`, `(type.number) -> type.bool`, etc.).
-                let annotation_result = interpret_type_expr(lang, ast, type_node, &ctx.registry);
+                // Dependent annotations first (families, `Pi`/`Sigma`/
+                // `Forall`/`Path` formers, index terms — ADR-0120/0152),
+                // then the existing type-syntax path (`type.number`,
+                // `(type.number) -> type.bool`, meta-predicates).
+                let annotation_result = self
+                    .dep_synth_type(lang, ast, type_idx, ctx)
+                    .or_else(|_| {
+                        interpret_type_expr(lang, ast, type_node, &ctx.registry)
+                    });
 
                 match annotation_result {
                     Ok(annotation_type) => {
