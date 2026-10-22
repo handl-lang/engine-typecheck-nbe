@@ -191,6 +191,14 @@ fn hom_dim_lit(v: &Val) -> Option<u64> {
     None
 }
 
+/// Whether a lifted value is a `Hom(m, ·, ·)` cell at dimension `m ≥ 3`
+/// — beyond the checked fragment (ADR-0153 §2 honest bound: `~[n]~>`
+/// terms at `n ≥ 3` parse and store but are *not* checked). Unifying
+/// one is stuck, never a decided failure.
+pub(crate) fn beyond_checked_dim(v: &Val) -> bool {
+    hom_dim_lit(v).is_some_and(|m| m >= 3)
+}
+
 fn num_val(v: &Value) -> Option<f64> {
     v.as_f64()
 }
@@ -222,11 +230,30 @@ fn node_name(node: &AstNode) -> Option<String> {
 // Index-term algebra
 // ---------------------------------------------------------------------------
 
-/// Replace solved metas with their solutions (deep).
+/// Replace solved metas with their solutions (deep). Meta-solution
+/// cycles (`?x := ?y`, `?y := ?x` — reachable whenever two unsolved
+/// metas unify in both orders, e.g. shared callee metas in nested
+/// applications) break to the bare meta rather than recursing — the
+/// same `visited` discipline as `Checker::zonk`.
 pub(crate) fn zonk_index(v: &Value, ctx: &TypecheckContext) -> Value {
+    let mut visited = std::collections::HashSet::new();
+    zonk_index_inner(v, ctx, &mut visited)
+}
+
+fn zonk_index_inner(
+    v: &Value,
+    ctx: &TypecheckContext,
+    visited: &mut std::collections::HashSet<u64>,
+) -> Value {
     if let Some(id) = extract_meta_id(v) {
+        if visited.contains(&id) {
+            return v.clone();
+        }
         if let Some(sol) = ctx.metas.get(id as usize).and_then(|o| o.as_ref()) {
-            return zonk_index(sol, ctx);
+            visited.insert(id);
+            let out = zonk_index_inner(sol, ctx, visited);
+            visited.remove(&id);
+            return out;
         }
         return v.clone();
     }
@@ -236,12 +263,16 @@ pub(crate) fn zonk_index(v: &Value, ctx: &TypecheckContext) -> Value {
         }
         let mut out = Map::new();
         for (k, x) in m {
-            out.insert(k.clone(), zonk_index(x, ctx));
+            out.insert(k.clone(), zonk_index_inner(x, ctx, visited));
         }
         return Value::Object(out);
     }
     if let Value::Array(xs) = v {
-        return Value::Array(xs.iter().map(|x| zonk_index(x, ctx)).collect());
+        return Value::Array(
+            xs.iter()
+                .map(|x| zonk_index_inner(x, ctx, visited))
+                .collect(),
+        );
     }
     v.clone()
 }
@@ -1631,6 +1662,50 @@ impl NbeTypecheckEngine {
                     None
                 }
             }
+            // `type.function` is the *structural* arrow: its `check`
+            // scheme checks params/body positionally, which is the
+            // only path that handles non-binder params (synthetic
+            // `value` params in unit tests). Route to the dependent
+            // intro — bind the name at the domain, check the body
+            // against the codomain — only when the params side spells
+            // an actual binder: `param_names` accepts any
+            // string-payload leaf, so also require the shape data —
+            // `pattern_role` (`var`/`arr`/`rest`/`sequence`), a
+            // `subject` role (`type-annot`), or a variadic params
+            // collection (`paren`/`tuple`/`array`). A bare `value`/`lit`
+            // satisfies none of these.
+            "type.function" => {
+                let node = ast.get(node_ref)?;
+                if node.kind != "function" {
+                    None
+                } else {
+                    let binder = children_of(node)
+                        .and_then(|kids| kids.first().and_then(Value::as_u64))
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .map(|p| {
+                            let shaped = lang.pattern_role(&p.kind).is_some()
+                                || lang.has_variadic_role(&p.kind)
+                                || lang
+                                    .child_role_index(&p.kind, "subject")
+                                    .ok()
+                                    .flatten()
+                                    .is_some();
+                            shaped
+                                && lang
+                                    .param_names(ast, p)
+                                    .map(|(names, rest)| {
+                                        !names.is_empty() || rest.is_some()
+                                    })
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if binder {
+                        Some(self.dep_intro_arrow(lang, ast, node, expected, ctx))
+                    } else {
+                        None
+                    }
+                }
+            }
             "Path" => {
                 let node = ast.get(node_ref)?;
                 if node.kind == "var" && node_name(node).as_deref() == Some("refl") {
@@ -2661,8 +2736,47 @@ impl NbeTypecheckEngine {
                 Some("type.ctor_sig") => self.instantiate_ctor_full(lang, ast, &cur, ctx)?,
                 Some("type.function") => {
                     let param = cur.get("param").cloned().unwrap_or(Value::Null);
-                    self.check_node(lang, ast, arg_ref, &param, ctx)?;
-                    cur.get("body").cloned().unwrap_or(Value::Null)
+                    // Positional tuple domains: a multi-param arrow
+                    // (`(x, y, …) ~> body`) mints `param` as
+                    // `type.array{elements: [d1, …, dn]}` — each call
+                    // argument checks against the *next* domain element
+                    // and the tuple shrinks until exhausted, at which
+                    // point the result is `body`. A real array-typed
+                    // domain spells `type.array{element: t}` (uniform)
+                    // and still checks the argument as a whole array.
+                    let domains = if tag_of(&param) == Some("type.array") {
+                        param
+                            .get("elements")
+                            .and_then(Value::as_array)
+                            .cloned()
+                    } else {
+                        None
+                    };
+                    match domains {
+                        Some(domains) if !domains.is_empty() => {
+                            self.check_node(lang, ast, arg_ref, &domains[0], ctx)?;
+                            if domains.len() > 1 {
+                                let mut rem =
+                                    cur.as_object().cloned().unwrap_or_default();
+                                let mut dom = Map::new();
+                                dom.insert(
+                                    "elements".to_string(),
+                                    Value::Array(domains[1..].to_vec()),
+                                );
+                                rem.insert(
+                                    "param".to_string(),
+                                    make_tag(ctx, "type.array", dom),
+                                );
+                                Value::Object(rem)
+                            } else {
+                                cur.get("body").cloned().unwrap_or(Value::Null)
+                            }
+                        }
+                        _ => {
+                            self.check_node(lang, ast, arg_ref, &param, ctx)?;
+                            cur.get("body").cloned().unwrap_or(Value::Null)
+                        }
+                    }
                 }
                 Some("type.pi") | Some("type.forall") => {
                     // Dependent application — check against the domain,

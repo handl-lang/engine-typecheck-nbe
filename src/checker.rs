@@ -681,6 +681,28 @@ impl Checker {
                 args: vec![Val::Const(TaggedValue::Int(d.max(k) as i64)), sa, tb_b],
             });
         }
+        // `Hom(?d, ·, ·)` — a cell type whose dimension is a meta or
+        // otherwise non-literal: the operand is a cell but its level
+        // is *open* (`d` above is only the 1-default). `k > d` and the
+        // boundary law can't be decided → store the composite at the
+        // operand's open dimension — the honest bound.
+        let open_dim = |vt: &Val, m: Option<u64>| -> Option<Val> {
+            if m.is_some() {
+                return None;
+            }
+            if let Val::Former { head, args } = self.metas.force_head(vt) {
+                if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+                    return Some(args[0].clone());
+                }
+            }
+            None
+        };
+        if let Some(dv) = open_dim(&ta, ma).or_else(|| open_dim(&tb, mb)) {
+            return Ok(Val::Former {
+                head: type_sym("type.hom"),
+                args: vec![dv, sa, tb_b],
+            });
+        }
         if !cells_ok {
             let bad = if self.cell_boundaries(a, &ta).is_err() && ma.is_none() {
                 self.show(&ta)

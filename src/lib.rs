@@ -320,6 +320,30 @@ impl NbeTypecheckEngine {
             ctx.node_types.insert(node_ref.index(), ty);
             return Ok(());
         }
+        // An unsolved metavariable carries no structure to check
+        // against — synthesize and let unification solve it. (The
+        // `check` schemes are directed: `type_field` of a meta yields
+        // `null`, so checking e.g. a `function` literal against `?t`
+        // would check its params against `null` and never bind them.)
+        if extract_meta_id(expected).is_some() {
+            // A meta already solved by earlier work has real
+            // structure — check against the solution, not the stale
+            // cell.
+            let resolved = self.zonk(expected, ctx);
+            if extract_meta_id(&resolved).is_none() {
+                return self.check_node(lang, ast, node_ref, &resolved, ctx);
+            }
+            let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+            // The meta may have been solved *while* the node
+            // synthesized (nested applications share the callee's
+            // metas) — unify against the current solution, not the
+            // stale cell (a re-solve would fail occurs on the
+            // structure the nested call stored).
+            let resolved = self.zonk(expected, ctx);
+            self.dep_unify(&ty, &resolved, ctx)?;
+            ctx.node_types.insert(node_ref.index(), ty);
+            return Ok(());
+        }
         if let Some(check_scheme) = &rule.check {
             self.eval_type_scheme(
                 lang,
@@ -1395,6 +1419,37 @@ impl NbeTypecheckEngine {
                                 "typecheck: synth_block: construct failed for type.unit",
                             )
                         });
+                }
+                // Object-literal blocks (ADR-0079 contextual braces):
+                // `{ "k": v, "k2": w }` in a `block_children` position
+                // (e.g. an arrow body — `grammar.arrow.infix` declares
+                // `block_children: [1]`) parses as a `block` of
+                // `type-annot` children rather than an `object` of
+                // `entry` pairs. Each `type-annot` whose `name` payload
+                // echoes a string-*literal* subject is a record entry,
+                // not an annotation — when every child is entry-shaped
+                // the block denotes object *data*, so synthesize the
+                // record exactly as `synth_object_record` does (a
+                // `__tag__` entry mints the tagged type — dependent.hnl's
+                // `Sigma := (A, F) ~> {"__tag__": "type.sigma", "param":
+                // A, "body": F}` yields `type.sigma{param, body}`).
+                let object_literal = children.iter().all(|c| {
+                    c.as_u64()
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .map(|n| is_record_entry_annot(lang, ast, n))
+                        .unwrap_or(false)
+                });
+                if object_literal {
+                    return self.eval_judgment(
+                        "synth_object_record",
+                        args,
+                        lit,
+                        lang,
+                        ast,
+                        node_ref,
+                        ctx,
+                        incoming,
+                    );
                 }
                 // A standalone `assign` node (e.g. the last child of a
                 // block, where the block does not bind it) typechecks
@@ -4462,15 +4517,23 @@ impl NbeTypecheckEngine {
             let mark = ctx.vcheck.store_mark();
             let va = dependent::domain_lift(a, ctx);
             let vb = dependent::domain_lift(b, ctx);
-            return if ctx.vcheck.conv(&va, &vb) {
-                Ok(())
-            } else {
+            if ctx.vcheck.conv(&va, &vb) {
+                return Ok(());
+            }
+            // A `Hom(m, ·, ·)` at `m ≥ 3` sits beyond the checked
+            // fragment (ADR-0153 §2 — `~[3]~>` coherence terms are
+            // stored, not checked): the mismatch is stuck, not a
+            // decided failure. Restore the domain store so a failed
+            // conversion leaves no partial solutions behind.
+            if dependent::beyond_checked_dim(&va) || dependent::beyond_checked_dim(&vb) {
                 ctx.vcheck.store_restore(mark);
-                Err(LangError::engine(format!(
-                    "typecheck: cannot unify {:?} with {:?}",
-                    a, b
-                )))
-            };
+                return Ok(());
+            }
+            ctx.vcheck.store_restore(mark);
+            return Err(LangError::engine(format!(
+                "typecheck: cannot unify {:?} with {:?}",
+                a, b
+            )));
         }
         // Recursive structural unification of tagged type values with the
         // same tag from the same registry (ADR-0054 legacy migration).
@@ -4950,6 +5013,29 @@ fn is_block_node(lang: &Language, node: &AstNode) -> bool {
 /// Falls back to the legacy kind check for role-less shapes.
 fn is_paren_node(lang: &Language, node: &AstNode) -> bool {
     role_declared(lang, &node.kind, "body")
+}
+
+/// Whether `node` is a record-*entry* annotation: a `subject`/`annot`
+/// pair (the `type-annot` shape) whose `name` payload echoes a
+/// string-*literal* subject. `{ "k": v }` inside a `block_children`
+/// position parses `k: v` pairs as `type-annot` nodes — an entry key is
+/// a `value`/`lit` leaf holding the key string, whereas a genuine
+/// annotation's subject is a `var` (or a compound expression).
+fn is_record_entry_annot(lang: &Language, ast: &Ast, node: &AstNode) -> bool {
+    if !role_declared(lang, &node.kind, "subject") || !role_declared(lang, &node.kind, "annot") {
+        return false;
+    }
+    let Some(name) = node.payload.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(subject) = role_child_ref(lang, node, "subject").and_then(|r| ast.get(r)) else {
+        return false;
+    };
+    // The key must be a literal leaf: a node carrying a string payload
+    // whose shape does *not* declare `pattern_role`. `var`/`arr` are
+    // pattern leaves (`x: T` stays an annotation); `value`/`lit`
+    // literals declare none.
+    lang.pattern_role(&subject.kind).is_none() && subject.payload.as_str() == Some(name)
 }
 
 /// Encode a metavariable id as `{"__meta__": id}`.
