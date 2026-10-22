@@ -2204,6 +2204,53 @@ impl NbeTypecheckEngine {
         } else {
             mnode
         };
+        if inner.kind == "var" {
+            // A named motive: `_motive := (i, w) ~> Vec(i, Bool)` binds
+            // the arrow's `Lam` term in `results` (synth_assign's
+            // `bind_result`) — resolve the var to it and apply that
+            // body's type expression as the motive. Any other var
+            // binding falls through to the constant-type reading.
+            if let Some(lam) = node_name(inner)
+                .and_then(|n| ctx.results.get(&n).cloned())
+                .filter(|v| matches!(tag_of(v), Some("Lam" | "LamVal")))
+            {
+                let names: Vec<String> = lam
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .map(|ps| {
+                        ps.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let body = lam.get("body").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let scrut_name = ast
+                    .get(AstRef::new(scrutinee_idx))
+                    .and_then(|n| {
+                        if n.kind == "var" {
+                            node_name(n)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "_scrut".to_string());
+                let old_results = ctx.results.clone();
+                for (i, name) in names.iter().enumerate() {
+                    let v = if i < arg_vals.len() {
+                        arg_vals[i].clone()
+                    } else if i == arg_vals.len() {
+                        var_term(&scrut_name)
+                    } else {
+                        var_term(name)
+                    };
+                    ctx.bind_result(name.clone(), v);
+                }
+                let r = self.dep_synth_type(lang, ast, body, ctx);
+                ctx.results = old_results;
+                return r;
+            }
+        }
         if inner.kind != "function" {
             // A non-function motive is a constant expected type.
             return self.dep_synth_type(lang, ast, motive_idx, ctx);

@@ -538,55 +538,51 @@ fn transport_rejects_non_path_and_absent_paths() {
 }
 
 /// The `j` eliminator consumes a path with an explicit motive:
-/// `j eq_n, (i, w) ~> Vec(i, Bool), v` checks `v` against the motive
+/// `J eq_n, (i, w) ~> Vec(i, Bool), v` checks `v` against the motive
 /// applied at the path's source (`Vec(var n, Bool)`) and synthesizes
 /// the motive at the target — `Vec(0, Bool)` under `VNil`,
-/// `Vec(?k + 1, Bool)` under `VCons` — composing with `apply_motive_`.
+/// `Vec(?k + 1, Bool)` under `VCons` — composing with `apply_motive`.
 ///
-/// The `j` prefix grammar exists (`grammar.j.prefix`, `ast.j`) but no
-/// keyword lexer rule emits `token.keyword.j` yet, so the surface form
-/// cannot be parsed — the test grafts `j` nodes onto the arena
-/// directly, rewriting each `eq_n # v` transport arm into
-/// `j eq_n, motive, v`.
+/// The surface form parses through `lex.keyword.j` (the CAPITAL `J`
+/// spelling — `j` stays an identifier) into `j` nodes
+/// (children `[path, motive, base]`); `synth_j` consumes them. A named
+/// motive bound in `results` (`_motive := (i2, w2) ~> Vec(i2, Bool)`)
+/// resolves to its `Lam` term through `apply_motive`'s var arm.
 #[test]
 fn j_eliminates_branch_path_through_motive() {
     let lang = canonical_lang();
-    let mut ast = parse_block(
+    let ast = parse_block(
         &lang,
         &[
             "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
-            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: eq_n # v, VCons(x, xs): eq_n # v }",
             "_motive := (i2, w2) ~> Vec(i2, Bool)",
+            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, _motive, v, VCons(x, xs): J eq_n, _motive, v }",
         ],
     );
-    // The motive `(i2, w2) ~> Vec(i2, Bool)`, parsed in the same block
-    // so `Vec` resolves in module scope, shared by both `j` nodes.
-    let motive_idx = ast
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| n.kind == "function")
-        .map(|(i, _)| i)
-        .last()
-        .expect("the _motive statement should contain a function node");
-    // Rewrite each `transport` arm `{children: [path, value]}` into a
-    // `j` node `{children: [path, motive, base]}`.
-    let transport_idx: Vec<usize> = ast
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| n.kind == "transport")
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(transport_idx.len(), 2, "both arms should be transports");
-    for i in transport_idx {
-        let node = ast.get_mut(AstRef::new(i)).unwrap();
-        let children = node.payload["children"].as_array().unwrap().clone();
-        node.kind = "j".to_string();
-        node.payload = json!({ "children": [children[0], motive_idx, children[1]] });
-    }
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "j eq_n, motive, v should eliminate the branch's Path through the motive, got {:?}",
+        "J eq_n, _motive, v should eliminate the branch's Path through the motive, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// `J` also takes a literal motive arrow: `J eq_n, (i, w) ~> Vec(i, Bool), v`
+/// applies the function child directly.
+#[test]
+fn j_surface_literal_motive() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, (i2, w2) ~> Vec(i2, Bool), v, VCons(x, xs): J eq_n, (i2, w2) ~> Vec(i2, Bool), v }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "J eq_n, (i2, w2) ~> Vec(i2, Bool), v should eliminate the branch's Path, got {:?}",
         diags_of(&result)
     );
 }
