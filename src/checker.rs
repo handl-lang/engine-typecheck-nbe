@@ -119,6 +119,12 @@ pub enum FormerSig {
     /// `cell.id(k, x)` — the identity k-cell on `x` (`id_k`). Its type
     /// is `Hom(k, x, x)` — see [`Checker::infer_id`].
     Id,
+    /// `IO(sig)` — the typed-effect former (ADR-0153 §4): an `IO` type
+    /// is an effect object whose index is the op-signature record.
+    /// `IO` bare (arity 0) is `IO(⊤)` — the top signature, accepting
+    /// any. Subtyping is record-width on the sig index — see
+    /// [`Checker::subtype`].
+    Io,
 }
 
 /// Errors the `Val` checker reports.
@@ -224,6 +230,8 @@ impl Checker {
         c.declare_pi();
         c.declare_hom();
         c.declare_cell_formers();
+        // `IO(sig)` — the typed-effect former (ADR-0153 §4).
+        c.formers.insert(type_sym("type.io").handle(), FormerSig::Io);
         c
     }
 
@@ -358,11 +366,46 @@ impl Checker {
         match (&a, &b) {
             (Val::Universe(i), Val::Universe(j)) => i <= j,
             (Val::Nominal(x), Val::Nominal(y)) => x.has_ancestor(y),
+            // `IO(sa) <: IO(sb)` — signature subtyping: `sb` must name
+            // at least the ops `sa` does (record-width on the sig
+            // index, `sb <: sa`). An arity-0 expected (`IO` bare =
+            // `IO(⊤)`) accepts any signature; an arity-0 actual is ⊤
+            // itself and only satisfies ⊤.
+            (Val::Former { head: ha, args: aa }, Val::Former { head: hb, args: ab })
+                if ha.handle() == hb.handle()
+                    && ha.handle() == type_sym("type.io").handle() =>
+            {
+                match (aa.first(), ab.first()) {
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                    (Some(sa), Some(sb)) => self.sig_width_subtype(sb, sa),
+                }
+            }
             // A bare nominal can inhabit a family application only if it
             // *is* that family's head with no indices — `Nat <: Nat()` —
             // covered by conv elsewhere; nominal-vs-former is not a
             // subtype step.
             _ => false,
+        }
+    }
+
+    /// Record-width subtyping on `IO` signature objects: `wider`
+    /// supplies every op `narrower` names, with convertible field
+    /// values (op signatures compare by `conv` — structural, per
+    /// ADR-0154 §3). Non-record sigs fall back to conversion.
+    fn sig_width_subtype(&mut self, wider: &Val, narrower: &Val) -> bool {
+        let w = self.metas.force_head(wider).clone();
+        let n = self.metas.force_head(narrower).clone();
+        match (&w, &n) {
+            (
+                Val::Const(TaggedValue::Obj(wm)),
+                Val::Const(TaggedValue::Obj(nm)),
+            ) => nm.iter().all(|(k, v)| {
+                wm.get(k).is_some_and(|wv| {
+                    self.conv(&Val::Const(wv.clone()), &Val::Const(v.clone()))
+                })
+            }),
+            _ => self.conv(&w, &n),
         }
     }
 
@@ -493,6 +536,18 @@ impl Checker {
                     });
                 };
                 self.infer_comp_axis(k, a, b)
+            }
+            FormerSig::Io => {
+                // `IO(sig) : Type(0)` — the sig index is an
+                // op-signature record; arity 0 is `IO(⊤)`.
+                if args.len() > 1 {
+                    return Err(TcError::Arity {
+                        former: head.name().to_string(),
+                        want: 1,
+                        got: args.len(),
+                    });
+                }
+                Ok(Val::Universe(0))
             }
             FormerSig::Id => match args {
                 [x] => self.infer_id(None, x),

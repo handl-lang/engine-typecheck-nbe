@@ -709,6 +709,39 @@ fn type_alias_expands_transparently() {
     );
 }
 
+/// `IO(sig)` — the typed-effect former (ADR-0153 §4): an `IO` type is
+/// an effect object indexed by the op-signature record. Checking
+/// `IO(s)` against `IO(s')` is signature subtyping — `s'` names at
+/// least the ops `s` does (record-width on the index). Bare `IO` is
+/// `IO(⊤)` — it accepts any signature in expected position.
+#[test]
+fn io_signature_subtyping() {
+    let lang = canonical_lang();
+    let good = parse_block(
+        &lang,
+        &[
+            "narrow : IO({puts: Str ~> Unit}) ~> IO({puts: Str ~> Unit, gets: Unit ~> Str}) = x ~> x",
+            "top : IO({puts: Str ~> Unit}) ~> IO = x ~> x",
+        ],
+    );
+    let result = typecheck(&lang, good);
+    assert!(
+        !has_error(&result),
+        "IO({{puts}}) should check against IO({{puts,gets}}) and bare IO, got {:?}",
+        diags_of(&result)
+    );
+
+    let bad = parse_block(
+        &lang,
+        &["widen : IO({puts: Str ~> Unit, gets: Unit ~> Str}) ~> IO({puts: Str ~> Unit}) = x ~> x"],
+    );
+    let result = typecheck(&lang, bad);
+    assert!(
+        has_error(&result),
+        "IO({{puts,gets}}) must not check against IO({{puts}}) — extra op not allowed"
+    );
+}
+
 /// `Ctor: absurd` is the explicit dismissal of a decided-impossible arm:
 /// `VNil : Vec(0, ?a)` can never produce a `Vec(2, Bool)` scrutinee, so
 /// `VNil: absurd` is *discharged* — no unreachable-branch diagnostic —

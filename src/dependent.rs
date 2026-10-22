@@ -157,6 +157,20 @@ pub(crate) fn domain_quote(v: &Val, ctx: &TypecheckContext) -> Value {
     ))
 }
 
+/// Whether `v` is a `Former{type.io}` application — either `__former__`
+/// spelling (quote's `{"sym", "args"}` or the surface `{"indices"}`).
+fn io_headed(v: &Value) -> bool {
+    fn sym_name(s: &Value) -> Option<&str> {
+        s.get("__sym__")
+            .and_then(|x| x.get("name"))
+            .or_else(|| s.get("name"))
+            .and_then(Value::as_str)
+    }
+    v.get("__former__")
+        .and_then(|f| sym_name(f).or_else(|| f.get("sym").and_then(sym_name)))
+        == Some("type.io")
+}
+
 /// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
 /// as boundary JSON (the `__former__` encoding).
 fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
@@ -954,14 +968,21 @@ impl NbeTypecheckEngine {
                 let body_idx = role_child_ref(lang, node, "body")
                     .or_else(|| child_at(ast, node, 1))
                     .ok_or_else(|| LangError::engine("dep_synth_type: function missing body"))?;
-                // The params child is a type expression (or a paren-wrapped
-                // params list — the last var is the domain for `A -> B`).
+                // The params child is a type expression — a `paren`-wrapped
+                // list takes its last child as the domain (the `A -> B`
+                // convention); any other node (`call` former
+                // applications like `Vec(n, a)`/`IO(sig)`, `var`, …) IS
+                // the domain.
                 let dom_idx = if let Some(p) = ast.get(params_idx) {
-                    children_of(p)
-                        .and_then(|k| k.last())
-                        .and_then(Value::as_u64)
-                        .map(|i| AstRef::new(i as usize))
-                        .unwrap_or(params_idx)
+                    if p.kind == "paren" {
+                        children_of(p)
+                            .and_then(|k| k.last())
+                            .and_then(Value::as_u64)
+                            .map(|i| AstRef::new(i as usize))
+                            .unwrap_or(params_idx)
+                    } else {
+                        params_idx
+                    }
                 } else {
                     params_idx
                 };
@@ -1048,6 +1069,17 @@ impl NbeTypecheckEngine {
             "Bool" => "type.bool",
             "String" | "Str" => "type.string",
             "Unit" => "type.unit",
+            // Bare `IO` = `IO(⊤)` — the arity-0 `Former{type.io}`
+            // (any signature) for backward compat (ADR-0153 §4).
+            "IO" => {
+                return Ok(domain_quote(
+                    &Val::Former {
+                        head: checker::type_sym("type.io"),
+                        args: vec![],
+                    },
+                    ctx,
+                ));
+            }
             "Type" | "Universe" | "Type0" => "type.universe",
             "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
             _ => {
@@ -1164,6 +1196,28 @@ impl NbeTypecheckEngine {
                     None => Value::Null,
                 };
                 Ok(path_val(frm, to))
+            }
+            Some("IO") => {
+                // `IO(sig)` — the typed-effect former (ADR-0153 §4):
+                // canonical `Former{type.io}` data. The sig index is
+                // an op-signature record — `{op: T, …}` entries
+                // synthesize their value types; `IO()` is `IO(⊤)`.
+                let sig = match arg_indices.first() {
+                    Some(&i) => self.io_sig(lang, ast, i, ctx)?,
+                    None => Value::Null,
+                };
+                let vs = domain_lift(&sig, ctx);
+                return Ok(domain_quote(
+                    &Val::Former {
+                        head: checker::type_sym("type.io"),
+                        args: if sig == Value::Null {
+                            vec![]
+                        } else {
+                            vec![vs]
+                        },
+                    },
+                    ctx,
+                ));
             }
             Some(name) => {
                 // A declared family's application: `Vec(i⃗)` →
@@ -1316,6 +1370,112 @@ impl NbeTypecheckEngine {
         let r = self.dep_synth_type(lang, ast, body_idx, ctx);
         ctx.results = old_results;
         r
+    }
+
+    /// The sig argument of `IO(sig)` — an `object` literal becomes a
+    /// record of op-name → synthesized value type; anything else is an
+    /// index term / type expression.
+    fn io_sig(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
+            LangError::engine("io: sig node out of bounds".to_string())
+        })?;
+        if node.kind == "object" {
+            let mut m = Map::new();
+            if let Some(entries) = node.payload.get("entries").and_then(Value::as_array) {
+                for e in entries {
+                    if let Some(k) = e.get("key").and_then(Value::as_str) {
+                        match e.get("value").and_then(Value::as_u64) {
+                            Some(vi) => {
+                                m.insert(
+                                    k.to_string(),
+                                    self.dep_synth_type(lang, ast, vi as usize, ctx)?,
+                                );
+                            }
+                            None => {
+                                if let Some(v) = e.get("value") {
+                                    m.insert(k.to_string(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if m.is_empty() {
+                for k in children_of(node).cloned().unwrap_or_default() {
+                    let Some(en) = k
+                        .as_u64()
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    else {
+                        continue;
+                    };
+                    if en.kind != "entry" {
+                        continue;
+                    }
+                    let ek = children_of(en)
+                        .and_then(|c| c.first())
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(|n| {
+                            node_name(n).or_else(|| {
+                                n.payload.get("value").and_then(Value::as_str).map(str::to_string)
+                            })
+                        });
+                    let v_idx = children_of(en)
+                        .and_then(|c| c.get(1))
+                        .and_then(Value::as_u64)
+                        .map(|i| i as usize);
+                    if let (Some(k), Some(vi)) = (ek, v_idx) {
+                        m.insert(k, self.dep_synth_type(lang, ast, vi, ctx)?);
+                    }
+                }
+            }
+            return Ok(Value::Object(m));
+        }
+        if node.kind == "block" {
+            // Object-literal blocks (ADR-0079): `{ op: T, … }` in a
+            // block position parses as `type-annot` children — each
+            // reads as an `entry` (subject → op name, annot → sig type).
+            let mut m = Map::new();
+            let mut entries = 0usize;
+            for k in children_of(node).cloned().unwrap_or_default() {
+                let Some(tn) = k
+                    .as_u64()
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                else {
+                    continue;
+                };
+                if tn.kind != "type-annot" {
+                    continue;
+                }
+                let tk = children_of(tn)
+                    .and_then(|c| c.first())
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(|n| {
+                            node_name(n).or_else(|| {
+                                n.payload.get("value").and_then(Value::as_str).map(str::to_string)
+                            })
+                        });
+                    let v_idx = children_of(tn)
+                        .and_then(|c| c.get(1))
+                        .and_then(Value::as_u64)
+                        .map(|i| i as usize);
+                    if let (Some(k), Some(vi)) = (tk, v_idx) {
+                        m.insert(k, self.dep_synth_type(lang, ast, vi, ctx)?);
+                        entries += 1;
+                    }
+                }
+            if entries > 0 {
+                return Ok(Value::Object(m));
+            }
+        }
+        self.node_index_or_type(lang, ast, idx, ctx)
     }
 
     /// `(params, body)` parts of a `function` node for dependent formers:
@@ -1755,7 +1915,24 @@ impl NbeTypecheckEngine {
             | (Some("type.family_app"), Some("type.function")) => Err(LangError::engine(
                 "typecheck: function is not a family member".to_string(),
             )),
-            _ => self.unify(a, b, ctx),
+            _ => {
+                // `Former{type.io}` — signature subtyping (record-width
+                // on the sig index): `IO(s) <: IO(s')` iff `s'` names
+                // at least the ops of `s` — directed, unlike index conv.
+                if io_headed(a) || io_headed(b) {
+                    let mark = ctx.vcheck.store_mark();
+                    let va = domain_lift(a, ctx);
+                    let vb = domain_lift(b, ctx);
+                    if ctx.vcheck.subtype(&va, &vb) {
+                        return Ok(());
+                    }
+                    ctx.vcheck.store_restore(mark);
+                    return Err(LangError::engine(format!(
+                        "typecheck: IO signature mismatch {a:?} vs {b:?}"
+                    )));
+                }
+                self.unify(a, b, ctx)
+            }
         }
     }
 
