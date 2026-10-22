@@ -61,6 +61,30 @@ pub struct Telescope {
     pub result: Val,
 }
 
+/// A former's signature — the *rule* that types its applications.
+///
+/// Most formers are plain telescopes; `Pi` and `Hom` carry judgment
+/// rules instead (ADR-0154 §4's universe-max; ADR-0153's dimension
+/// boundary law) — judgment ops are the spec, so these are honest
+/// variants, not hardcoded kind checks.
+#[derive(Clone, Debug)]
+pub enum FormerSig {
+    /// Ordinary telescope checking.
+    Tel(Telescope),
+    /// `Pi(dom, cod)` — `Type(max(level(dom), level(cod)))`. A
+    /// dependent `cod` (a `Val::Arrow`) is rejected for now: its body
+    /// type needs engine evaluation of `body_def`
+    /// (`OpHandler::apply_arrow` — the engine-side hook).
+    Pi,
+    /// `Hom(n, src, tgt)` — the dimension-indexed hom former
+    /// (ADR-0153). Checked for `n ≤ 2`: `n = 1` requires `src`/`tgt`
+    /// to be types (`Type(max)` result); `n = 2` requires both to be
+    /// 1-cells over convertible boundaries (`infer → Hom(1, a, b)`
+    /// with `a ≡ a'`, `b ≡ b'`). `n ≥ 3` stores unchecked — the
+    /// ADR-0153 honest bound ("parses, stores, does not check").
+    Hom,
+}
+
 /// Errors the `Val` checker reports.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TcError {
@@ -119,8 +143,8 @@ pub struct Checker {
     pub metas: MetaStore,
     /// Typing context: `(name, type)` per binder level.
     pub gamma: Vec<(Rc<str>, Val)>,
-    /// Former telescopes, keyed by `Sym::handle`.
-    pub formers: HashMap<u64, Telescope>,
+    /// Former signatures, keyed by `Sym::handle`.
+    pub formers: HashMap<u64, FormerSig>,
     /// Declared types of nominals, keyed by `Sym::handle`
     /// (`Int : Type(0)` &c.); a nominal with no entry defaults to
     /// `Type(0)` — types are values and a plain declared type lives at
@@ -135,9 +159,27 @@ pub struct Checker {
 }
 
 impl Checker {
-    /// A fresh context with no bindings or declarations.
+    /// A fresh context with no bindings and the builtin former rules
+    /// (`type.pi`, `type.hom`) registered — seeded syms, idempotent.
     pub fn new() -> Self {
-        Self::default()
+        let mut c = Self::default();
+        c.declare_pi();
+        c.declare_hom();
+        c
+    }
+
+    /// Register the `Pi` former rule (`type.pi`).
+    pub fn declare_pi(&mut self) -> Rc<Sym> {
+        let s = type_sym("type.pi");
+        self.formers.insert(s.handle(), FormerSig::Pi);
+        s
+    }
+
+    /// Register the `Hom` former rule (`type.hom`, ADR-0153).
+    pub fn declare_hom(&mut self) -> Rc<Sym> {
+        let s = type_sym("type.hom");
+        self.formers.insert(s.handle(), FormerSig::Hom);
+        s
     }
 
     /// The ambient level — the number of binders in Γ.
@@ -305,13 +347,93 @@ impl Checker {
     }
 
     /// Synthesize the result type of a former application —
-    /// telescope checking with progressive index substitution.
+    /// dispatch on the former's rule (telescope / Pi / Hom).
     pub fn infer_former(&mut self, head: &Rc<Sym>, args: &[Val]) -> Result<Val, TcError> {
-        let tel = self
+        let sig = self
             .formers
             .get(&head.handle())
             .cloned()
             .ok_or_else(|| TcError::UnknownFormer(head.name().to_string()))?;
+        match sig {
+            FormerSig::Tel(tel) => self.infer_telescope(head, &tel, args),
+            FormerSig::Pi => {
+                let [dom, cod] = args else {
+                    return Err(TcError::Arity {
+                        former: head.name().to_string(),
+                        want: 2,
+                        got: args.len(),
+                    });
+                };
+                if matches!(cod, Val::Arrow(_)) {
+                    // Dependent codomain: the body's type needs engine
+                    // evaluation (apply_arrow hook) — not reached here.
+                    return Err(TcError::CannotInfer("dependent pi codomain"));
+                }
+                self.infer_pi(dom, cod)
+            }
+            FormerSig::Hom => self.infer_hom(head, args),
+        }
+    }
+
+    /// `Hom(n, src, tgt)` typing (ADR-0153), checked for `n ≤ 2`:
+    /// - `n = 1`: `src`/`tgt` are types — `Hom(1, A, B) : Type(max)`.
+    /// - `n = 2`: `src`/`tgt` are 1-cells over *convertible*
+    ///   boundaries — `infer(src) ≡ infer(tgt) ≡ Hom(1, a, b)`;
+    ///   `Hom(2, f, g) : Type(level of that hom)`.
+    /// - `n ≥ 3` and non-literal `n`: stores unchecked (honest bound).
+    pub fn infer_hom(&mut self, head: &Rc<Sym>, args: &[Val]) -> Result<Val, TcError> {
+        let [n, src, tgt] = args else {
+            return Err(TcError::Arity {
+                former: head.name().to_string(),
+                want: 3,
+                got: args.len(),
+            });
+        };
+        let k = match self.metas.force_head(n) {
+            Val::Const(TaggedValue::Int(k)) => *k,
+            _ => return Ok(Val::Universe(0)), // non-literal dim: store only
+        };
+        match k {
+            1 => {
+                let l = self.universe_level(src)?;
+                let r = self.universe_level(tgt)?;
+                Ok(Val::Universe(l.max(r)))
+            }
+            2 => {
+                let st = self.infer(src)?;
+                let tt = self.infer(tgt)?;
+                let bd = |v: &Val| -> Option<(Val, Val)> {
+                    if let Val::Former { head: h, args } = self.metas.force_head(v) {
+                        if h.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+                            return Some((args[1].clone(), args[2].clone()));
+                        }
+                    }
+                    None
+                };
+                let (sa, sb) = bd(&st).ok_or(TcError::NotAType(self.show(&st)))?;
+                let (ta, tb) = bd(&tt).ok_or(TcError::NotAType(self.show(&tt)))?;
+                if !self.conv(&sa, &ta) || !self.conv(&sb, &tb) {
+                    return Err(TcError::Mismatch {
+                        got: self.show(&st),
+                        want: self.show(&tt),
+                    });
+                }
+                let l = self.universe_level(&st)?;
+                Ok(Val::Universe(l))
+            }
+            // Honest bound (ADR-0153): n ≥ 3 parses and stores; the
+            // general boundary law is not checked.
+            _ => Ok(Val::Universe(0)),
+        }
+    }
+
+    /// Telescope checking with progressive index substitution.
+    fn infer_telescope(
+        &mut self,
+        head: &Rc<Sym>,
+        tel: &Telescope,
+        args: &[Val],
+    ) -> Result<Val, TcError> {
         if tel.params.len() != args.len() {
             return Err(TcError::Arity {
                 former: head.name().to_string(),
@@ -373,7 +495,7 @@ impl Checker {
     /// former).
     pub fn declare_former(&mut self, seed: &str, tel: Telescope) -> Rc<Sym> {
         let s = Sym::seeded(seed);
-        self.formers.insert(s.handle(), tel);
+        self.formers.insert(s.handle(), FormerSig::Tel(tel));
         s
     }
 
@@ -887,6 +1009,65 @@ mod tests {
         let t = c.infer(&m).unwrap();
         assert!(matches!(t, Val::Former { head, .. } if head.name() == "sig"));
         assert!(c.lookup_name("m").is_some());
+    }
+
+    #[test]
+    fn hom_dim_index_n_le_2() {
+        // ADR-0153: `~[n]~>` = `Hom(n, ·, ·)`, checked for n ≤ 2.
+        let mut c = Checker::new();
+        let hom = type_sym("type.hom");
+        let f = |a: Val, b: Val| Val::Former {
+            head: hom.clone(),
+            args: vec![Val::Const(TaggedValue::Int(1)), a, b],
+        };
+        // Hom(1, Int, Nat) : Type(0) — both endpoints are types.
+        let h1 = f(Val::Nominal(int()), Val::Nominal(nat()));
+        assert!(matches!(c.infer(&h1).unwrap(), Val::Universe(0)));
+        // Hom(2, f, g) with f,g : Hom(1, Int, Nat) — same boundary.
+        let arrow_ty = f(Val::Nominal(int()), Val::Nominal(nat()));
+        let x = c.bind("f", arrow_ty.clone());
+        let y = c.bind("g", arrow_ty);
+        let h2 = Val::Former {
+            head: hom.clone(),
+            args: vec![Val::Const(TaggedValue::Int(2)), x, y],
+        };
+        assert!(matches!(c.infer(&h2).unwrap(), Val::Universe(0)));
+        // Mismatched boundaries reject: g : Hom(1, Nat, Int).
+        let z = c.bind(
+            "h",
+            f(Val::Nominal(nat()), Val::Nominal(int())),
+        );
+        let x0 = Val::Rigid {
+            lvl: 1,
+            spine: Spine::default(),
+        };
+        let bad = Val::Former {
+            head: hom.clone(),
+            args: vec![Val::Const(TaggedValue::Int(2)), x0, z],
+        };
+        assert!(c.infer(&bad).is_err());
+        // n ≥ 3: stores unchecked (honest bound).
+        let h3 = Val::Former {
+            head: hom,
+            args: vec![
+                Val::Const(TaggedValue::Int(3)),
+                Val::Nominal(int()),
+                Val::Nominal(int()),
+            ],
+        };
+        assert!(matches!(c.infer(&h3).unwrap(), Val::Universe(0)));
+    }
+
+    #[test]
+    fn pi_former_uses_max_level() {
+        let mut c = Checker::new();
+        // `Former{pi, [Type(0), Int]}` — infer via the Pi rule:
+        // max(1, 0) = 1.
+        let p = Val::Former {
+            head: type_sym("type.pi"),
+            args: vec![Val::Universe(0), Val::Nominal(int())],
+        };
+        assert!(matches!(c.infer(&p).unwrap(), Val::Universe(1)));
     }
 
     #[test]
