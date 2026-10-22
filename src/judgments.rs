@@ -20,14 +20,21 @@
 //! `&self` but judging mutates (meta solving, Γ binding).
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
+use handl_language::{Ast, AstRef, Language};
 use handl_value::nbe::{ArrowVal, Spine, Val};
 use handl_value::{Sym, TaggedValue};
 use hnl_engine::nbe::{EvalError, OpHandler};
 use hnl_engine::Term;
+use rustc_hash::FxHashMap;
 use serde_json::Value;
 
 use crate::checker::{Checker, lift, type_sym};
+
+/// Evaluation fuel for [`eval_arrow_body`] — the same guaranteed-
+/// termination bound every other checker recursion keeps.
+const APPLY_FUEL: u32 = 256;
 
 /// The judgment-op surface: evaluates type-level `Term`s into the
 /// `Val` domain, solving metas and binding Γ in the owned `Checker`.
@@ -35,6 +42,11 @@ pub struct JudgmentOps {
     /// The checking context (mutated through `RefCell` — `OpHandler`
     /// is `&self`).
     pub checker: RefCell<Checker>,
+    /// The ambient language, when the host knows it — needed by
+    /// `apply_arrow` body evaluation for role lookups
+    /// (`child_role_index`) and `Ast::instantiate`. `None` keeps the
+    /// positional fallback and makes `function` bodies stuck.
+    pub lang: Option<Rc<Language>>,
 }
 
 impl JudgmentOps {
@@ -42,6 +54,7 @@ impl JudgmentOps {
     pub fn new() -> Self {
         JudgmentOps {
             checker: RefCell::new(Checker::new()),
+            lang: None,
         }
     }
 
@@ -50,13 +63,575 @@ impl JudgmentOps {
     pub fn over(checker: Checker) -> Self {
         JudgmentOps {
             checker: RefCell::new(checker),
+            lang: None,
         }
+    }
+
+    /// Install the ambient language (arrow-body role resolution and
+    /// `Ast::instantiate` for nested `function` values).
+    pub fn with_lang(mut self, lang: Rc<Language>) -> Self {
+        self.lang = Some(lang);
+        self
     }
 }
 
 impl Default for JudgmentOps {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arrow-body evaluation (`OpHandler::apply_arrow`)
+// ---------------------------------------------------------------------------
+//
+// A `Val::Arrow` is self-contained data: `body_def` is a `{"__ast__":
+// <arena>}` tagged value, `binds` the residual environment. Applying a
+// *saturated* arrow evaluates the body root under `binds ∪ {param ↦
+// arg}` over the small tagged fragment the checker needs — open
+// subterms are legal inside checking and produce `Former{stuck.*}`
+// neutrals rather than errors (the `infer` side then reports
+// `CannotInfer`/`UnknownFormer` honestly). Partial application stays
+// the residual closure (`None` from `apply_arrow`).
+
+/// A `Former{stuck.*}` neutral — the open-term stand-in. `kind` names
+/// the shape that could not reduce (`stuck.var`, `stuck.call`,
+/// `stuck.binary.add`, `stuck.function`, …).
+fn stuck_val(kind: &str, args: Vec<Val>) -> Val {
+    Val::Former {
+        head: type_sym(&format!("stuck.{kind}")),
+        args,
+    }
+}
+
+fn const_val(v: impl Into<serde_json::Value>) -> Val {
+    Val::Const(TaggedValue::from(v.into()))
+}
+
+/// Decode a `body_def` `{"__ast__": <arena>}` value into its `Ast`.
+fn decode_body(def: &TaggedValue) -> Result<Ast, EvalError> {
+    handl_language::as_ast(&handl_value::tagged_to_value(def))
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            EvalError::Op("apply_arrow: body_def is not a __ast__ arena".into())
+        })
+}
+
+/// The arena index of the child at `role` (ADR-0081) — `pos` is the
+/// positional fallback when the node kind declares no roles or no
+/// language is installed.
+fn body_child(
+    ast: &Ast,
+    node: &handl_language::AstNode,
+    lang: Option<&Language>,
+    role: &str,
+    pos: usize,
+) -> Option<AstRef> {
+    let idx = lang
+        .and_then(|l| l.child_role_index(&node.kind, role).ok().flatten())
+        .unwrap_or(pos);
+    node.payload
+        .get("children")?
+        .as_array()?
+        .get(idx)?
+        .as_u64()
+        .map(|i| AstRef::new(i as usize))
+}
+
+/// Evaluate a saturated arrow's body: `body_def` under
+/// `binds ∪ extra`. `extra` is the fresh binding for the argument
+/// (`apply_arrow` passes `[param ↦ arg]`; the checker's `infer`
+/// saturates every param with a rigid binder).
+pub(crate) fn eval_arrow_body(
+    arrow: &ArrowVal,
+    extra: &[(Rc<str>, Val)],
+    lang: Option<&Language>,
+) -> Result<Val, EvalError> {
+    let ast = decode_body(&arrow.body_def)?;
+    let mut env: FxHashMap<Rc<str>, Val> = (*arrow.binds).clone();
+    for (k, v) in extra {
+        env.insert(k.clone(), v.clone());
+    }
+    let mut fuel = APPLY_FUEL;
+    eval_body_node(&ast, AstRef::new(ast.len() - 1), &env, lang, &mut fuel)
+}
+
+/// Evaluate an arena node to a `Val` under `env` (var/call/binary/
+/// unary/if/array/object/paren/function + the cell forms).
+fn eval_body_node(
+    ast: &Ast,
+    r: AstRef,
+    env: &FxHashMap<Rc<str>, Val>,
+    lang: Option<&Language>,
+    fuel: &mut u32,
+) -> Result<Val, EvalError> {
+    if *fuel == 0 {
+        return Ok(stuck_val("fuel", vec![]));
+    }
+    *fuel -= 1;
+    let node = ast
+        .get(r)
+        .ok_or_else(|| EvalError::Op("apply_arrow: node out of bounds".into()))?;
+    let ev = |i: AstRef,
+              env: &FxHashMap<Rc<str>, Val>,
+              ast: &Ast,
+              lang: Option<&Language>,
+              fuel: &mut u32|
+     -> Result<Val, EvalError> { eval_body_node(ast, i, env, lang, fuel) };
+    match node.kind.as_str() {
+        "value" | "lit" => Ok(const_val(
+            node.payload.get("value").cloned().unwrap_or_else(|| {
+                if node.payload.is_object() {
+                    Value::Null
+                } else {
+                    node.payload.clone()
+                }
+            }),
+        )),
+        "var" => {
+            let name = node
+                .payload
+                .as_str()
+                .or_else(|| node.payload.get("name").and_then(Value::as_str))
+                .unwrap_or("");
+            Ok(env
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| stuck_val("var", vec![const_val(name)])))
+        }
+        "paren" => match body_child(ast, node, lang, "body", 0) {
+            Some(i) => ev(i, env, ast, lang, fuel),
+            None => Ok(stuck_val("paren", vec![])),
+        },
+        "if" => {
+            let cond = body_child(ast, node, lang, "condition", 0);
+            let then = body_child(ast, node, lang, "then", 1);
+            let els = body_child(ast, node, lang, "else", 2);
+            let (Some(c), Some(t)) = (cond, then) else {
+                return Ok(stuck_val("if", vec![]));
+            };
+            match ev(c, env, ast, lang, fuel)? {
+                Val::Const(TaggedValue::Bool(true)) => ev(t, env, ast, lang, fuel),
+                Val::Const(TaggedValue::Bool(false)) => match els {
+                    Some(e) => ev(e, env, ast, lang, fuel),
+                    None => Ok(Val::Const(TaggedValue::Null)),
+                },
+                c => Ok(stuck_val("if", vec![c])),
+            }
+        }
+        "array" => {
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut els = Vec::with_capacity(kids.len());
+            let mut all_const = true;
+            for k in kids {
+                let Some(i) = k.as_u64() else { continue };
+                let v = ev(AstRef::new(i as usize), env, ast, lang, fuel)?;
+                all_const &= matches!(v, Val::Const(_));
+                els.push(v);
+            }
+            if all_const {
+                Ok(Val::Const(TaggedValue::Arr(
+                    els.into_iter()
+                        .map(|v| match v {
+                            Val::Const(t) => t,
+                            _ => unreachable!(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                )))
+            } else {
+                Ok(stuck_val("array", els))
+            }
+        }
+        "object" => {
+            // Object literal — each `entry` child contributes a field.
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut fields = rustc_hash::FxHashMap::default();
+            let mut all_const = true;
+            let mut stuck = Vec::new();
+            for k in kids {
+                let Some(i) = k.as_u64() else { continue };
+                let Some(entry) = ast.get(AstRef::new(i as usize)) else {
+                    continue;
+                };
+                if entry.kind == "entry" {
+                    let key = body_child(ast, entry, lang, "key", 0)
+                        .and_then(|i| ast.get(i))
+                        .and_then(|n| n.payload.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let v = match body_child(ast, entry, lang, "value", 1) {
+                        Some(vi) => ev(vi, env, ast, lang, fuel)?,
+                        None => stuck_val("entry", vec![]),
+                    };
+                    all_const &= matches!(v, Val::Const(_));
+                    fields.insert(Rc::from(key.as_str()), v);
+                } else {
+                    let v = ev(AstRef::new(i as usize), env, ast, lang, fuel)?;
+                    all_const &= matches!(v, Val::Const(_));
+                    stuck.push(v);
+                }
+            }
+            if all_const {
+                let obj = fields
+                    .into_iter()
+                    .map(|(k, v)| match v {
+                        Val::Const(t) => (k, t),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                Ok(Val::Const(TaggedValue::Obj(Rc::new(obj))))
+            } else {
+                stuck.extend(fields.into_values());
+                Ok(stuck_val("object", stuck))
+            }
+        }
+        "function" => {
+            // Nested arrows stay arrow values: params from the shape's
+            // `params` role, the body subtree re-arenas through
+            // `Ast::instantiate` with the env's serializable bindings.
+            let (Some(lang), Some(params_idx), Some(body_idx)) = (
+                lang,
+                body_child(ast, node, lang, "params", 0),
+                body_child(ast, node, lang, "body", 1),
+            ) else {
+                return Ok(stuck_val("function", vec![]));
+            };
+            let Some(pnode) = ast.get(params_idx) else {
+                return Ok(stuck_val("function", vec![]));
+            };
+            let Ok((names, _rest)) = lang.param_names(ast, pnode) else {
+                return Ok(stuck_val("function", vec![]));
+            };
+            let env_vals: std::collections::HashMap<Rc<str>, Value> = env
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        handl_value::tagged_to_value(&handl_value::nbe::quote(
+                            &handl_value::nbe::MetaStore::default(),
+                            0,
+                            v,
+                        )),
+                    )
+                })
+                .collect();
+            let sub = ast
+                .instantiate(body_idx, lang, &env_vals)
+                .map_err(|e| EvalError::Op(format!("apply_arrow: instantiate: {e}")))?;
+            Ok(Val::Arrow(Rc::new(ArrowVal {
+                params: names.into(),
+                body_def: TaggedValue::from(handl_language::ast_value(&sub)),
+                binds: Rc::new(env.clone()),
+            })))
+        }
+        "call" => {
+            let callee_i = body_child(ast, node, lang, "callee", 0);
+            let args_i = lang
+                .and_then(|l| l.child_role_index(&node.kind, "args").ok().flatten())
+                .unwrap_or(1);
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let Some(callee_i) = callee_i else {
+                return Ok(stuck_val("call", vec![]));
+            };
+            let callee = ev(callee_i, env, ast, lang, fuel)?;
+            let mut args = Vec::new();
+            for k in kids.iter().skip(args_i) {
+                let Some(i) = k.as_u64() else { continue };
+                args.push(ev(AstRef::new(i as usize), env, ast, lang, fuel)?);
+            }
+            apply_body_value(callee, args, lang, fuel)
+        }
+        // The cell forms evaluate to their canonical former data — the
+        // same shapes `synth_dim_arrow`/`synth_axis_flow` emit.
+        "dim_arrow" => {
+            let (Some(s), Some(d), Some(t)) = (
+                body_child(ast, node, lang, "src", 0),
+                body_child(ast, node, lang, "dim", 1),
+                body_child(ast, node, lang, "tgt", 2),
+            ) else {
+                return Ok(stuck_val("dim_arrow", vec![]));
+            };
+            let sv = ev(s, env, ast, lang, fuel)?;
+            let dv = ev(d, env, ast, lang, fuel)?;
+            let tv = ev(t, env, ast, lang, fuel)?;
+            Ok(Val::Former {
+                head: type_sym("type.hom"),
+                args: vec![dv, sv, tv],
+            })
+        }
+        "axis_flow" => {
+            let (Some(a), Some(k), Some(b)) = (
+                body_child(ast, node, lang, "left", 0),
+                body_child(ast, node, lang, "axis", 1),
+                body_child(ast, node, lang, "right", 2),
+            ) else {
+                return Ok(stuck_val("axis_flow", vec![]));
+            };
+            let av = ev(a, env, ast, lang, fuel)?;
+            let kv = ev(k, env, ast, lang, fuel)?;
+            let bv = ev(b, env, ast, lang, fuel)?;
+            Ok(Val::Former {
+                head: type_sym("cell.comp"),
+                args: vec![kv, av, bv],
+            })
+        }
+        "flow" => {
+            let (Some(a), Some(b)) = (
+                body_child(ast, node, lang, "left", 0),
+                body_child(ast, node, lang, "right", 1),
+            ) else {
+                return Ok(stuck_val("flow", vec![]));
+            };
+            let av = ev(a, env, ast, lang, fuel)?;
+            let bv = ev(b, env, ast, lang, fuel)?;
+            Ok(Val::Former {
+                head: type_sym("cell.comp"),
+                args: vec![const_val(0), av, bv],
+            })
+        }
+        "cell_id" => {
+            let Some(x) = body_child(ast, node, lang, "operand", 0) else {
+                return Ok(stuck_val("cell_id", vec![]));
+            };
+            let xv = ev(x, env, ast, lang, fuel)?;
+            Ok(Val::Former {
+                head: type_sym("cell.id"),
+                args: vec![const_val(2), xv],
+            })
+        }
+        "cell_comp_v" | "cell_comp_h" => {
+            let axis = if node.kind == "cell_comp_v" { 2 } else { 0 };
+            let (Some(a), Some(b)) = (
+                body_child(ast, node, lang, "left", 0),
+                body_child(ast, node, lang, "right", 1),
+            ) else {
+                return Ok(stuck_val("cell_comp", vec![]));
+            };
+            let av = ev(a, env, ast, lang, fuel)?;
+            let bv = ev(b, env, ast, lang, fuel)?;
+            Ok(Val::Former {
+                head: type_sym("cell.comp"),
+                args: vec![const_val(axis), av, bv],
+            })
+        }
+        kind if kind.starts_with("binary.") || kind.starts_with("unary.") => {
+            let l = body_child(ast, node, lang, "left", 0)
+                .or_else(|| body_child(ast, node, lang, "operand", 0));
+            let r = body_child(ast, node, lang, "right", 1);
+            let lv = l
+                .map(|i| ev(i, env, ast, lang, fuel))
+                .transpose()?
+                .unwrap_or(Val::Const(TaggedValue::Null));
+            let rv = r.map(|i| ev(i, env, ast, lang, fuel)).transpose()?;
+            match fold_scalar(kind, &lv, rv.as_ref()) {
+                Some(v) => Ok(v),
+                None => {
+                    let mut args = vec![const_val(kind), lv];
+                    if let Some(r) = rv {
+                        args.push(r);
+                    }
+                    Ok(stuck_val(kind, args))
+                }
+            }
+        }
+        kind => {
+            // Out-of-fragment kinds: evaluate the children that reduce
+            // and keep them inside a `stuck.<kind>` neutral — open
+            // terms are legal inside checking.
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut args = Vec::new();
+            for k in kids {
+                let Some(i) = k.as_u64() else { continue };
+                args.push(ev(AstRef::new(i as usize), env, ast, lang, fuel)?);
+            }
+            Ok(stuck_val(kind, args))
+        }
+    }
+}
+
+/// Fold a scalar binary/unary operation on `Const` operands —
+/// arithmetic on ints/floats, comparisons, boolean `and`/`or`, `neg`/
+/// `not`. `None` = the operation does not reduce (open operand).
+fn fold_scalar(kind: &str, l: &Val, r: Option<&Val>) -> Option<Val> {
+    let int = |v: &Val| match v {
+        Val::Const(TaggedValue::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let num = |v: &Val| match v {
+        Val::Const(TaggedValue::Int(n)) => Some(*n as f64),
+        Val::Const(TaggedValue::Float(n)) => Some(*n),
+        _ => None,
+    };
+    let bool = |v: &Val| match v {
+        Val::Const(TaggedValue::Bool(b)) => Some(*b),
+        _ => None,
+    };
+    let is_int = |v: &Val| matches!(v, Val::Const(TaggedValue::Int(_)));
+    if let (Some(a), Some(Some(b))) = (int(l), r.map(|r| int(r))) {
+        let v = match kind {
+            "binary.add" => Some(a + b),
+            "binary.sub" => Some(a - b),
+            "binary.mul" => Some(a * b),
+            "binary.div" if b != 0 => Some(a / b),
+            "binary.mod" if b != 0 => Some(a % b),
+            "binary.pow" if b >= 0 => a.checked_pow(b as u32),
+            _ => None,
+        };
+        if let Some(n) = v {
+            return Some(const_val(n));
+        }
+    }
+    if let (Some(a), Some(Some(b))) = (num(l), r.map(|r| num(r))) {
+        let v = match kind {
+            "binary.eq" => Some(const_val(a == b)),
+            "binary.neq" => Some(const_val(a != b)),
+            "binary.lt" => Some(const_val(a < b)),
+            "binary.lte" => Some(const_val(a <= b)),
+            "binary.gt" => Some(const_val(a > b)),
+            "binary.gte" => Some(const_val(a >= b)),
+            "binary.div" if b != 0.0 && !is_int(l) => Some(const_val(a / b)),
+            _ => None,
+        };
+        if v.is_some() {
+            return v;
+        }
+    }
+    if let (Some(a), Some(Some(b))) = (bool(l), r.map(|r| bool(r))) {
+        let v = match kind {
+            "binary.and" => Some(a && b),
+            "binary.or" => Some(a || b),
+            _ => None,
+        };
+        if let Some(b) = v {
+            return Some(const_val(b));
+        }
+    }
+    match (kind, bool(l), num(l), r) {
+        ("unary.not", Some(a), _, None) => Some(const_val(!a)),
+        ("unary.neg", _, Some(a), None) => Some(const_val(-a)),
+        _ => None,
+    }
+}
+
+/// Apply an evaluated body value to evaluated arguments: arrows
+/// saturate by evaluating their `body_def` under `binds ∪ params ↦
+/// args` (residual on partial application); neutrals extend their
+/// spine; formers extend their index args; anything else is a
+/// `stuck.call` neutral.
+fn apply_body_value(
+    f: Val,
+    args: Vec<Val>,
+    lang: Option<&Language>,
+    fuel: &mut u32,
+) -> Result<Val, EvalError> {
+    let mut f = f;
+    let mut args = args.into_iter();
+    loop {
+        let Some(arg) = args.next() else {
+            return Ok(f);
+        };
+        let arrow: Rc<ArrowVal> = match f {
+            Val::Arrow(a) => a,
+            Val::Const(TaggedValue::Arrow {
+                params,
+                body_def,
+                binds,
+                ..
+            }) => Rc::new(ArrowVal {
+                params,
+                body_def: (*body_def).clone(),
+                binds: Rc::new(
+                    binds
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Val::Const(v.clone())))
+                        .collect(),
+                ),
+            }),
+            Val::Rigid { lvl, spine } => {
+                let mut s = spine;
+                s.push(arg);
+                f = Val::Rigid { lvl, spine: s };
+                continue;
+            }
+            Val::Flex { meta, spine } => {
+                let mut s = spine;
+                s.push(arg);
+                f = Val::Flex { meta, spine: s };
+                continue;
+            }
+            Val::Unfold { name, spine, value } => {
+                let mut s = spine;
+                s.push(arg);
+                f = Val::Unfold {
+                    name,
+                    spine: s,
+                    value,
+                };
+                continue;
+            }
+            Val::Former { head, args: fargs } => {
+                let mut fargs = fargs;
+                fargs.push(arg);
+                f = Val::Former {
+                    head,
+                    args: fargs,
+                };
+                continue;
+            }
+            other => {
+                let mut stuck = vec![other, arg];
+                stuck.extend(args);
+                return Ok(stuck_val("call", stuck));
+            }
+        };
+        // Bind `params ↦ args` greedily; leftover params stay residual,
+        // a saturated arrow runs its body and the result may itself be
+        // applied to further args.
+        let mut env2: FxHashMap<Rc<str>, Val> = (*arrow.binds).clone();
+        env2.insert(Rc::from(arrow.params[0].as_str()), arg);
+        let mut consumed = 1;
+        for p in arrow.params.iter().skip(1) {
+            match args.next() {
+                Some(v) => {
+                    env2.insert(Rc::from(p.as_str()), v);
+                    consumed += 1;
+                }
+                None => break,
+            }
+        }
+        if consumed < arrow.params.len() {
+            return Ok(Val::Arrow(Rc::new(ArrowVal {
+                params: arrow.params[consumed..].to_vec().into(),
+                body_def: arrow.body_def.clone(),
+                binds: Rc::new(env2),
+            })));
+        }
+        let ast = decode_body(&arrow.body_def)?;
+        if *fuel == 0 {
+            return Ok(stuck_val("fuel", vec![]));
+        }
+        *fuel -= 1;
+        f = eval_body_node(&ast, AstRef::new(ast.len() - 1), &env2, lang, fuel)?;
     }
 }
 
@@ -388,11 +963,18 @@ impl OpHandler for JudgmentOps {
         }
     }
 
-    fn apply_arrow(&self, _arrow: &ArrowVal, _arg: Val) -> Option<Result<Val, EvalError>> {
-        // Body evaluation is the bound eval engine's job — wired when
-        // `NbeTypecheckEngine` adopts this handler (the `EvalEngine`
-        // boundary). `None` = residual closure for now.
-        None
+    fn apply_arrow(&self, arrow: &ArrowVal, arg: Val) -> Option<Result<Val, EvalError>> {
+        // Fire only when this application saturates the arrow — a
+        // partial application stays the residual closure (`None`).
+        if arrow.params.len() > 1 {
+            return None;
+        }
+        let extra: Vec<(Rc<str>, Val)> = arrow
+            .params
+            .first()
+            .map(|p| vec![(Rc::from(p.as_str()), arg)])
+            .unwrap_or_default();
+        Some(eval_arrow_body(arrow, &extra, self.lang.as_deref()))
     }
 }
 

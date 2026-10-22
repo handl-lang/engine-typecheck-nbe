@@ -973,7 +973,8 @@ impl NbeTypecheckEngine {
                 let inc = incoming
                     .map(|v| checker::lift(ctx.vcheck.lvl(), &handl_value::TaggedValue::from(v)))
                     .unwrap_or(Val::Const(TaggedValue::Null));
-                let ops = judgments::JudgmentOps::over(std::mem::take(&mut ctx.vcheck));
+                let ops = judgments::JudgmentOps::over(std::mem::take(&mut ctx.vcheck))
+                    .with_lang(Rc::new(lang.clone()));
                 let r = hnl_engine::nbe::eval(&term, inc, &ops);
                 ctx.vcheck = ops.checker.into_inner();
                 let v = r.map_err(|e| LangError::engine(format!("typecheck: veval: {e}")))?;
@@ -1806,6 +1807,24 @@ impl NbeTypecheckEngine {
                 })?;
                 self.synth_axis_flow_judgment(lang, ast, node, ctx)
             }
+            "synth_cell_id" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_cell_id: node out of bounds".to_string())
+                })?;
+                self.synth_cell_id_judgment(lang, ast, node, ctx)
+            }
+            "synth_cell_comp_v" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_cell_comp_v: node out of bounds".to_string())
+                })?;
+                self.synth_cell_comp_axis_judgment(lang, ast, node, 2, ctx)
+            }
+            "synth_cell_comp_h" => {
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_cell_comp_h: node out of bounds".to_string())
+                })?;
+                self.synth_cell_comp_axis_judgment(lang, ast, node, 0, ctx)
+            }
             "synth_rec" => {
                 // Typecheck a `rec` region (ADR-0074 ID.3 — Paterson loop
                 // fixpoint typing). The `rec` node is a flattened block: its
@@ -2428,6 +2447,7 @@ impl NbeTypecheckEngine {
                     ))
                 })?;
                 let mut fields = serde_json::Map::new();
+                let mut tag_name: Option<String> = None;
 
                 if let Some(entries) = node.payload.get("entries").and_then(|e| e.as_array()) {
                     for entry in entries {
@@ -2443,6 +2463,14 @@ impl NbeTypecheckEngine {
                                 node,
                             )
                         })?;
+                        // The reserved `__tag__` key (ADR-0055): its string
+                        // *value* names the tag — the object literal denotes
+                        // the tagged type, not a record field of type
+                        // `type.string`.
+                        if key == "__tag__" {
+                            tag_name = value.as_str().map(str::to_string);
+                            continue;
+                        }
                         let tag = match value {
                             Value::Number(_) => "type.number",
                             Value::String(_) => "type.string",
@@ -2515,6 +2543,24 @@ impl NbeTypecheckEngine {
                         let Some(key) = key_node.payload.as_str() else {
                             continue;
                         };
+                        if key == "__tag__" {
+                            let value_node = ast.get(AstRef::new(value_idx));
+                            tag_name = value_node.and_then(|n| {
+                                n.payload
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .or_else(|| {
+                                        n.payload
+                                            .get("value")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string)
+                                    })
+                            });
+                            // Still synthesize the value node (node_types
+                            // bookkeeping), but it is not a record field.
+                            let _ = self.synth_node(lang, ast, AstRef::new(value_idx), ctx);
+                            continue;
+                        }
                         let value_type = self.synth_node(lang, ast, AstRef::new(value_idx), ctx)?;
                         fields.insert(key.to_string(), value_type);
                     }
@@ -2525,6 +2571,20 @@ impl NbeTypecheckEngine {
                     ));
                 }
 
+                // A `__tag__`-bearing literal mints the tagged type
+                // (`{"__tag__": t, …fields}`); an untagged one is a
+                // `type.record`.
+                if let Some(tag) = tag_name {
+                    return ctx
+                        .registry
+                        .construct(&tag, &Value::Object(fields))
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "synth_object_record: construct failed for tagged type",
+                                node,
+                            )
+                        });
+                }
                 let fields_value = Value::Object(fields);
                 let mut payload = serde_json::Map::new();
                 payload.insert("fields".to_string(), fields_value);
@@ -4389,6 +4449,28 @@ impl NbeTypecheckEngine {
             }
             ctx.solve_meta(id, a.clone());
             return Ok(());
+        }
+        // Domain-encoded operands (`__former__`/`__sym__`/`__neutral__`/
+        // `__type__` — the `quote` spellings checker-produced types
+        // carry) convert in the `Val` domain: both sides lift through
+        // `checker::lift` (tagged `__meta__` leaves remap to fresh
+        // domain metas — the stores never alias) and `ctx.vcheck.conv`
+        // decides; `store_mark`/`store_restore` bounds the attempt.
+        // Top-level metas are already handled above — they keep solving
+        // in the tagged store.
+        if dependent::is_domain_encoded(a) || dependent::is_domain_encoded(b) {
+            let mark = ctx.vcheck.store_mark();
+            let va = dependent::domain_lift(a, ctx);
+            let vb = dependent::domain_lift(b, ctx);
+            return if ctx.vcheck.conv(&va, &vb) {
+                Ok(())
+            } else {
+                ctx.vcheck.store_restore(mark);
+                Err(LangError::engine(format!(
+                    "typecheck: cannot unify {:?} with {:?}",
+                    a, b
+                )))
+            };
         }
         // Recursive structural unification of tagged type values with the
         // same tag from the same registry (ADR-0054 legacy migration).

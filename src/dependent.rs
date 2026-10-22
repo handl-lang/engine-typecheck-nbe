@@ -23,12 +23,14 @@
 //!   as `eq_<name>` in `results` by branch refinement.
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language};
+use handl_value::TaggedValue;
+use handl_value::nbe::{MetaId, Val};
 use hnl_engine_typecheck::TypecheckDiagnostic;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use crate::{
-    extract_meta_id, is_assign_node, meta_value, role_child_ref, NbeTypecheckEngine,
+    checker, extract_meta_id, is_assign_node, meta_value, role_child_ref, NbeTypecheckEngine,
     TypecheckContext,
 };
 
@@ -77,6 +79,116 @@ fn path_val(frm: Value, to: Value) -> Value {
     m.insert("frm".to_string(), frm);
     m.insert("to".to_string(), to);
     Value::Object(m)
+}
+
+// ---------------------------------------------------------------------------
+// The `Val`-domain bridge (`veval` → `v*` — phase-1 spec WS-B)
+// ---------------------------------------------------------------------------
+//
+// The judgment ops below speak the *legacy* tagged encoding
+// (`{"__tag__": …}` records, `{"__meta__": n}` metas), while the
+// canonical cell data is `Val` domain data — `Former{type.hom}`/
+// `Former{cell.comp}` applications that reify to the `quote`
+// spellings (`__former__`/`__sym__`/`__neutral__`/`__type__`).
+// `domain_lift`/`domain_quote` are the two crossings; the tagged
+// `__meta__` store and the domain `MetaStore` are disjoint id spaces,
+// so metas remap onto fresh domain metas at the boundary (the stores
+// never alias).
+
+/// Whether `v` carries a `Val`-domain encoding at its head — the
+/// `quote` spellings checker-produced types arrive in.
+pub(crate) fn is_domain_encoded(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => {
+            m.contains_key("__former__")
+                || m.contains_key("__sym__")
+                || m.contains_key("__neutral__")
+                || m.contains_key("__type__")
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite tagged `{"__meta__": n}` leaves into `{"__neutral__":
+/// {"head":"meta","id": m}}` carrying *fresh* domain metas — the two
+/// meta stores never alias: a tagged meta crossing the domain bridge
+/// mints a real `ctx.vcheck` meta (memoized within one lift so
+/// co-occurring metas stay shared).
+pub(crate) fn remap_tagged_metas(
+    v: &Value,
+    map: &mut HashMap<u64, MetaId>,
+    ctx: &mut TypecheckContext,
+) -> Value {
+    if let Some(id) = extract_meta_id(v) {
+        let m = *map
+            .entry(id)
+            .or_insert_with(|| ctx.vcheck.fresh_meta(Val::Universe(0)));
+        return serde_json::json!({"__neutral__": {"head": "meta", "id": m, "spine": []}});
+    }
+    match v {
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), remap_tagged_metas(x, map, ctx)))
+                .collect(),
+        ),
+        Value::Array(xs) => {
+            Value::Array(xs.iter().map(|x| remap_tagged_metas(x, map, ctx)).collect())
+        }
+        _ => v.clone(),
+    }
+}
+
+/// Lift a tagged type value into the `Val` domain — `checker::lift`
+/// (the `__tag__`/`__former__`/`__sym__`/`__meta__` bridge) after
+/// remapping tagged metas onto fresh domain metas.
+pub(crate) fn domain_lift(v: &Value, ctx: &mut TypecheckContext) -> Val {
+    let mut map = HashMap::new();
+    let v = remap_tagged_metas(v, &mut map, ctx);
+    checker::lift(ctx.vcheck.lvl(), &handl_value::TaggedValue::from(v))
+}
+
+/// Reify a `Val` back to boundary JSON — the `__former__`/`__sym__`/
+/// `__neutral__`/`__type__` spellings of `quote`.
+pub(crate) fn domain_quote(v: &Val, ctx: &TypecheckContext) -> Value {
+    handl_value::tagged_to_value(&handl_value::nbe::quote(
+        &ctx.vcheck.metas,
+        ctx.vcheck.lvl(),
+        v,
+    ))
+}
+
+/// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
+/// as boundary JSON (the `__former__` encoding).
+fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
+    domain_quote(
+        &Val::Former {
+            head: checker::type_sym("type.hom"),
+            args: vec![d, a, b],
+        },
+        ctx,
+    )
+}
+
+/// A `Dim`-typed domain meta — the symbolic dimension index of an
+/// `f<d>`-style dim/axis that is not a literal.
+fn dim_meta(ctx: &mut TypecheckContext) -> Val {
+    let m = ctx
+        .vcheck
+        .fresh_meta(Val::Nominal(checker::type_sym("type.Dim")));
+    ctx.vcheck.meta_val(m)
+}
+
+/// The literal dimension of a lifted `Former{type.hom}` head —
+/// `Some(m)` when `v` is `Hom(m, ·, ·)` with a literal `m`.
+fn hom_dim_lit(v: &Val) -> Option<u64> {
+    if let Val::Former { head, args } = v {
+        if head.handle() == checker::type_sym("type.hom").handle() && args.len() == 3 {
+            if let Val::Const(TaggedValue::Int(m)) = &args[0] {
+                return u64::try_from(*m).ok();
+            }
+        }
+    }
+    None
 }
 
 fn num_val(v: &Value) -> Option<f64> {
@@ -2065,8 +2177,13 @@ impl NbeTypecheckEngine {
 
     /// Resolve a path operand node to a `Path{frm,to}` value: a
     /// `results`-bound `eq_<name>` witness, a Γ-bound `p : Path`, or
-    /// `refl` (identity). `None` when the operand is not a path.
-    fn resolve_path(&self, node: &AstNode, ctx: &TypecheckContext) -> Option<Value> {
+    /// `refl` (identity). A metavariable-bound operand is *stuck*, not
+    /// a decided non-path — an unannotated function parameter sits at a
+    /// fresh meta — so it synthesizes an open `Path(?a, ?b)` whose
+    /// endpoints checking resolves against the use site. `None` only
+    /// when the operand is decided-not-a-path (unbound, or bound to a
+    /// concrete non-`Path` value).
+    fn resolve_path(&self, node: &AstNode, ctx: &mut TypecheckContext) -> Option<Value> {
         if node.kind == "var" {
             let name = node_name(node)?;
             if name == "refl" {
@@ -2088,6 +2205,16 @@ impl NbeTypecheckEngine {
                 if tag_of(w) == Some("Path") {
                     return Some(w.clone());
                 }
+            }
+            let bound = ctx
+                .results
+                .get(&name)
+                .or_else(|| ctx.lookup(&name))
+                .cloned();
+            if bound.as_ref().and_then(extract_meta_id).is_some() {
+                let frm = meta_value(ctx.fresh_meta());
+                let to = meta_value(ctx.fresh_meta());
+                return Some(path_val(frm, to));
             }
         }
         None
@@ -2145,9 +2272,13 @@ impl NbeTypecheckEngine {
         } else {
             subst_index(&vty, &frm, &to)
         };
-        // Record the consumed witness (proof-relevant provenance).
+        // Record the consumed witness (proof-relevant provenance). An
+        // open transport over an unsolved meta stays atomic — a `via`
+        // field would corrupt the `{"__meta__"}` encoding.
         if let Value::Object(mut m) = rewritten {
-            m.insert("via".to_string(), path);
+            if extract_meta_id(&Value::Object(m.clone())).is_none() {
+                m.insert("via".to_string(), path);
+            }
             return Ok(Value::Object(m));
         }
         Ok(rewritten)
@@ -2230,18 +2361,26 @@ impl NbeTypecheckEngine {
             dim_payload.clone()
         };
         let dim_lit = if dim_inner.kind == "value" && dim_val.is_number() {
-            dim_val
+            Some(dim_val)
         } else {
-            Value::Null
+            None
         };
-        let grade = self.synth_node(lang, ast, AstRef::new(dim_idx), ctx)?;
+        // The dim expression still synthesizes (node_types + meta
+        // solving); the emitted former no longer carries a `grade`
+        // field — the dimension index IS the first `Hom` arg.
+        let _grade = self.synth_node(lang, ast, AstRef::new(dim_idx), ctx)?;
         let tgt = self.synth_node(lang, ast, AstRef::new(tgt_idx), ctx)?;
-        let mut m = Map::new();
-        m.insert("inputs".to_string(), src);
-        m.insert("grade".to_string(), grade);
-        m.insert("output".to_string(), tgt);
-        m.insert("dim".to_string(), dim_lit);
-        Ok(make_tag(ctx, "Arrow", m))
+        // Canonical `Former{type.hom}` data (ADR-0153): `~[n]~>` is
+        // `Hom(n, src, tgt)` — a literal dim is a `Const` natural, a
+        // symbolic dim (`f<d>`) mints a `Dim`-typed meta. Endpoints
+        // lift through the `__tag__` bridge into the `Val` domain.
+        let dim_v = match dim_lit.and_then(|d| d.as_i64()) {
+            Some(n) => Val::Const(TaggedValue::Int(n)),
+            None => dim_meta(ctx),
+        };
+        let va = domain_lift(&src, ctx);
+        let vb = domain_lift(&tgt, ctx);
+        Ok(hom_former(dim_v, va, vb, ctx))
     }
 
     /// `f >>> g` — composition in `type.function` coordinates
@@ -2278,6 +2417,18 @@ impl NbeTypecheckEngine {
         g_ty: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // Domain-encoded operands (a `Former{type.hom}` produced by
+        // `~[n]~>` or a prior composition) route through the domain
+        // boundary law — `f >>> g` on `Hom`-typed cells is the
+        // axis-0 paste.
+        if is_domain_encoded(f_ty) || is_domain_encoded(g_ty) {
+            return self.comp_axis_typed(
+                &Val::Const(TaggedValue::Int(0)),
+                f_ty,
+                g_ty,
+                ctx,
+            );
+        }
         // `f >>> P` — reindexing: a family over `f`'s source (pullback).
         if tag_of(g_ty) == Some("type.family") {
             let f_dom = match tag_of(f_ty) {
@@ -2392,11 +2543,92 @@ impl NbeTypecheckEngine {
         if k_lit == Some(0.0) || k_lit.is_none() {
             return self.flow_of(&a_ty, &b_ty, ctx);
         }
-        let mut m = Map::new();
-        m.insert("inputs".to_string(), a_ty);
-        m.insert("output".to_string(), b_ty);
-        m.insert("dim".to_string(), Value::from(k_lit));
-        Ok(make_tag(ctx, "Arrow", m))
+        let kv = Val::Const(TaggedValue::Int(k_lit.unwrap_or(0.0) as i64));
+        self.comp_axis_typed(&kv, &a_ty, &b_ty, ctx)
+    }
+
+    /// `a >>>[k] b` (and the derived `=>>`/`=>|` cell ops) over lifted
+    /// operand *types*: the globular boundary law is decided in the
+    /// `Val` domain through [`checker::Checker::infer_comp_axis_tys`].
+    /// Decided errors (dimension, boundary mismatch) propagate; stuck
+    /// operands (metas, non-cell types, dim ≥ 3) store the composite
+    /// `Hom(d, a_ty, b_ty)` unchecked — `d` the greatest operand
+    /// dimension or a `Dim` meta — the ADR-0153 honest bound.
+    fn comp_axis_typed(
+        &self,
+        kv: &Val,
+        a_ty: &Value,
+        b_ty: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let va = domain_lift(a_ty, ctx);
+        let vb = domain_lift(b_ty, ctx);
+        match ctx.vcheck.infer_comp_axis_tys(kv, &va, &vb) {
+            Ok(t) => Ok(domain_quote(&t, ctx)),
+            Err(e @ (checker::TcError::Dim { .. } | checker::TcError::Mismatch { .. })) => {
+                Err(LangError::engine(format!("typecheck: axis_flow: {e}")))
+            }
+            Err(_) => {
+                let d = hom_dim_lit(&va)
+                    .into_iter()
+                    .chain(hom_dim_lit(&vb))
+                    .max()
+                    .map(|m| Val::Const(TaggedValue::Int(m as i64)))
+                    .unwrap_or_else(|| dim_meta(ctx));
+                Ok(hom_former(d, va, vb, ctx))
+            }
+        }
+    }
+
+    /// `id2 x` — the identity 2-cell on `x`: `Hom(2, x_ty, x_ty)` in
+    /// the tagged approximation (operand types stand in for cell
+    /// endpoints — the same convention `comp_axis_typed` keeps).
+    pub(crate) fn synth_cell_id_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = children_of(node)
+            .ok_or_else(|| LangError::engine("cell_id: no children".to_string()))?;
+        let x_idx = kids[0].as_u64().ok_or_else(|| {
+            LangError::engine("cell_id: operand index not a u64".to_string())
+        })? as usize;
+        let x_ty = self.synth_node(lang, ast, AstRef::new(x_idx), ctx)?;
+        let vx = domain_lift(&x_ty, ctx);
+        Ok(hom_former(
+            Val::Const(TaggedValue::Int(2)),
+            vx.clone(),
+            vx,
+            ctx,
+        ))
+    }
+
+    /// `a =>> b` (vertical, axis 2) / `a =>| b` (horizontal, axis 0) —
+    /// the derived cell compositions share the `>>>[k]` boundary law.
+    pub(crate) fn synth_cell_comp_axis_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        axis: i64,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = children_of(node)
+            .ok_or_else(|| LangError::engine("cell_comp: no children".to_string()))?;
+        if kids.len() < 2 {
+            return Err(LangError::engine("cell_comp: needs two operands".to_string()));
+        }
+        let a_idx = kids[0].as_u64().ok_or_else(|| {
+            LangError::engine("cell_comp: lhs index not a u64".to_string())
+        })? as usize;
+        let b_idx = kids[1].as_u64().ok_or_else(|| {
+            LangError::engine("cell_comp: rhs index not a u64".to_string())
+        })? as usize;
+        let a_ty = self.synth_node(lang, ast, AstRef::new(a_idx), ctx)?;
+        let b_ty = self.synth_node(lang, ast, AstRef::new(b_idx), ctx)?;
+        self.comp_axis_typed(&Val::Const(TaggedValue::Int(axis)), &a_ty, &b_ty, ctx)
     }
 
     /// `call` typing — curried application: the callee synthesizes a

@@ -392,7 +392,38 @@ impl Checker {
                 .ok_or(TcError::CannotInfer("unfold-forced"))
                 .and_then(|v| self.infer(v)),
             Val::Const(tv) => self.infer_const(&tv),
-            Val::Arrow(_) => Err(TcError::CannotInfer("arrow")),
+            Val::Arrow(a) => {
+                // Saturate the arrow on rigid binders (fresh domain
+                // metas for the domains), evaluate the `{"__ast__"}`
+                // body through the engine-owned arrow eval, and infer
+                // the body's type — a `Pi` tower over the params.
+                // Stuck bodies report `CannotInfer` honestly.
+                let mark = self.mark();
+                let mut doms: Vec<Val> = Vec::new();
+                let mut extra: Vec<(Rc<str>, Val)> = Vec::new();
+                for p in a.params.iter() {
+                    let m = self.fresh_meta(Val::Universe(0));
+                    let r = self.bind(p.as_str(), self.meta_val(m));
+                    doms.push(self.meta_val(m));
+                    extra.push((Rc::from(p.as_str()), r));
+                }
+                let body_ty = crate::judgments::eval_arrow_body(&a, &extra, None)
+                    .ok()
+                    .and_then(|body| self.infer(&body).ok());
+                self.restore(mark);
+                match body_ty {
+                    Some(mut t) => {
+                        for d in doms.into_iter().rev() {
+                            t = Val::Former {
+                                head: type_sym("type.pi"),
+                                args: vec![d, t],
+                            };
+                        }
+                        Ok(t)
+                    }
+                    None => Err(TcError::CannotInfer("arrow")),
+                }
+            }
             _ => Err(TcError::CannotInfer("spined neutral")),
         }
     }
@@ -433,12 +464,24 @@ impl Checker {
                         got: args.len(),
                     });
                 };
-                if matches!(cod, Val::Arrow(_)) {
-                    // Dependent codomain: the body's type needs engine
-                    // evaluation (apply_arrow hook) — not reached here.
-                    return Err(TcError::CannotInfer("dependent pi codomain"));
-                }
-                self.infer_pi(dom, cod)
+                // Dependent codomain: evaluate the arrow body on the
+                // domain's rigid binder through the engine-owned arrow
+                // eval (`{"__ast__"}`); stuck bodies report honestly.
+                let cod = match cod {
+                    Val::Arrow(a) => {
+                        let mark = self.mark();
+                        let x = self.bind("dom", dom.clone());
+                        let applied = crate::judgments::eval_arrow_body(
+                            a,
+                            &[(Rc::from("dom"), x)],
+                            None,
+                        );
+                        self.restore(mark);
+                        applied.map_err(|_| TcError::CannotInfer("dependent pi codomain"))?
+                    }
+                    other => other.clone(),
+                };
+                self.infer_pi(dom, &cod)
             }
             FormerSig::Hom => self.infer_hom(head, args),
             FormerSig::Comp => {
@@ -566,12 +609,38 @@ impl Checker {
     /// (the lower cell is read at its own level — the degenerate
     /// promotion is already inside its `Hom` boundary).
     pub fn infer_comp_axis(&mut self, k: &Val, a: &Val, b: &Val) -> Result<Val, TcError> {
+        let ta = self.infer(a)?;
+        let tb = self.infer(b)?;
+        self.comp_axis_of(k, a, &ta, b, &tb)
+    }
+
+    /// The boundary law on already-inferred operand *types* — the
+    /// tagged-checker bridge: operand *values* are unavailable there,
+    /// so a non-`Hom` operand type stands in as its own degenerate
+    /// object (the degenerate-cell reading, self-bounded). Decided
+    /// errors ([`TcError::Dim`], [`TcError::Mismatch`]) are real
+    /// rejections; anything else leaves the composite stored
+    /// unchecked — the honest bound.
+    pub fn infer_comp_axis_tys(&mut self, k: &Val, ta: &Val, tb: &Val) -> Result<Val, TcError> {
+        let (a, b) = (ta.clone(), tb.clone());
+        self.comp_axis_of(k, &a, ta, &b, tb)
+    }
+
+    /// The shared core of `infer_comp_axis`/`infer_comp_axis_tys`:
+    /// `a`/`b` are the operand values used for degenerate promotion
+    /// faces, `ta`/`tb` their inferred types.
+    fn comp_axis_of(
+        &mut self,
+        k: &Val,
+        a: &Val,
+        ta: &Val,
+        b: &Val,
+        tb: &Val,
+    ) -> Result<Val, TcError> {
         let axis = match self.metas.force_head(k) {
             Val::Const(TaggedValue::Int(n)) => u64::try_from(*n).ok(),
             _ => None,
         };
-        let ta = self.infer(a)?;
-        let tb = self.infer(b)?;
         let (ma, mb) = (self.hom_dim(&ta), self.hom_dim(&tb));
         // Effective dimension: a cell is at least its declared `Hom`
         // level; an object is a degenerate 1-cell.
@@ -789,6 +858,23 @@ impl Checker {
         self.nominal_ty
             .insert(s.handle(), ty.unwrap_or(Val::Universe(0)));
         s
+    }
+
+    /// Snapshot the meta store (metas + the parallel `meta_tys`/
+    /// `meta_constraints` tables) for backtracking a domain conversion
+    /// attempt — the tagged bridge allocates fresh domain metas while
+    /// lifting and a failed `conv` must not leak them.
+    pub fn store_mark(&self) -> usize {
+        self.metas.mark()
+    }
+
+    /// Restore the meta store to `mark` (see [`Self::store_mark`]).
+    /// Solutions to pre-mark metas are monotone and kept (the NbE
+    /// convention); only post-mark allocations drop.
+    pub fn store_restore(&mut self, mark: usize) {
+        self.metas.truncate(mark);
+        self.meta_tys.truncate(mark);
+        self.meta_constraints.truncate(mark);
     }
 
     /// Default every still-unsolved meta to its constraint anchor
