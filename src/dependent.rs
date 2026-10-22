@@ -256,6 +256,32 @@ fn node_name(node: &AstNode) -> Option<String> {
         })
 }
 
+/// Whether `name` is a builtin type-position identifier — the name table
+/// `dep_builtin_or_tag` resolves (`Bool`/`Nat`/`IO`/`Type`/`Pi`/…).
+/// Injected `with_global` seeds must not shadow these (they are
+/// `type.unknown` placeholders for wire names, not real bindings).
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Int"
+            | "Nat"
+            | "Number"
+            | "Bool"
+            | "String"
+            | "Str"
+            | "Unit"
+            | "IO"
+            | "Type"
+            | "Universe"
+            | "Type0"
+            | "List"
+            | "Family"
+            | "Pi"
+            | "Sigma"
+            | "Forall"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Index-term algebra
 // ---------------------------------------------------------------------------
@@ -1010,6 +1036,61 @@ impl NbeTypecheckEngine {
                 Ok(make_tag(ctx, "type.function", m))
             }
             "call" => self.dep_synth_call_type(lang, ast, node, ctx),
+            "dim_arrow" => {
+                // `A ~[k]~> B` in annotation position — `Hom(k, A, B)`
+                // (ADR-0153). The endpoints are *type expressions* —
+                // unlike `synth_dim_arrow` (term position, `synth_node`
+                // on operands) — and a src of `type-annot(f, A)` (the
+                // `f : A ~[k]~> B` assign-annot shape) unwraps to `A`
+                // through the `type-annot` arm above, so the bound
+                // name never enters the type.
+                let kids = children_of(node).ok_or_else(|| {
+                    LangError::engine("dep_synth_type: dim_arrow no children")
+                })?;
+                if kids.len() < 3 {
+                    return Err(LangError::engine(
+                        "dep_synth_type: dim_arrow missing operands",
+                    ));
+                }
+                let src_idx = kids[0].as_u64().ok_or_else(|| {
+                    LangError::engine("dep_synth_type: dim_arrow src index")
+                })? as usize;
+                let dim_idx = kids[1].as_u64().ok_or_else(|| {
+                    LangError::engine("dep_synth_type: dim_arrow dim index")
+                })? as usize;
+                let tgt_idx = kids[2].as_u64().ok_or_else(|| {
+                    LangError::engine("dep_synth_type: dim_arrow tgt index")
+                })? as usize;
+                let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
+                let tgt = self.dep_synth_type(lang, ast, tgt_idx, ctx)?;
+                let dim_node = ast.get(AstRef::new(dim_idx)).ok_or_else(|| {
+                    LangError::engine("dep_synth_type: dim node out of bounds")
+                })?;
+                let dim_inner = if dim_node.kind == "paren" {
+                    child_at(ast, dim_node, 0)
+                        .and_then(|i| ast.get(i))
+                        .unwrap_or(dim_node)
+                } else {
+                    dim_node
+                };
+                let dim_payload = &dim_inner.payload;
+                let dim_val = if dim_payload.is_object() {
+                    dim_payload.get("value").cloned().unwrap_or(Value::Null)
+                } else {
+                    dim_payload.clone()
+                };
+                let dim_v = if dim_inner.kind == "value" {
+                    match dim_val.as_i64() {
+                        Some(n) => Val::Const(TaggedValue::Int(n)),
+                        None => dim_meta(ctx),
+                    }
+                } else {
+                    dim_meta(ctx)
+                };
+                let va = domain_lift(&src, ctx);
+                let vb = domain_lift(&tgt, ctx);
+                Ok(hom_former(dim_v, va, vb, ctx))
+            }
             "absurd" | "if" | "match" | "object" | "index" => {
                 // Non-type positions in annotations — leave them open.
                 let mut m = Map::new();
@@ -1043,39 +1124,76 @@ impl NbeTypecheckEngine {
         let name_owned = node_name(node)
             .ok_or_else(|| LangError::engine("dep_synth_type: var payload is not a string"))?;
         let name = name_owned.as_str();
-        if let Some(bound) = ctx.lookup(name).cloned() {
-            match tag_of(&bound) {
-                Some("type.ctor_sig") => {
-                    return self.instantiate_ctor_full(lang, ast, &bound, ctx)
-                }
-                Some("type.alias") => {
-                    return self.expand_alias(lang, ast, &bound, &[], ctx)
-                }
-                Some("type.family") => {
-                    if bound.get("name").and_then(Value::as_str).unwrap_or("") == name {
-                        let n = bound
-                            .get("base")
-                            .and_then(|b| b.get("elements"))
-                            .and_then(Value::as_array)
-                            .map(|e| e.len())
-                            .unwrap_or(0);
-                        let args: Vec<Value> = (0..n)
-                            .map(|_| meta_value(ctx.fresh_meta()))
-                            .collect();
-                        let mut m = Map::new();
-                        m.insert("name".to_string(), Value::String(name.to_string()));
-                        m.insert("args".to_string(), Value::Array(args));
-                        return Ok(make_tag(ctx, "type.family_app", m));
-                    }
-                }
-                _ => return Ok(bound),
+        // Γ bindings — source-level declarations (`data`, `type` aliases,
+        // `assign`s, pattern binders) — legitimately shadow builtin names:
+        // `data Bool :: …` must rebind `Bool` away from `type.bool`.
+        if let Some(bound) = ctx.lookup_gamma(name).cloned() {
+            if let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
+                return Ok(ty);
             }
         }
-        // `results` bindings shadow builtins for index variables.
+        // `results` bindings (index vars, ctor args, alias params,
+        // assign-bound terms — all lexically inner) shadow builtins and
+        // injected globals alike.
         if ctx.results.contains_key(name) {
             return Ok(eval_index(&var_term(name), ctx));
         }
+        // Builtin type names resolve before *injected* globals: `hnl
+        // typecheck` seeds the whole wire-prelude name set as
+        // `type.unknown` placeholders, which would otherwise report
+        // `Bool`/`Nat`/`IO`/… as `type.unknown` instead of their real
+        // types — and would shadow results-bound index variables the
+        // same way.
+        if is_builtin_type_name(name) {
+            return self.dep_builtin_or_tag(name, ctx);
+        }
+        if let Some(bound) = ctx.lookup_global(name).cloned() {
+            if let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
+                return Ok(ty);
+            }
+        }
         self.dep_builtin_or_tag(name, ctx)
+    }
+
+    /// Interpret a Γ/global binding in type position: `type.ctor_sig`
+    /// specs instantiate, `type.alias` records expand, `type.family`
+    /// self-references mint fresh `type.family_app` indices. Returns
+    /// `Ok(None)` only for a `type.family` binding that names a
+    /// *different* family (falls through to the next scope).
+    fn dep_bound_var_type(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        bound: &Value,
+        name: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<Value>, LangError> {
+        match tag_of(bound) {
+            Some("type.ctor_sig") => self
+                .instantiate_ctor_full(lang, ast, bound, ctx)
+                .map(Some),
+            Some("type.alias") => self.expand_alias(lang, ast, bound, &[], ctx).map(Some),
+            Some("type.family") => {
+                if bound.get("name").and_then(Value::as_str).unwrap_or("") == name {
+                    let n = bound
+                        .get("base")
+                        .and_then(|b| b.get("elements"))
+                        .and_then(Value::as_array)
+                        .map(|e| e.len())
+                        .unwrap_or(0);
+                    let args: Vec<Value> = (0..n)
+                        .map(|_| meta_value(ctx.fresh_meta()))
+                        .collect();
+                    let mut m = Map::new();
+                    m.insert("name".to_string(), Value::String(name.to_string()));
+                    m.insert("args".to_string(), Value::Array(args));
+                    Ok(Some(make_tag(ctx, "type.family_app", m)))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(Some(bound.clone())),
+        }
     }
 
     /// The builtin-name table for bare type-position identifiers.
@@ -3393,6 +3511,37 @@ impl NbeTypecheckEngine {
                     .ok_or_else(|| LangError::engine("synth_assign: annot idx".to_string()))?
                     as usize;
                 (iv.to_string(), AstRef::new(vidx), Some(AstRef::new(tidx)))
+            } else if matches!(lhs_node.kind.as_str(), "dim_arrow" | "axis_flow" | "flow") {
+                // `f : A ~[k]~> B` / `f : A >>>[k] B` — `:` binds
+                // tighter than the arrow infix, so the annotation
+                // parses as `arrow(type-annot(f, A), …)` with the
+                // `type-annot` nested in the arrow's src operand. The
+                // whole lhs is the annotation; the bound name lives in
+                // the src `type-annot`'s subject.
+                let src_node = child_at(ast, lhs_node, 0)
+                    .and_then(|i| ast.get(i))
+                    .ok_or_else(|| {
+                        LangError::engine("synth_assign: arrow lhs has no src operand".to_string())
+                    })?;
+                let sinner = if src_node.kind == "paren" {
+                    child_at(ast, src_node, 0)
+                        .and_then(|i| ast.get(i))
+                        .unwrap_or(src_node)
+                } else {
+                    src_node
+                };
+                let subj = lang
+                    .child_role_index(&sinner.kind, "subject")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let iv = children_of(sinner)
+                    .and_then(|k| k.get(subj))
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(node_name)
+                    .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?;
+                (iv, AstRef::new(vidx), Some(AstRef::new(lhs_idx)))
             } else if lhs_node.kind == "function" {
                 // `f : A ~> B` — the arrow annotation parses as a
                 // `function` node whose params child is the

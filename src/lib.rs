@@ -4805,12 +4805,25 @@ impl TypecheckContext {
     /// Look up a variable's type in Γ (reverse order — innermost first),
     /// then fall back to injected globals.
     fn lookup(&self, name: &str) -> Option<&Value> {
+        self.lookup_gamma(name).or_else(|| self.lookup_global(name))
+    }
+
+    /// Look up a variable's type in Γ only (reverse order — innermost
+    /// first). Source-level bindings live here; injected `with_global`
+    /// seeds do not (see [`lookup_global`](Self::lookup_global)).
+    fn lookup_gamma(&self, name: &str) -> Option<&Value> {
         self.gamma
             .iter()
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v)
-            .or_else(|| self.globals.get(name))
+    }
+
+    /// Look up an injected global — the `with_global` seeds a host binds
+    /// into the root context (e.g. the `type.unknown` wire-name
+    /// placeholders `hnl typecheck`/`hnl run` seed for module imports).
+    fn lookup_global(&self, name: &str) -> Option<&Value> {
+        self.globals.get(name)
     }
 
     /// Look up a binding by index in Γ (0 = outermost).
