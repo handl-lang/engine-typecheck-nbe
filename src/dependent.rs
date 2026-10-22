@@ -25,6 +25,7 @@
 use handl_language::{Ast, AstNode, AstRef, LangError, Language};
 use hnl_engine_typecheck::TypecheckDiagnostic;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 use crate::{
     extract_meta_id, is_assign_node, meta_value, role_child_ref, NbeTypecheckEngine,
@@ -2663,14 +2664,73 @@ impl NbeTypecheckEngine {
             // the refined scrutinee type. Pre-synthesizing would check
             // the arms under an unsolved-meta scrutinee, where `results`
             // stays empty and `transport`/`j`/`absurd` cannot resolve.
-            let ann = self
+            let ann = match self
                 .dep_synth_type(lang, ast, ann_ref.index(), ctx)
-                .or_else(|_| crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry))?;
+                .or_else(|_| crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry))
+            {
+                // A term-valued annotation (e.g. `call` on a results-bound
+                // name — `inc(4)` lowers to `App{var inc, [4]}`) reduces
+                // against the bound-value env before classification.
+                Ok(a) if is_ann_term(&a) => {
+                    self.eval_ann_term(lang, ast, &a, ctx, ANN_FUEL)?
+                }
+                Ok(a) => a,
+                Err(interp_err) => {
+                    // Ordered value annotation (ADR-0103): `x : E := v`
+                    // evaluates `E` as a term — a value result means
+                    // equality (`f : inc(4) := 5` checks `5 == inc(4)`).
+                    match self.eval_ann_node(lang, ast, ann_ref.index(), ctx) {
+                        Ok(v) => v,
+                        Err(_) => return Err(interp_err),
+                    }
+                }
+            };
             if matches!(
                 ann.get("__tag__").and_then(Value::as_str),
                 Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app")
             ) {
                 self.check_node(lang, ast, value_ref, &ann, ctx)?;
+            } else if is_plain_ann_value(&ann) {
+                // The annotation evaluated to a *value*: the assigned
+                // expression must evaluate to the same value.
+                let v = self
+                    .eval_ann_node(lang, ast, value_ref.index(), ctx)
+                    .map_err(|e| {
+                        LangError::engine(format!(
+                            "assign: cannot evaluate the value side of '{name}'s annotation: {e}"
+                        ))
+                    })?;
+                if !ann_value_eq(&v, &ann) {
+                    return Err(LangError::engine(format!(
+                        "assign: value {v} does not equal the annotation {ann} for '{name}'"
+                    )));
+                }
+            } else if is_applicable_ann(&ann) {
+                // The annotation evaluated to a closure — a predicate /
+                // family-membership check: apply it to the value.
+                let v = self.eval_ann_node(lang, ast, value_ref.index(), ctx);
+                let applied = match v {
+                    Ok(vv) => {
+                        self.apply_ann_val(lang, ast, &ann, &[vv], ctx, ANN_FUEL)?
+                    }
+                    Err(_) => Value::Null,
+                };
+                if applied == Value::Bool(false) {
+                    return Err(LangError::engine(format!(
+                        "assign: value does not satisfy the predicate annotation for '{name}'"
+                    )));
+                }
+                if !(applied == Value::Bool(true)) {
+                    // Undecidable — symbolic predicate; accept with a
+                    // runtime-assert diagnostic (the model's warning).
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "runtime_assert".to_string(),
+                        message: format!(
+                            "assign: predicate annotation for '{name}' is symbolic — deferred to runtime"
+                        ),
+                        span: None,
+                    });
+                }
             } else {
                 let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
                 self.dep_unify(&value_type, &ann, ctx)?;
@@ -2679,9 +2739,524 @@ impl NbeTypecheckEngine {
         } else {
             self.synth_node(lang, ast, value_ref, ctx)?
         };
-        ctx.extend(name, bound_type);
+        ctx.extend(name.clone(), bound_type);
+        // ADR-0103: record the bound *term* of the value — the bound-value
+        // env ordered annotations evaluate against (the model's
+        // `tc_bind_result`). `var{name}` inside a call annotation resolves
+        // to this term (e.g. `inc ↦ Lam{params, body}`).
+        if let Some(vn) = ast.get(value_ref) {
+            if let Some(t) = self.node_to_ann_term(lang, ast, vn) {
+                ctx.bind_result(name.clone(), t);
+            }
+        }
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ordered value annotations (ADR-0103) — bound-value evaluation
+// ---------------------------------------------------------------------------
+//
+// Port of the model's `node_term_`/`eval_term_`/`apply_val_`/`eval_node_`
+// fragment: `x : E := v` treats `E` as an expression evaluated against the
+// bound-value environment (`ctx.results`, populated by every `assign` —
+// the model's `tc_bind_result`). A *type* result means membership
+// (`5 : Number`); a *value* result means equality (`f : inc(4) := 5`
+// checks `5 == inc(4)`); a closure result means predicate application.
+//
+// Terms are the same tagged `Value`s the index algebra uses:
+// `var{name}`, `Bin{op,l,r}`, `Un{op,operand}`, plus `App{callee,args}`,
+// `Lam{params,body}`, `LamVal{params,body,env}`, `Comp{l,r}`,
+// `CompVal{l,r}`, `If{cond,then,else}`, `ArrLit{elements}` — everything
+// else is a literal.
+
+/// Evaluation fuel for annotation terms — the model's `tc_burn_fuel`
+/// bound (guaranteed termination like every other checker recursion).
+const ANN_FUEL: u32 = 4096;
+
+/// Whether `v` is a *term* produced by the annotation lowering (not a
+/// `type.*`/`Path`/family type value and not a plain value).
+fn is_ann_term(v: &Value) -> bool {
+    matches!(
+        tag_of(v),
+        Some("App" | "var" | "Lam" | "LamVal" | "Comp" | "CompVal" | "If" | "ArrLit")
+    )
+}
+
+/// Whether `v` is a plain (untagged, non-meta) value — a *value* result
+/// in the ordered-annotation sense.
+fn is_plain_ann_value(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => {
+            !m.contains_key("__tag__")
+                && !m.contains_key("__meta__")
+                && !m.contains_key("__former__")
+                && !m.contains_key("__sym__")
+                && !m.contains_key("__neutral__")
+                && !m.contains_key("__arrow__")
+                && !m.contains_key("__type__")
+        }
+        Value::Null => false,
+        _ => true,
+    }
+}
+
+/// Whether `v` is an applicable annotation value — `LamVal`/`CompVal`
+/// closure terms or a boundary `__arrow__`.
+fn is_applicable_ann(v: &Value) -> bool {
+    matches!(tag_of(v), Some("LamVal" | "CompVal"))
+        || v.get("__arrow__").and_then(Value::as_bool) == Some(true)
+}
+
+/// Numeric-tolerant value equality — index evaluation folds arithmetic
+/// to `f64` (`5.0`) while literal payloads stay integer (`5`).
+fn ann_value_eq(a: &Value, b: &Value) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn app_term(callee: Value, args: Vec<Value>) -> Value {
+    let mut m = Map::new();
+    m.insert("__tag__".to_string(), Value::String("App".to_string()));
+    m.insert("callee".to_string(), callee);
+    m.insert("args".to_string(), Value::Array(args));
+    Value::Object(m)
+}
+
+impl NbeTypecheckEngine {
+    /// Lower an AST node to a closed annotation *term* (the model's
+    /// `node_term_`). Returns `None` for kinds outside the evaluable
+    /// fragment — the annotation then keeps the type-interpretation
+    /// error path.
+    fn node_to_ann_term(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+    ) -> Option<Value> {
+        let kids = children_of(node).cloned().unwrap_or_default();
+        let at = |i: usize| -> Option<&AstNode> {
+            kids.get(i)
+                .and_then(Value::as_u64)
+                .and_then(|j| ast.get(AstRef::new(j as usize)))
+        };
+        match node.kind.as_str() {
+            "value" | "lit" => Some(match &node.payload {
+                Value::Object(m) => m.get("value").cloned().unwrap_or(Value::Null),
+                p => p.clone(),
+            }),
+            "var" => Some(var_term(&node_name(node)?)),
+            "paren" => self.node_to_ann_term(lang, ast, at(0)?),
+            "call" => {
+                let callee_role = lang
+                    .child_role_index(&node.kind, "callee")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let args_role = lang
+                    .child_role_index(&node.kind, "args")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1);
+                let callee = self.node_to_ann_term(lang, ast, at(callee_role)?)?;
+                let mut args = Vec::new();
+                for i in args_role..kids.len() {
+                    args.push(self.node_to_ann_term(lang, ast, at(i)?)?);
+                }
+                Some(app_term(callee, args))
+            }
+            "function" => {
+                // Rich `{params: [..], body: idx}` payload or the
+                // children [params, body] layout (roles per ADR-0081).
+                if let (Some(params), Some(body)) = (
+                    node.payload.get("params").and_then(Value::as_array),
+                    node.payload.get("body").and_then(Value::as_u64),
+                ) {
+                    let names: Vec<Value> = params.clone();
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("Lam".to_string()));
+                    m.insert("params".to_string(), Value::Array(names));
+                    m.insert("body".to_string(), Value::from(body));
+                    return Some(Value::Object(m));
+                }
+                let params_idx = role_child_ref(lang, node, "params").or_else(|| child_at(ast, node, 0))?;
+                let body_idx = role_child_ref(lang, node, "body").or_else(|| child_at(ast, node, 1))?;
+                let pnode = ast.get(params_idx)?;
+                let (names, _rest) = lang.param_names(ast, pnode).ok()?;
+                let mut m = Map::new();
+                m.insert("__tag__".to_string(), Value::String("Lam".to_string()));
+                m.insert(
+                    "params".to_string(),
+                    Value::Array(names.into_iter().map(Value::String).collect()),
+                );
+                m.insert("body".to_string(), Value::from(body_idx.index() as u64));
+                Some(Value::Object(m))
+            }
+            "if" => {
+                let cond = role_child_ref(lang, node, "condition").or_else(|| child_at(ast, node, 0))?;
+                let then = role_child_ref(lang, node, "then").or_else(|| child_at(ast, node, 1))?;
+                let els = role_child_ref(lang, node, "else").or_else(|| child_at(ast, node, 2));
+                let mut m = Map::new();
+                m.insert("__tag__".to_string(), Value::String("If".to_string()));
+                m.insert(
+                    "cond".to_string(),
+                    self.node_to_ann_term(lang, ast, ast.get(cond)?)?,
+                );
+                m.insert(
+                    "then".to_string(),
+                    self.node_to_ann_term(lang, ast, ast.get(then)?)?,
+                );
+                if let Some(e) = els.and_then(|r| ast.get(r)) {
+                    m.insert(
+                        "else".to_string(),
+                        self.node_to_ann_term(lang, ast, e)?,
+                    );
+                }
+                Some(Value::Object(m))
+            }
+            "array" => {
+                let mut els = Vec::new();
+                for i in 0..kids.len() {
+                    els.push(self.node_to_ann_term(lang, ast, at(i)?)?);
+                }
+                let mut m = Map::new();
+                m.insert("__tag__".to_string(), Value::String("ArrLit".to_string()));
+                m.insert("elements".to_string(), Value::Array(els));
+                Some(Value::Object(m))
+            }
+            "flow" => {
+                let l = self.node_to_ann_term(lang, ast, at(0)?)?;
+                let r = self.node_to_ann_term(lang, ast, at(1)?)?;
+                let mut m = Map::new();
+                m.insert("__tag__".to_string(), Value::String("Comp".to_string()));
+                m.insert("l".to_string(), l);
+                m.insert("r".to_string(), r);
+                Some(Value::Object(m))
+            }
+            _ if node.kind.starts_with("binary.") => {
+                let l = role_child_ref(lang, node, "left")
+                    .or_else(|| child_at(ast, node, 0))
+                    .and_then(|r| ast.get(r))
+                    .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
+                let r = role_child_ref(lang, node, "right")
+                    .or_else(|| child_at(ast, node, 1))
+                    .and_then(|r| ast.get(r))
+                    .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
+                Some(bin_term(&node.kind, l, r))
+            }
+            _ if node.kind.starts_with("unary.") => {
+                let o = role_child_ref(lang, node, "operand")
+                    .or_else(|| child_at(ast, node, 0))
+                    .and_then(|r| ast.get(r))
+                    .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
+                Some(un_term(&node.kind, o))
+            }
+            _ => None,
+        }
+    }
+
+    /// `node_to_ann_term` + `eval_ann_term` (the model's `eval_node_`).
+    fn eval_ann_node(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
+            LangError::engine(format!("ann eval: node {idx} out of bounds"))
+        })?;
+        let term = self.node_to_ann_term(lang, ast, node).ok_or_else(|| {
+            LangError::engine(format!(
+                "ann eval: node kind '{}' is not evaluable",
+                node.kind
+            ))
+        })?;
+        self.eval_ann_term(lang, ast, &term, ctx, ANN_FUEL)
+    }
+
+    /// Reduce an annotation term against the bound-value env
+    /// (`ctx.results`) — the model's `eval_term_`. Stuck terms return
+    /// their partially-evaluated form (the model returned the term).
+    fn eval_ann_term(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        term: &Value,
+        ctx: &mut TypecheckContext,
+        fuel: u32,
+    ) -> Result<Value, LangError> {
+        if fuel == 0 {
+            return Ok(term.clone());
+        }
+        match tag_of(term) {
+            Some("var") => {
+                let name = term.get("name").and_then(Value::as_str).unwrap_or("");
+                match ctx.results.get(name) {
+                    // A `var{n} ↦ var{n}` self-binding stays symbolic —
+                    // recursing would burn the fuel on a fixed point.
+                    Some(bound) if bound != term => {
+                        self.eval_ann_term(lang, ast, &bound.clone(), ctx, fuel - 1)
+                    }
+                    _ => Ok(term.clone()),
+                }
+            }
+            Some("Lam") => {
+                let mut m = Map::new();
+                m.insert("__tag__".to_string(), Value::String("LamVal".to_string()));
+                m.insert(
+                    "params".to_string(),
+                    term.get("params").cloned().unwrap_or(Value::Array(vec![])),
+                );
+                m.insert(
+                    "body".to_string(),
+                    term.get("body").cloned().unwrap_or(Value::Null),
+                );
+                m.insert(
+                    "env".to_string(),
+                    Value::Object(
+                        ctx.results
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    ),
+                );
+                Ok(Value::Object(m))
+            }
+            Some("App") => {
+                let callee = self.eval_ann_term(
+                    lang,
+                    ast,
+                    &term.get("callee").cloned().unwrap_or(Value::Null),
+                    ctx,
+                    fuel - 1,
+                )?;
+                let mut args = Vec::new();
+                for a in term
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    args.push(self.eval_ann_term(lang, ast, &a, ctx, fuel - 1)?);
+                }
+                self.apply_ann_val(lang, ast, &callee, &args, ctx, fuel - 1)
+            }
+            Some("Comp") => {
+                let l = self.eval_ann_term(
+                    lang,
+                    ast,
+                    &term.get("l").cloned().unwrap_or(Value::Null),
+                    ctx,
+                    fuel - 1,
+                )?;
+                let r = self.eval_ann_term(
+                    lang,
+                    ast,
+                    &term.get("r").cloned().unwrap_or(Value::Null),
+                    ctx,
+                    fuel - 1,
+                )?;
+                if is_applicable_ann(&r) && !is_applicable_ann(&l) {
+                    self.apply_ann_val(lang, ast, &r, &[l], ctx, fuel - 1)
+                } else if is_applicable_ann(&l) && is_applicable_ann(&r) {
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("CompVal".to_string()));
+                    m.insert("l".to_string(), l);
+                    m.insert("r".to_string(), r);
+                    Ok(Value::Object(m))
+                } else {
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("Comp".to_string()));
+                    m.insert("l".to_string(), l);
+                    m.insert("r".to_string(), r);
+                    Ok(Value::Object(m))
+                }
+            }
+            Some("Bin") | Some("Un") => {
+                // Evaluate subterms first (they may contain App/Lam), then
+                // fold closed arithmetic through the index evaluator.
+                let evaled = if tag_of(term) == Some("Bin") {
+                    let l = self.eval_ann_term(
+                        lang,
+                        ast,
+                        &term.get("l").cloned().unwrap_or(Value::Null),
+                        ctx,
+                        fuel - 1,
+                    )?;
+                    let r = self.eval_ann_term(
+                        lang,
+                        ast,
+                        &term.get("r").cloned().unwrap_or(Value::Null),
+                        ctx,
+                        fuel - 1,
+                    )?;
+                    bin_term(
+                        term.get("op").and_then(Value::as_str).unwrap_or(""),
+                        l,
+                        r,
+                    )
+                } else {
+                    let o = self.eval_ann_term(
+                        lang,
+                        ast,
+                        &term.get("operand").cloned().unwrap_or(Value::Null),
+                        ctx,
+                        fuel - 1,
+                    )?;
+                    un_term(
+                        term.get("op").and_then(Value::as_str).unwrap_or(""),
+                        o,
+                    )
+                };
+                // `binary.eq`/`neq`/comparisons on plain literals fold too —
+                // `eval_index` covers arithmetic; close the scalar fragment.
+                if tag_of(&evaled) == Some("Bin") {
+                    let op = evaled.get("op").and_then(Value::as_str).unwrap_or("");
+                    let l = eval_index(evaled.get("l").unwrap_or(&Value::Null), ctx);
+                    let r = eval_index(evaled.get("r").unwrap_or(&Value::Null), ctx);
+                    let (ln, rn) = (num_val(&l), num_val(&r));
+                    let folded = match op {
+                        "binary.eq" if l == r || (ln.is_some() && ln == rn) => {
+                            Some(Value::Bool(true))
+                        }
+                        "binary.eq" if ln.is_some() && rn.is_some() => {
+                            Some(Value::Bool(false))
+                        }
+                        "binary.neq" if ln.is_some() && rn.is_some() => {
+                            Some(Value::Bool(ln != rn))
+                        }
+                        "binary.lt" => ln.zip(rn).map(|(a, b)| Value::Bool(a < b)),
+                        "binary.lte" => ln.zip(rn).map(|(a, b)| Value::Bool(a <= b)),
+                        "binary.gt" => ln.zip(rn).map(|(a, b)| Value::Bool(a > b)),
+                        "binary.gte" => ln.zip(rn).map(|(a, b)| Value::Bool(a >= b)),
+                        "binary.and" => match (&l, &r) {
+                            (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(*a && *b)),
+                            _ => None,
+                        },
+                        "binary.or" => match (&l, &r) {
+                            (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(*a || *b)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(v) = folded {
+                        return Ok(v);
+                    }
+                }
+                Ok(eval_index(&evaled, ctx))
+            }
+            Some("If") => {
+                let c = self.eval_ann_term(
+                    lang,
+                    ast,
+                    &term.get("cond").cloned().unwrap_or(Value::Null),
+                    ctx,
+                    fuel - 1,
+                )?;
+                match c {
+                    Value::Bool(true) => self.eval_ann_term(
+                        lang,
+                        ast,
+                        &term.get("then").cloned().unwrap_or(Value::Null),
+                        ctx,
+                        fuel - 1,
+                    ),
+                    Value::Bool(false) => self.eval_ann_term(
+                        lang,
+                        ast,
+                        &term.get("else").cloned().unwrap_or(Value::Null),
+                        ctx,
+                        fuel - 1,
+                    ),
+                    _ => Ok(term.clone()),
+                }
+            }
+            Some("ArrLit") => {
+                let mut els = Vec::new();
+                let mut all_plain = true;
+                for e in term
+                    .get("elements")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    let v = self.eval_ann_term(lang, ast, &e, ctx, fuel - 1)?;
+                    all_plain &= tag_of(&v).is_none();
+                    els.push(v);
+                }
+                if all_plain {
+                    Ok(Value::Array(els))
+                } else {
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("ArrLit".to_string()));
+                    m.insert("elements".to_string(), Value::Array(els));
+                    Ok(Value::Object(m))
+                }
+            }
+            _ => Ok(term.clone()),
+        }
+    }
+
+    /// Apply an evaluated annotation value to evaluated arguments (the
+    /// model's `apply_val_`): `LamVal` runs its body under the captured
+    /// env extended with `params ↦ args`; `CompVal` composes; a boundary
+    /// `__arrow__` cannot be host-called here and stays a stuck `App`.
+    fn apply_ann_val(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        f: &Value,
+        args: &[Value],
+        ctx: &mut TypecheckContext,
+        fuel: u32,
+    ) -> Result<Value, LangError> {
+        match tag_of(f) {
+            Some("LamVal") => {
+                let params: Vec<String> = f
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .map(|ps| {
+                        ps.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let body_idx = f
+                    .get("body")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| LangError::engine("LamVal: no body index".to_string()))?
+                    as usize;
+                // bound_env = captured env + params ↦ args.
+                let mut bound_env: HashMap<String, Value> = f
+                    .get("env")
+                    .and_then(Value::as_object)
+                    .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                for (p, a) in params.iter().zip(args.iter()) {
+                    bound_env.insert(p.clone(), a.clone());
+                }
+                let old_results = ctx.results.clone();
+                ctx.results = bound_env;
+                let r = self.eval_ann_node(lang, ast, body_idx, ctx);
+                ctx.results = old_results;
+                r
+            }
+            Some("CompVal") => {
+                let l = f.get("l").cloned().unwrap_or(Value::Null);
+                let r = f.get("r").cloned().unwrap_or(Value::Null);
+                let inner = self.apply_ann_val(lang, ast, &l, args, ctx, fuel - 1)?;
+                self.apply_ann_val(lang, ast, &r, &[inner], ctx, fuel - 1)
+            }
+            _ => Ok(app_term(f.clone(), args.to_vec())),
+        }
     }
 }
 

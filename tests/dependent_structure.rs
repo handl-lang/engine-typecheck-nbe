@@ -783,3 +783,45 @@ fn dependent_hnl_parses_and_typechecks() {
         diags_of(&result)
     );
 }
+
+/// Ordered value annotations (ADR-0103): a `call`-shaped annotation
+/// evaluates against the bound-value env (`inc := n ~> n + 1` records
+/// `inc ↦ Lam{…}` in `results`), so `f : inc(4) := 5` checks
+/// `5 == inc(4)` and `f : inc(4) := 6` is a mismatch — the WS-B
+/// regression where the NBE checker silently accepted (or failed to
+/// interpret) term-level `call` annotations.
+#[test]
+fn ordered_call_annotation_checks_equality() {
+    let lang = canonical_lang();
+    let good = parse_block(
+        &lang,
+        &["inc := n ~> n + 1", "f : inc(4) := 5"],
+    );
+    let result = typecheck(&lang, good);
+    assert!(
+        !has_error(&result),
+        "f : inc(4) := 5 should check 5 == inc(4), got {:?}",
+        diags_of(&result)
+    );
+
+    let bad = parse_block(
+        &lang,
+        &["inc := n ~> n + 1", "f : inc(4) := 6"],
+    );
+    let result = typecheck(&lang, bad);
+    assert!(
+        has_error(&result),
+        "f : inc(4) := 6 should be a value-annotation mismatch"
+    );
+
+    let nested = parse_block(
+        &lang,
+        &["inc := n ~> n + 1", "dbl := n ~> n * 2", "f : dbl(inc(4)) := 10"],
+    );
+    let result = typecheck(&lang, nested);
+    assert!(
+        !has_error(&result),
+        "dbl(inc(4)) = 2*(4+1) = 10 should check, got {:?}",
+        diags_of(&result)
+    );
+}
