@@ -516,6 +516,40 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
             ),
         })),
         TaggedValue::Obj(m) => {
+            // The `__tag__` bridge (ADR-0154 §3 / spec WS-E): a legacy
+            // tagged type value `{"__tag__": t}` lifts to `Nominal(t)`;
+            // one with a payload lifts to `Former{t, <fields sorted by
+            // key>}` — the tag names the former, the payload its
+            // indices. `__tag__`/`__registry__`/`body_closure` are
+            // structural keys, not indices.
+            if let Some(TaggedValue::Str(tag)) = m.get("__tag__") {
+                // `type.universe{level}` is `Type(i)` — a domain
+                // universe, not a former application.
+                if tag.as_ref() == "type.universe" {
+                    let i = m
+                        .get("level")
+                        .and_then(|l| l.as_i64())
+                        .unwrap_or(0)
+                        .max(0) as u32;
+                    return Val::Universe(i);
+                }
+                let mut keyed: Vec<(&Rc<str>, &TaggedValue)> = m
+                    .iter()
+                    .filter(|(k, _)| {
+                        k.as_ref() != "__tag__"
+                            && k.as_ref() != "__registry__"
+                            && k.as_ref() != "body_closure"
+                    })
+                    .collect();
+                if keyed.is_empty() {
+                    return Val::Nominal(type_sym(tag));
+                }
+                keyed.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+                return Val::Former {
+                    head: type_sym(tag),
+                    args: keyed.into_iter().map(|(_, v)| lift(lvl, v)).collect(),
+                };
+            }
             if let Some(f) = m.get("__former__") {
                 // Two spellings: `{"__former__": {"sym": <sym>, "args":
                 // [...]}}` (quote's encoding) and `{"__former__": <sym>,

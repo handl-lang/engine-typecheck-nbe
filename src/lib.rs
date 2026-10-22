@@ -97,6 +97,7 @@ use hnl_engine_typecheck::{
     TypecheckDiagnostic, TypecheckEngine, TypecheckRequest, TypecheckResult,
 };
 use handl_plugin_lib_tag::TypeRegistry;
+use handl_value::{TaggedValue, nbe::Val};
 use hnl_engine::TermData;
 
 pub mod checker;
@@ -839,6 +840,135 @@ impl NbeTypecheckEngine {
                 let sup = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
                 self.check_subtype(&sub, &sup, ctx)?;
                 Ok(Value::Null)
+            }
+            // --- `Val`-domain ops (phase-1 spec WS-B) ----------------------
+            // The `v*` ops are the migration seam toward domain-native
+            // checking (ADR-0154 §7): argument schemes evaluate in the
+            // legacy tagged encoding, `checker::lift` reifies them into
+            // `Val` (`{"__tag__":"type.X"}` → `Nominal`, `{"__tag__":t,
+            // …}` → `Former`), and `ctx.vcheck` judges. `veval` runs a
+            // whole sub-scheme inside the domain through
+            // `hnl_engine::nbe::eval` + `JudgmentOps`.
+            "vconv" | "vunify" => {
+                if args.len() != 2 {
+                    return Err(LangError::engine("vconv: requires 2 args (a, b)"));
+                }
+                let a = self.eval_type_scheme_td(
+                    lang,
+                    ast,
+                    node_ref,
+                    &args[0],
+                    ctx,
+                    incoming.clone(),
+                )?;
+                let b = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                let lvl = ctx.vcheck.lvl();
+                let va = checker::lift(lvl, &handl_value::TaggedValue::from(a));
+                let vb = checker::lift(lvl, &handl_value::TaggedValue::from(b));
+                Ok(Value::Bool(ctx.vcheck.conv(&va, &vb)))
+            }
+            "vsubtype" => {
+                if args.len() != 2 {
+                    return Err(LangError::engine("vsubtype: requires 2 args (sub, super)"));
+                }
+                let sub = self.eval_type_scheme_td(
+                    lang,
+                    ast,
+                    node_ref,
+                    &args[0],
+                    ctx,
+                    incoming.clone(),
+                )?;
+                let sup = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                let lvl = ctx.vcheck.lvl();
+                let va = checker::lift(lvl, &handl_value::TaggedValue::from(sub));
+                let vb = checker::lift(lvl, &handl_value::TaggedValue::from(sup));
+                Ok(Value::Bool(ctx.vcheck.subtype(&va, &vb)))
+            }
+            "vinfer" => {
+                let v = if args.is_empty() {
+                    incoming.clone().unwrap_or(Value::Null)
+                } else {
+                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                };
+                let lvl = ctx.vcheck.lvl();
+                let vv = checker::lift(lvl, &handl_value::TaggedValue::from(v));
+                let ty = ctx
+                    .vcheck
+                    .infer(&vv)
+                    .map_err(|e| LangError::engine(format!("typecheck: vinfer: {e}")))?;
+                Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
+                    &ctx.vcheck.metas,
+                    ctx.vcheck.lvl(),
+                    &ty,
+                )))
+            }
+            "vbind" => {
+                // `vbind("x", <type-scheme>)` — extend the domain Γ;
+                // returns `incoming` (the `extend` convention).
+                let name = lit
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        LangError::engine("typecheck: vbind: lit must be a string (name)")
+                    })?
+                    .to_string();
+                let ty = if args.is_empty() {
+                    incoming.clone().unwrap_or(Value::Null)
+                } else {
+                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                };
+                let lvl = ctx.vcheck.lvl();
+                let vt = checker::lift(lvl, &handl_value::TaggedValue::from(ty));
+                ctx.vcheck.bind(name, vt);
+                Ok(incoming.unwrap_or(Value::Null))
+            }
+            "vlookup" => {
+                let name = lit
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        incoming
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .ok_or_else(|| {
+                        LangError::engine(
+                            "typecheck: vlookup: requires a string lit or string incoming (name)",
+                        )
+                    })?;
+                match ctx.vcheck.lookup_name(&name).cloned() {
+                    Some(ty) => Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
+                        &ctx.vcheck.metas,
+                        ctx.vcheck.lvl(),
+                        &ty,
+                    ))),
+                    None => Ok(Value::Null),
+                }
+            }
+            "veval" => {
+                // Evaluate a whole sub-scheme inside the domain:
+                // `TermData` → `Term` → `hnl_engine::nbe::eval` under
+                // `JudgmentOps` over `ctx.vcheck` (moved out for the
+                // `&dyn OpHandler` call and moved back).
+                let td = args.first().ok_or_else(|| {
+                    LangError::engine("typecheck: veval: requires a scheme arg")
+                })?;
+                let term = td.to_term().map_err(|e| {
+                    LangError::engine(format!("typecheck: veval: bad scheme: {e}"))
+                })?;
+                let inc = incoming
+                    .map(|v| checker::lift(ctx.vcheck.lvl(), &handl_value::TaggedValue::from(v)))
+                    .unwrap_or(Val::Const(TaggedValue::Null));
+                let ops = judgments::JudgmentOps::over(std::mem::take(&mut ctx.vcheck));
+                let r = hnl_engine::nbe::eval(&term, inc, &ops);
+                ctx.vcheck = ops.checker.into_inner();
+                let v = r.map_err(|e| LangError::engine(format!("typecheck: veval: {e}")))?;
+                Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
+                    &ctx.vcheck.metas,
+                    ctx.vcheck.lvl(),
+                    &v,
+                )))
             }
             "extend" => {
                 // Read the name from `lit` when a non-null literal is present;
@@ -4544,6 +4674,11 @@ struct TypecheckContext {
     globals: HashMap<String, Value>,
     /// Per-node synthesized/checked types (ADR-0032 proof erasure).
     node_types: HashMap<usize, Value>,
+    /// The `Val`-domain checker (phase-1 WS-B): Γ, meta store, former
+    /// and nominal registries. The `v*` judgment ops lift legacy
+    /// tagged types into the domain and judge here — the migration
+    /// seam toward full domain evaluation.
+    vcheck: checker::Checker,
 }
 
 impl TypecheckContext {
@@ -4557,6 +4692,7 @@ impl TypecheckContext {
             diagnostics: Vec::new(),
             globals,
             node_types: HashMap::new(),
+            vcheck: checker::Checker::new(),
         }
     }
 

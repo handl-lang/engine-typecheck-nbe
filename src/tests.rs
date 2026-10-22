@@ -11283,3 +11283,132 @@ fn type_tag_wraps_value() {
         .unwrap();
     assert_eq!(result, json!({"__tag__": "Foo", "value": type_number()}));
 }
+
+// ---------------------------------------------------------------------------
+// `v*` domain ops (phase-1 spec WS-B): the checker::Checker seam —
+// legacy tagged type values lift into the `Val` domain, judgment calls
+// (`vconv`/`vsubtype`/`vinfer`/`vbind`/`vlookup`) and whole sub-scheme
+// evaluation (`veval` through hnl_engine::nbe::eval + JudgmentOps).
+// ---------------------------------------------------------------------------
+
+fn vscheme(scheme: Term) -> Value {
+    let engine = engine();
+    let mut ast = Ast::new();
+    ast.push(AstNode::new("test"));
+    let node_ref = AstRef::new(0);
+    let lang = Language::new();
+    let mut ctx = TypecheckContext::new("handl.canonical", HashMap::new());
+    engine
+        .eval_type_scheme(&lang, &ast, node_ref, &scheme, &mut ctx, None)
+        .unwrap()
+}
+
+#[test]
+fn vconv_lifts_tagged_types() {
+    // `{"__tag__":"type.int"}` lifts to `Nominal(type.int)` — equal
+    // nominals convert.
+    let scheme = td(arr_judgment(
+        "vconv",
+        vec![
+            TermData::const_value(json!({"__tag__": "type.int"})),
+            TermData::const_value(json!({"__tag__": "type.int"})),
+        ],
+    ));
+    assert_eq!(vscheme(scheme), json!(true));
+
+    let scheme = td(arr_judgment(
+        "vconv",
+        vec![
+            TermData::const_value(json!({"__tag__": "type.int"})),
+            TermData::const_value(json!({"__tag__": "type.string"})),
+        ],
+    ));
+    assert_eq!(vscheme(scheme), json!(false));
+}
+
+#[test]
+fn vsubtype_walks_declared_parent() {
+    // Declare `type.nat <: type.int` in the domain, then a lifted
+    // `type.nat` subtypes to `type.int`.
+    let scheme = Term::seq(
+        Term::arr_judgment_lit(
+            "veval",
+            vec![td(arr_judgment_lit(
+                "decl_parent",
+                vec![],
+                json!(["type.nat", "type.int"]),
+            ))],
+            json!(null),
+        ),
+        td(arr_judgment(
+            "vsubtype",
+            vec![
+                TermData::const_value(json!({"__tag__": "type.nat"})),
+                TermData::const_value(json!({"__tag__": "type.int"})),
+            ],
+        )),
+    );
+    assert_eq!(vscheme(scheme), json!(true));
+    // The reverse direction is not a subtype.
+    let scheme = td(arr_judgment(
+        "vsubtype",
+        vec![
+            TermData::const_value(json!({"__tag__": "type.int"})),
+            TermData::const_value(json!({"__tag__": "type.nat"})),
+        ],
+    ));
+    assert_eq!(vscheme(scheme), json!(false));
+}
+
+#[test]
+fn veval_normalizes_indices() {
+    // `Vec(1+1, Int) ≡ Vec(2, Int)` inside the domain — index equality
+    // is evaluation, not a rewriting solver (ADR-0152 §3).
+    let int = || arr_judgment_lit("nominal", vec![], json!("type.int"));
+    let vec_a = arr_judgment_lit(
+        "former",
+        vec![
+            arr_judgment(
+                "add",
+                vec![TermData::const_value(json!(1)), TermData::const_value(json!(1))],
+            ),
+            int(),
+        ],
+        json!("vec.Vec"),
+    );
+    let vec_b = arr_judgment_lit(
+        "former",
+        vec![TermData::const_value(json!(2)), int()],
+        json!("vec.Vec"),
+    );
+    let scheme = Term::arr_judgment(
+        "veval",
+        vec![td(arr_judgment("unify", vec![vec_a, vec_b]))],
+    );
+    assert_eq!(vscheme(scheme), json!(true));
+}
+
+#[test]
+fn vbind_vlookup_roundtrip() {
+    // `vbind("x", <type.int>) >>> vlookup("x")` — the domain Γ port of
+    // `bind_imports_`: bound names resolve to their types.
+    let scheme = Term::seq(
+        Term::arr_judgment_lit(
+            "vbind",
+            vec![Term::constant(json!({"__tag__": "type.int"}))],
+            json!("x"),
+        ),
+        td(arr_judgment_lit("vlookup", vec![], json!("x"))),
+    );
+    let result = vscheme(scheme);
+    assert_eq!(result["__sym__"]["name"], json!("int"));
+}
+
+#[test]
+fn vinfer_literal_mints_constrained_meta() {
+    // `vinfer(42)` — a numeric literal synthesizes a constrained meta
+    // (ADR-0154 §5), quoted as a `__neutral__` meta.
+    let scheme = td(arr_judgment("vinfer", vec![TermData::const_value(json!(42))]));
+    let result = vscheme(scheme);
+    assert_eq!(result["__neutral__"]["head"], json!("meta"));
+}

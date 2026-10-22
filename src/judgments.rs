@@ -22,7 +22,7 @@
 use std::cell::RefCell;
 
 use handl_value::nbe::{ArrowVal, Spine, Val};
-use handl_value::TaggedValue;
+use handl_value::{Sym, TaggedValue};
 use hnl_engine::nbe::{EvalError, OpHandler};
 use hnl_engine::Term;
 use serde_json::Value;
@@ -151,6 +151,33 @@ impl OpHandler for JudgmentOps {
                     head: type_sym("type.hom"),
                     args: all,
                 })
+            }
+            "decl_parent" => {
+                // Declare a parent link on a seeded nominal:
+                // `decl_parent` with lit `[child, parent]` or args
+                // `[child, parent]` — the `Sym::seeded_with_parent`
+                // declaration (ADR-0154 §2's `parent` link).
+                let pair: Vec<String> = lit
+                    .and_then(Value::as_array)
+                    .map(|xs| {
+                        xs.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        args.iter()
+                            .filter_map(|v| match v {
+                                Val::Const(TaggedValue::Str(s)) => Some(s.to_string()),
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                if pair.len() != 2 {
+                    return Err(err("expected [child, parent] seed pair".into()));
+                }
+                let parent = Sym::seeded(&pair[1]);
+                Ok(Val::Nominal(Sym::seeded_with_parent(&pair[0], &parent)))
             }
             "meta" => {
                 let ty = args.first().cloned().unwrap_or(Val::Universe(0));
