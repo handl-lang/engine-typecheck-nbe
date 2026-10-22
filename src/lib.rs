@@ -100,6 +100,7 @@ use handl_plugin_lib_tag::TypeRegistry;
 use hnl_engine::TermData;
 
 pub mod checker;
+pub mod judgments;
 mod predicate_eval;
 mod totality_check;
 
