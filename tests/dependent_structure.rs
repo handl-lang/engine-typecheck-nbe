@@ -659,6 +659,56 @@ fn nonlinear_square_and_pow_solve_by_integer_root() {
     );
 }
 
+/// `type.Name := T` / `type.Name(p…) := T` — the transparent type
+/// alias (ADR-0154 §3): the `type.` namespace head on an `assign`
+/// declares an alias that substitutes structurally at use sites. A
+/// scalar alias expands in annotation position; a parameterized alias
+/// substitutes its arguments into the body; a tuple body reads as the
+/// `type.array{elements}` product convention.
+#[test]
+fn type_alias_expands_transparently() {
+    let lang = canonical_lang();
+    let good = parse_block(
+        &lang,
+        &[
+            "type.Score := Nat",
+            "s : Score = 3",
+            "type.Id(A) := A",
+            "x : Id(Nat) = 4",
+            "y : type.Id(Bool) = true",
+            "type.Pair(A, B) := (A, B)",
+            "p : Pair(Nat, Bool) = (1, true)",
+            "q : Pair(Nat, Bool) = p",
+        ],
+    );
+    let result = typecheck(&lang, good);
+    assert!(
+        !has_error(&result),
+        "alias declarations and uses should check, got {:?}",
+        diags_of(&result)
+    );
+
+    let bad = parse_block(&lang, &["type.Id(A) := A", "x : Id(Bool) = 3"]);
+    let result = typecheck(&lang, bad);
+    assert!(
+        has_error(&result),
+        "Id(Bool) should expand to Bool and reject 3"
+    );
+
+    let bad_tuple = parse_block(
+        &lang,
+        &[
+            "type.Pair(A, B) := (A, B)",
+            "p : Pair(Nat, Bool) = (1, 2)",
+        ],
+    );
+    let result = typecheck(&lang, bad_tuple);
+    assert!(
+        has_error(&result),
+        "Pair(Nat, Bool) should reject (1, 2) — element 1 is not Bool"
+    );
+}
+
 /// `Ctor: absurd` is the explicit dismissal of a decided-impossible arm:
 /// `VNil : Vec(0, ?a)` can never produce a `Vec(2, Bool)` scrutinee, so
 /// `VNil: absurd` is *discharged* — no unreachable-branch diagnostic —

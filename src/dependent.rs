@@ -888,6 +888,23 @@ impl NbeTypecheckEngine {
         })?;
         match node.kind.as_str() {
             "paren" => {
+                let kids = children_of(node)
+                    .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
+                if kids.len() > 1 {
+                    // Tuple position `(A, B)` — the `type.array{elements}`
+                    // convention `synth_function` mints for `(x, y) ~>`
+                    // domains.
+                    let mut els = Vec::with_capacity(kids.len());
+                    for k in kids {
+                        let i = k.as_u64().ok_or_else(|| {
+                            LangError::engine("dep_synth_type: paren child idx")
+                        })? as usize;
+                        els.push(self.dep_synth_type(lang, ast, i, ctx)?);
+                    }
+                    let mut m = Map::new();
+                    m.insert("elements".to_string(), Value::Array(els));
+                    return Ok(make_tag(ctx, "type.array", m));
+                }
                 let inner = child_at(ast, node, 0)
                     .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
                 self.dep_synth_type(lang, ast, inner.index(), ctx)
@@ -910,6 +927,14 @@ impl NbeTypecheckEngine {
                     LangError::engine("dep_synth_type: field node out of bounds")
                 })?)
                 .ok_or_else(|| LangError::engine("dep_synth_type: field name missing"))?;
+                // `type.Name` — a declared alias spelled through the
+                // type namespace (`type.Name := body`); expands
+                // transparently when Γ-bound, else the builtin table.
+                if let Some(bound) = ctx.lookup(&field).cloned() {
+                    if tag_of(&bound) == Some("type.alias") {
+                        return self.expand_alias(lang, ast, &bound, &[], ctx);
+                    }
+                }
                 self.dep_builtin_or_tag(&field, ctx)
             }
             "array" => {
@@ -985,6 +1010,9 @@ impl NbeTypecheckEngine {
             match tag_of(&bound) {
                 Some("type.ctor_sig") => {
                     return self.instantiate_ctor_full(lang, ast, &bound, ctx)
+                }
+                Some("type.alias") => {
+                    return self.expand_alias(lang, ast, &bound, &[], ctx)
                 }
                 Some("type.family") => {
                     if bound.get("name").and_then(Value::as_str).unwrap_or("") == name {
@@ -1143,6 +1171,18 @@ impl NbeTypecheckEngine {
                 // evaluate (1+1 → 2), rigid vars stay `var{n}`.
         if let Some(bound) = ctx.lookup(name).cloned() {
                     match tag_of(&bound) {
+                        Some("type.alias") => {
+                            // A declared `type.Name(p…) := T` alias —
+                            // transparent substitution: bind the params
+                            // to the argument types and re-synthesize
+                            // the body (ADR-0154 §3, no former mint).
+                            let mut args = Vec::with_capacity(arg_indices.len());
+                            for &i in &arg_indices {
+                                let t = self.node_index_or_type(lang, ast, i, ctx)?;
+                                args.push(eval_index(&t, ctx));
+                            }
+                            return self.expand_alias(lang, ast, &bound, &args, ctx);
+                        }
                         Some("type.family") => {
                             let mut args = Vec::with_capacity(arg_indices.len());
                             for &i in &arg_indices {
@@ -1184,6 +1224,98 @@ impl NbeTypecheckEngine {
                 "dep_synth_type: call callee is not a name".to_string(),
             )),
         }
+    }
+
+    /// `type.Name` (a `field-access` on the `var "type"` namespace) or
+    /// `type.Name(p, …)` (a `call` thereof) as an `assign` lhs — the
+    /// transparent alias form (`type` is a keyword, so `type.` never
+    /// names a real object). Returns `(name, params)`.
+    fn type_alias_head(&self, ast: &Ast, node: &AstNode) -> Option<(String, Vec<String>)> {
+        let kids = children_of(node)?;
+        let (fa, params) = match node.kind.as_str() {
+            "field-access" => (node, Vec::new()),
+            "call" => {
+                let fa = ast.get(AstRef::new(kids.first()?.as_u64()? as usize))?;
+                if fa.kind != "field-access" {
+                    return None;
+                }
+                let mut params = Vec::new();
+                for arg in kids.iter().skip(1) {
+                    let n = ast.get(AstRef::new(arg.as_u64()? as usize))?;
+                    if n.kind != "var" {
+                        return None;
+                    }
+                    params.push(node_name(n)?);
+                }
+                (fa, params)
+            }
+            _ => return None,
+        };
+        let fa_kids = children_of(fa)?;
+        let subj = ast.get(AstRef::new(fa_kids.first()?.as_u64()? as usize))?;
+        if subj.kind != "var" || node_name(subj).as_deref() != Some("type") {
+            return None;
+        }
+        let name = fa
+            .payload
+            .get("field")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                fa_kids
+                    .get(1)
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(node_name)
+            })?;
+        Some((name, params))
+    }
+
+    /// Expand a `type.alias{params, body}` record (ADR-0154 §3 —
+    /// aliases are transparent: plain substitution, no former mint).
+    /// Binds each param name to its argument type in `results` (fresh
+    /// metas when the alias is referenced bare) and re-synthesizes the
+    /// body type expression.
+    fn expand_alias(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        bound: &Value,
+        args: &[Value],
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let params: Vec<String> = bound
+            .get("params")
+            .and_then(Value::as_array)
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !args.is_empty() && args.len() != params.len() {
+            return Err(LangError::engine(format!(
+                "type.alias: {} applied to {} args (expects {})",
+                bound.get("name").and_then(Value::as_str).unwrap_or("?"),
+                args.len(),
+                params.len()
+            )));
+        }
+        let body_idx = bound.get("body").and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine("type.alias: missing body index".to_string())
+        })? as usize;
+        let old_results = ctx.results.clone();
+        for (i, p) in params.iter().enumerate() {
+            let v = args
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
+            ctx.results.insert(p.clone(), v);
+        }
+        let r = self.dep_synth_type(lang, ast, body_idx, ctx);
+        ctx.results = old_results;
+        r
     }
 
     /// `(params, body)` parts of a `function` node for dependent formers:
@@ -1660,6 +1792,43 @@ impl NbeTypecheckEngine {
                     Some(self.dep_intro_sigma(lang, ast, node, expected, ctx))
                 } else {
                     None
+                }
+            }
+            // `type.array{elements}` (the tuple/product convention):
+            // a `paren`/`array` node checks positionally — element `i`
+            // against `elements[i]`.
+            "type.array" => {
+                let node = ast.get(node_ref)?;
+                let els = expected
+                    .get("elements")
+                    .and_then(Value::as_array)
+                    .cloned();
+                match (els, node.kind.as_str()) {
+                    (Some(els), "paren" | "array") => {
+                        let kids = children_of(node).cloned().unwrap_or_default();
+                        if kids.len() != els.len() {
+                            return Some(Err(LangError::engine(format!(
+                                "typecheck: tuple arity {} does not match expected {}",
+                                kids.len(),
+                                els.len()
+                            ))));
+                        }
+                        for (k, el) in kids.iter().zip(els.iter()) {
+                            let idx = match k.as_u64() {
+                                Some(i) => AstRef::new(i as usize),
+                                None => {
+                                    return Some(Err(LangError::engine(
+                                        "typecheck: bad tuple child",
+                                    )))
+                                }
+                            };
+                            if let Err(e) = self.check_node(lang, ast, idx, el, ctx) {
+                                return Some(Err(e));
+                            }
+                        }
+                        Some(Ok(expected.clone()))
+                    }
+                    _ => None,
                 }
             }
             // `type.function` is the *structural* arrow: its `check`
@@ -2911,6 +3080,7 @@ impl NbeTypecheckEngine {
             .get("children")
             .and_then(|c| c.as_array())
             .ok_or_else(|| LangError::engine("synth_assign: no children".to_string()))?;
+        let mut alias_params: Option<Vec<String>> = None;
         let (name, value_ref, ann_ref) = if let Some(n) =
             node.payload.get("name").and_then(|v| v.as_str())
         {
@@ -2979,7 +3149,14 @@ impl NbeTypecheckEngine {
             let lhs_node = ast.get(AstRef::new(lhs_idx)).ok_or_else(|| {
                 LangError::engine("synth_assign: lhs out of bounds".to_string())
             })?;
-            if role_child_ref(lang, lhs_node, "annot").is_some() || lhs_node.kind == "type-annot" {
+            if let Some((aname, aparams)) = self.type_alias_head(ast, lhs_node) {
+                // `type.Name := T` / `type.Name(p…) := T` — a transparent
+                // type alias (ADR-0154 §3): bind a `type.alias` expansion
+                // record (params + the body's ast index); applications
+                // substitute at use sites — no former mint.
+                alias_params = Some(aparams);
+                (aname, AstRef::new(vidx), None)
+            } else if role_child_ref(lang, lhs_node, "annot").is_some() || lhs_node.kind == "type-annot" {
                 let ta = children_of(lhs_node)
                     .ok_or_else(|| LangError::engine("synth_assign: type-annot children".to_string()))?;
                 if ta.len() < 2 {
@@ -3045,7 +3222,20 @@ impl NbeTypecheckEngine {
                 (n.to_string(), AstRef::new(vidx), None)
             }
         };
-        let bound_type = if let Some(ann_ref) = ann_ref {
+        let bound_type = if let Some(params) = alias_params {
+            // The alias binds its expansion record, not a synthesized
+            // type — `Name`/`Name(args)` in type position substitute
+            // through it (the `type.alias` arms of `dep_synth_var_type`/
+            // `dep_synth_call_type`).
+            let mut m = Map::new();
+            m.insert(
+                "params".to_string(),
+                Value::Array(params.into_iter().map(Value::from).collect()),
+            );
+            m.insert("body".to_string(), Value::from(value_ref.index() as u64));
+            m.insert("name".to_string(), Value::from(name.clone()));
+            make_tag(ctx, "type.alias", m)
+        } else if let Some(ann_ref) = ann_ref {
             let type_expr_node = ast.get(ann_ref).ok_or_else(|| {
                 LangError::engine("synth_assign: annot out of bounds".to_string())
             })?;
@@ -3080,7 +3270,7 @@ impl NbeTypecheckEngine {
             };
             if matches!(
                 ann.get("__tag__").and_then(Value::as_str),
-                Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app")
+                Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app" | "type.array")
             ) {
                 self.check_node(lang, ast, value_ref, &ann, ctx)?;
             } else if is_plain_ann_value(&ann) {
