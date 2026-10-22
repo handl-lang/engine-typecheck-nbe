@@ -304,8 +304,84 @@ impl OpHandler for JudgmentOps {
                     .unwrap_or(Val::Const(TaggedValue::Null)))
             }
 
+            // -- cell ops (ADR-0153 §2: `>>>[k]`, `id_k`) --------------------
+            "cell_comp_axis" | "cell2_comp_axis" => {
+                // Shapes: `Seq`-delegated (args `[a, b]`, the axis in
+                // `lit{"axis"}`/`dim`), or the op spelling
+                // `[k, a, b]` / `[k, dim, a, b]`.
+                let (kv, a, b) = match args.len() {
+                    2 => {
+                        let k = lit
+                            .and_then(|l| l.get("axis").and_then(Value::as_i64))
+                            .or_else(|| dim.nat_literal().map(|n| n as i64))
+                            .map(|n| Val::Const(TaggedValue::Int(n)))
+                            .unwrap_or(Val::Const(TaggedValue::Null));
+                        (k, args[0].clone(), args[1].clone())
+                    }
+                    3 => (args[0].clone(), args[1].clone(), args[2].clone()),
+                    4 => (args[0].clone(), args[2].clone(), args[3].clone()),
+                    _ => {
+                        return Err(err(
+                            "expected [a, b] (+lit axis) or [k, a, b]".into(),
+                        ))
+                    }
+                };
+                // The boundary law is decided now (fail-fast); the
+                // composite is canonical former data — `infer` of
+                // `cell.comp` re-derives the same rule.
+                self.checker
+                    .borrow_mut()
+                    .infer_comp_axis(&kv, &a, &b)
+                    .map_err(|e| err(e.to_string()))?;
+                Ok(Val::Former {
+                    head: type_sym("cell.comp"),
+                    args: vec![kv, a, b],
+                })
+            }
+            "cell_id" | "refl" => {
+                let (kv, x) = match args.len() {
+                    1 => {
+                        let k = lit
+                            .and_then(Value::as_i64)
+                            .or_else(|| dim.nat_literal().map(|n| n as i64))
+                            .map(|n| Val::Const(TaggedValue::Int(n)));
+                        (k, args[0].clone())
+                    }
+                    2 => (Some(args[0].clone()), args[1].clone()),
+                    _ => return Err(err("expected [x] or [k, x]".into())),
+                };
+                self.checker
+                    .borrow_mut()
+                    .infer_id(kv.as_ref(), &x)
+                    .map_err(|e| err(e.to_string()))?;
+                Ok(Val::Former {
+                    head: type_sym("cell.id"),
+                    args: match kv {
+                        Some(k) => vec![k, x],
+                        None => vec![x],
+                    },
+                })
+            }
             // -- trivial natives ----------------------------------------------
-            "id" => Ok(input),
+            "id" => {
+                // `id` at dimension ≥ 2 is the identity cell `id_k`
+                // (`eval.cell_id` emits `Op{id, dim:2}`); at dim ≤ 1 it
+                // stays the trivial identity arrow.
+                let k = dim.nat_literal().unwrap_or(1);
+                if k >= 2 {
+                    let v = args.first().cloned().unwrap_or(input);
+                    let kv = Val::Const(TaggedValue::Int(k as i64));
+                    self.checker
+                        .borrow_mut()
+                        .infer_id(Some(&kv), &v)
+                        .map_err(|e| err(e.to_string()))?;
+                    return Ok(Val::Former {
+                        head: type_sym("cell.id"),
+                        args: vec![kv, v],
+                    });
+                }
+                Ok(input)
+            }
             "const" => Ok(args.first().cloned().unwrap_or(Val::Const(TaggedValue::Null))),
 
             other => Err(EvalError::Op(format!("unknown judgment op `{other}`"))),

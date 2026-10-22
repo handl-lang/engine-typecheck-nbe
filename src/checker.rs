@@ -80,9 +80,19 @@ pub enum FormerSig {
     /// (ADR-0153). Checked for `n ≤ 2`: `n = 1` requires `src`/`tgt`
     /// to be types (`Type(max)` result); `n = 2` requires both to be
     /// 1-cells over convertible boundaries (`infer → Hom(1, a, b)`
-    /// with `a ≡ a'`, `b ≡ b'`). `n ≥ 3` stores unchecked — the
-    /// ADR-0153 honest bound ("parses, stores, does not check").
+    /// with `a ≡ a'`, `b ≡ b'`) or both objects (the degenerate-cell
+    /// reading — `a ~[2]~> b` on types is the equation/`refl` type).
+    /// `n ≥ 3` stores unchecked — the ADR-0153 honest bound ("parses,
+    /// stores, does not check").
     Hom,
+    /// `cell.comp(k, a, b)` — the `a >>>[k] b` composite *cell* value
+    /// (a term-level former application; ADR-0153 §2). Its type is
+    /// decided by the globular boundary law — see
+    /// [`Checker::infer_comp_axis`].
+    Comp,
+    /// `cell.id(k, x)` — the identity k-cell on `x` (`id_k`). Its type
+    /// is `Hom(k, x, x)` — see [`Checker::infer_id`].
+    Id,
 }
 
 /// Errors the `Val` checker reports.
@@ -112,6 +122,17 @@ pub enum TcError {
     UnknownFormer(String),
     /// A value was expected to be a type (infer → `Type(i)`).
     NotAType(String),
+    /// A `>>>`/`cell.comp` operand is not a cell — its inferred type is
+    /// not a `Hom` former application.
+    NotACell(String),
+    /// A composition axis is out of range for the operands' cell
+    /// dimension (`k > m` — there is no axis-k boundary).
+    Dim {
+        /// The requested composition axis.
+        axis: u64,
+        /// The operands' cell dimension.
+        dim: u64,
+    },
 }
 
 impl std::fmt::Display for TcError {
@@ -127,6 +148,12 @@ impl std::fmt::Display for TcError {
             }
             Self::UnknownFormer(n) => write!(f, "unknown former `{n}`"),
             Self::NotAType(v) => write!(f, "expected a type, got {v}"),
+            Self::NotACell(v) => write!(f, "expected a cell (Hom-typed), got {v}"),
+            Self::Dim { axis, dim } => write!(
+                f,
+                "axis-{axis} composition requires cells of dimension > {axis} \
+                 (operand dimension {dim})"
+            ),
         }
     }
 }
@@ -165,7 +192,18 @@ impl Checker {
         let mut c = Self::default();
         c.declare_pi();
         c.declare_hom();
+        c.declare_cell_formers();
         c
+    }
+
+    /// Register the cell formers `cell.comp`/`cell.id` (ADR-0153 §2) —
+    /// term-level formers: an application is a cell *value*, typed by
+    /// the `>>>[k]` boundary law / `id_k` rule.
+    pub fn declare_cell_formers(&mut self) {
+        self.formers
+            .insert(type_sym("cell.comp").handle(), FormerSig::Comp);
+        self.formers
+            .insert(type_sym("cell.id").handle(), FormerSig::Id);
     }
 
     /// Register the `Pi` former rule (`type.pi`).
@@ -372,6 +410,27 @@ impl Checker {
                 self.infer_pi(dom, cod)
             }
             FormerSig::Hom => self.infer_hom(head, args),
+            FormerSig::Comp => {
+                let [k, a, b] = args else {
+                    return Err(TcError::Arity {
+                        former: head.name().to_string(),
+                        want: 3,
+                        got: args.len(),
+                    });
+                };
+                self.infer_comp_axis(k, a, b)
+            }
+            FormerSig::Id => match args {
+                [x] => self.infer_id(None, x),
+                [k, x] => self.infer_id(Some(k), x),
+                _ => {
+                    return Err(TcError::Arity {
+                        former: head.name().to_string(),
+                        want: 2,
+                        got: args.len(),
+                    })
+                }
+            },
         }
     }
 
@@ -402,17 +461,14 @@ impl Checker {
             2 => {
                 let st = self.infer(src)?;
                 let tt = self.infer(tgt)?;
-                let bd = |v: &Val| -> Option<(Val, Val)> {
-                    if let Val::Former { head: h, args } = self.metas.force_head(v) {
-                        if h.handle() == type_sym("type.hom").handle() && args.len() == 3 {
-                            return Some((args[1].clone(), args[2].clone()));
-                        }
-                    }
-                    None
-                };
-                let (sa, sb) = bd(&st).ok_or(TcError::NotAType(self.show(&st)))?;
-                let (ta, tb) = bd(&tt).ok_or(TcError::NotAType(self.show(&tt)))?;
-                if !self.conv(&sa, &ta) || !self.conv(&sb, &tb) {
+                // Both endpoints must live in the *same* hom: either
+                // both are 1-cells (`infer ≡ Hom(1, a, b)` with
+                // convertible boundaries) or both are objects read as
+                // degenerate cells (`a ~[2]~> b` on types is the
+                // equation/refl type, endpoints `(a, a)`/`(b, b)`).
+                let sa = self.cell_boundaries(src, &st)?;
+                let ta = self.cell_boundaries(tgt, &tt)?;
+                if !self.conv(&sa.0, &ta.0) || !self.conv(&sa.1, &ta.1) {
                     return Err(TcError::Mismatch {
                         got: self.show(&st),
                         want: self.show(&tt),
@@ -425,6 +481,194 @@ impl Checker {
             // general boundary law is not checked.
             _ => Ok(Val::Universe(0)),
         }
+    }
+
+    /// The globular 0-boundary of a cell value `v` whose inferred type
+    /// is `vt`: for a `Hom(m, s, t)`-typed cell the boundary pair is
+    /// `(s, t)`; an object (`vt` a `Universe`/nominal type) reads as a
+    /// degenerate cell — `(v, v)`. `None` when `vt` is neither.
+    fn cell_boundaries(&mut self, v: &Val, vt: &Val) -> Result<(Val, Val), TcError> {
+        if let Val::Former { head, args } = self.metas.force_head(vt) {
+            if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+                return Ok((args[1].clone(), args[2].clone()));
+            }
+        }
+        // Objects are degenerate cells: `a` is its own boundary.
+        if matches!(
+            self.metas.force_head(vt),
+            Val::Universe(_) | Val::Nominal(_)
+        ) {
+            return Ok((v.clone(), v.clone()));
+        }
+        Err(TcError::NotACell(self.show(v)))
+    }
+
+    /// The literal dimension of a `Hom(m, ·, ·)` former application —
+    /// `None` for non-`Hom` types or non-literal `m`.
+    fn hom_dim(&self, vt: &Val) -> Option<u64> {
+        if let Val::Former { head, args } = self.metas.force_head(vt) {
+            if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+                if let Val::Const(TaggedValue::Int(m)) = self.metas.force_head(&args[0]) {
+                    return u64::try_from(*m).ok();
+                }
+            }
+        }
+        None
+    }
+
+    /// `a >>>[k] b` typing (ADR-0153 §2): compose cells along their
+    /// shared k-boundary.
+    ///
+    /// - `k ≤ 1` (the surface `>>>`/`>>>[1]`): ordinary arrow
+    ///   composition — `Hom(1, a, b) ∘ Hom(1, b, c) → Hom(1, a, c)`.
+    ///   Objects promote to degenerate 1-cells, so `A >>> B` reads
+    ///   `id_A ∘₀ id_B` and requires `A ≡ B`.
+    /// - `k = 2`: vertical composition of 2-cells —
+    ///   `Hom(2, f, g) ∘ Hom(2, g, h) → Hom(2, f, h)`; the boundary law
+    ///   `tgt_1(fst) ≡ src_1(snd)` is enforced by `conv`.
+    /// - `k ≥ 3` and non-literal `k` store unchecked (honest bound —
+    ///   the same `m ≥ 3` bound `infer_hom` keeps).
+    ///
+    /// The composite's *value* is the former application
+    /// `cell.comp(k, a, b)` the caller stores; this rule decides its
+    /// type. Mixed-dimension operands compose at the higher dimension
+    /// (the lower cell is read at its own level — the degenerate
+    /// promotion is already inside its `Hom` boundary).
+    pub fn infer_comp_axis(&mut self, k: &Val, a: &Val, b: &Val) -> Result<Val, TcError> {
+        let axis = match self.metas.force_head(k) {
+            Val::Const(TaggedValue::Int(n)) => u64::try_from(*n).ok(),
+            _ => None,
+        };
+        let ta = self.infer(a)?;
+        let tb = self.infer(b)?;
+        let (ma, mb) = (self.hom_dim(&ta), self.hom_dim(&tb));
+        // Effective dimension: a cell is at least its declared `Hom`
+        // level; an object is a degenerate 1-cell.
+        let d = ma.into_iter().chain(mb).max().unwrap_or(1).max(1);
+        // The operand's `(d-1)`-faces: a `Hom(d, s, t)`-typed cell's own
+        // faces; a lower-dimension cell (or object) promotes to the
+        // degenerate `d`-cell `id` — faces are the operand itself.
+        let face = |v: &Val, vt: &Val, lvl: Option<u64>| -> (Val, Val) {
+            if lvl == Some(d) {
+                if let Val::Former { args, .. } = self.metas.force_head(vt) {
+                    return (args[1].clone(), args[2].clone());
+                }
+            }
+            (v.clone(), v.clone())
+        };
+        let (sa, ta_b) = face(a, &ta, ma);
+        let (sb, tb_b) = face(b, &tb, mb);
+        // Non-cell operands: `infer` gave neither a `Hom` nor a type —
+        // only the unchecked regime tolerates that.
+        let cells_ok = matches!(ma, Some(_)) || self.cell_boundaries(a, &ta).is_ok();
+        let cells_ok = cells_ok
+            && (matches!(mb, Some(_)) || self.cell_boundaries(b, &tb).is_ok());
+        let k = match axis {
+            Some(k) => k,
+            // Non-literal axis: store the composite unchecked at the
+            // operand dimension.
+            None => {
+                return Ok(Val::Former {
+                    head: type_sym("type.hom"),
+                    args: vec![k.clone(), sa, tb_b],
+                });
+            }
+        };
+        if k >= 3 || d >= 3 {
+            // Honest bound: higher cells store unchecked.
+            return Ok(Val::Former {
+                head: type_sym("type.hom"),
+                args: vec![Val::Const(TaggedValue::Int(d.max(k) as i64)), sa, tb_b],
+            });
+        }
+        if !cells_ok {
+            let bad = if self.cell_boundaries(a, &ta).is_err() && ma.is_none() {
+                self.show(&ta)
+            } else {
+                self.show(&tb)
+            };
+            return Err(TcError::NotACell(bad));
+        }
+        if k > d {
+            return Err(TcError::Dim { axis: k, dim: d });
+        }
+        // `>>>[k]` at the *top* boundary of an m-cell means `k = m-1`
+        // under the globular convention; the surface level-indexed
+        // spelling `>>>[m]` denotes the same top-boundary composition
+        // (ADR-0153: `e >>>[2] eInv` on 2-cells). Both readings — and
+        // `>>>`/`>>>[1]` on 1-cells — compose along the top faces.
+        let (src, tgt) = if k + 1 >= d {
+            // top-boundary composition: `tgt(fst) ≡ src(snd)`.
+            if !self.conv(&ta_b, &sb) {
+                return Err(TcError::Mismatch {
+                    got: self.show(&ta_b),
+                    want: self.show(&sb),
+                });
+            }
+            (sa, tb_b)
+        } else {
+            // Deep-axis (horizontal) composition on 2-cells: boundaries
+            // compose pointwise one level down — `k = 0` on
+            // `Hom(2, f, g) ∘ Hom(2, f', g')` gives
+            // `Hom(2, f ∘₀ f', g ∘₀ g')`.
+            if !self.conv(&ta_b, &sb) {
+                return Err(TcError::Mismatch {
+                    got: self.show(&ta_b),
+                    want: self.show(&sb),
+                });
+            }
+            let sub = |x: Val, y: Val| Val::Former {
+                head: type_sym("cell.comp"),
+                args: vec![Val::Const(TaggedValue::Int(k as i64)), x, y],
+            };
+            (sub(sa, sb), sub(ta_b, tb_b))
+        };
+        Ok(Val::Former {
+            head: type_sym("type.hom"),
+            args: vec![Val::Const(TaggedValue::Int(d as i64)), src, tgt],
+        })
+    }
+
+    /// `id_k(x)` — the identity cell at level `k` (ADR-0153 §2): the
+    /// `Former{cell.id}` value carries `[k, x]`; its type is
+    /// `Hom(k, x, x)`. `x` must be a `(k-1)`-cell (or a degenerate
+    /// lower cell): `id_1` takes objects (`Hom(1, A, A)`), `id_2` takes
+    /// 1-cells (`Hom(2, f, f)`); `id` on an object at level 2 is the
+    /// `refl` equation `Hom(2, a, a)`. `k` absent defaults to
+    /// `level(x) + 1` for cells and `2` for objects; `k ≥ 3` stores
+    /// `Hom(k, x, x)` unchecked (honest bound).
+    pub fn infer_id(&mut self, k: Option<&Val>, x: &Val) -> Result<Val, TcError> {
+        let xt = self.infer(x)?;
+        let m = self.hom_dim(&xt).unwrap_or(0); // 0 = object/0-cell
+        let lvl = match k.and_then(|kv| match self.metas.force_head(kv) {
+            Val::Const(TaggedValue::Int(n)) => u64::try_from(*n).ok(),
+            _ => None,
+        }) {
+            Some(n) => n.max(1),
+            None => {
+                if m == 0 {
+                    2
+                } else {
+                    m + 1
+                }
+            }
+        };
+        if lvl <= 2 {
+            if m == 0 {
+                // Object endpoint: `x` must be a type.
+                self.universe_level(x)?;
+            } else if m != lvl - 1 {
+                return Err(TcError::Dim { axis: lvl, dim: m });
+            }
+        }
+        Ok(Val::Former {
+            head: type_sym("type.hom"),
+            args: vec![
+                Val::Const(TaggedValue::Int(lvl as i64)),
+                x.clone(),
+                x.clone(),
+            ],
+        })
     }
 
     /// Telescope checking with progressive index substitution.
@@ -1088,5 +1332,152 @@ mod tests {
         let back = lift(1, &tv);
         let mut c = Checker::new();
         assert!(c.conv(&v, &back));
+    }
+
+    // --- `>>>[k]` / `id_k` (ADR-0153 §2) ----------------------------------
+
+    fn hom(n: i64, s: Val, t: Val) -> Val {
+        Val::Former {
+            head: type_sym("type.hom"),
+            args: vec![Val::Const(TaggedValue::Int(n)), s, t],
+        }
+    }
+
+    fn comp(k: i64, a: Val, b: Val) -> Val {
+        Val::Former {
+            head: type_sym("cell.comp"),
+            args: vec![Val::Const(TaggedValue::Int(k)), a, b],
+        }
+    }
+
+    fn idf(k: i64, x: Val) -> Val {
+        Val::Former {
+            head: type_sym("cell.id"),
+            args: vec![Val::Const(TaggedValue::Int(k)), x],
+        }
+    }
+
+    fn bool_s() -> Rc<Sym> {
+        Sym::seeded("type.bool")
+    }
+
+    #[test]
+    fn comp_axis_0_and_1_compose_1cells() {
+        let mut c = Checker::new();
+        int();
+        nat();
+        bool_s();
+        // f : Int ~> Nat, g : Nat ~> Bool — `f >>> g : Hom(1, Int, Bool)`
+        // at both spellings (axis 0 = `>>>`, axis 1 = level-indexed).
+        for k in [0, 1] {
+            let f = c.bind("f", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+            let g = c.bind("g", hom(1, Val::Nominal(nat()), Val::Nominal(bool_s())));
+            let t = c.infer(&comp(k, f.clone(), g.clone())).unwrap();
+            assert!(
+                c.conv(&t, &hom(1, Val::Nominal(int()), Val::Nominal(bool_s()))),
+                "axis {k}: got {}",
+                c.show(&t)
+            );
+        }
+        // Boundary violation: h : Bool ~> Nat — `f >>>[1] h` fails.
+        let f = c.bind("f2", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        let h = c.bind("h", hom(1, Val::Nominal(bool_s()), Val::Nominal(nat())));
+        assert!(matches!(
+            c.infer(&comp(1, f, h)),
+            Err(TcError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn comp_axis_2_is_vertical_2cell_composition() {
+        let mut c = Checker::new();
+        int();
+        nat();
+        bool_s();
+        let f = c.bind("f", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        let g = c.bind("g", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        let h = c.bind("h", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        // e : Hom(2, f, g), e2 : Hom(2, g, h) — `e >>>[2] e2 : Hom(2, f, h)`.
+        let e = c.bind("e", hom(2, f.clone(), g.clone()));
+        let e2 = c.bind("e2", hom(2, g.clone(), h.clone()));
+        let t = c.infer(&comp(2, e.clone(), e2)).unwrap();
+        assert!(c.conv(&t, &hom(2, f.clone(), h)), "got {}", c.show(&t));
+        // Boundary violation: e3 : Hom(2, f, f) — `e >>>[2] e3` needs
+        // src ≡ g, gets f.
+        let e3 = c.bind("e3", hom(2, f.clone(), f));
+        assert!(matches!(
+            c.infer(&comp(2, e.clone(), e3)),
+            Err(TcError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn comp_promotes_lower_dim_operand() {
+        let mut c = Checker::new();
+        int();
+        nat();
+        // f (a 1-cell) `>>>[2]` with e : Hom(2, f, g): id₂(f) ∘ e — the
+        // boundary law conv(f, src(e)) holds.
+        let f = c.bind("f", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        let g = c.bind("g", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        let e = c.bind("e", hom(2, f.clone(), g.clone()));
+        let t = c.infer(&comp(2, f.clone(), e)).unwrap();
+        assert!(c.conv(&t, &hom(2, f, g)), "got {}", c.show(&t));
+    }
+
+    #[test]
+    fn comp_level_3_stores_unchecked() {
+        let mut c = Checker::new();
+        int();
+        nat();
+        // Two 3-cell-typed rigids with *mismatched* boundaries still
+        // compose — the ≥3 boundary law is stored, not checked.
+        let x = c.bind("x", hom(3, Val::Nominal(int()), Val::Nominal(nat())));
+        let y = c.bind("y", hom(3, Val::Nominal(nat()), Val::Nominal(int())));
+        let t = c.infer(&comp(3, x, y)).unwrap();
+        assert!(matches!(t, Val::Former { head, .. } if head.handle() == type_sym("type.hom").handle()));
+        // `>>>[3]` on 2-cells is past the honest bound — stores
+        // unchecked too (promotion is a ≥3 concern, not enforced).
+        let f = c.bind("f", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        let e = c.bind("e", hom(2, f.clone(), f.clone()));
+        let e2 = c.bind("e2", hom(2, f.clone(), f.clone()));
+        assert!(c.infer(&comp(3, e, e2)).is_ok());
+        // But `>>>[2]` on 1-cells IS a dimension error (k > m ≤ 2).
+        let g = c.bind("g", hom(1, Val::Nominal(int()), Val::Nominal(nat())));
+        assert!(matches!(
+            c.infer(&comp(2, f.clone(), g)),
+            Err(TcError::Dim { .. })
+        ));
+    }
+
+    #[test]
+    fn id_levels() {
+        let mut c = Checker::new();
+        int();
+        // id₁ on an object: Hom(1, Int, Int).
+        let t = c.infer(&idf(1, Val::Nominal(int()))).unwrap();
+        assert!(c.conv(&t, &hom(1, Val::Nominal(int()), Val::Nominal(int()))));
+        // id₂ on an arrow: Hom(2, f, f).
+        let f = c.bind("f", hom(1, Val::Nominal(int()), Val::Nominal(int())));
+        let t = c.infer(&idf(2, f.clone())).unwrap();
+        assert!(c.conv(&t, &hom(2, f.clone(), f.clone())));
+        // id₂ on an object: refl — Hom(2, Int, Int).
+        let t = c.infer(&idf(2, Val::Nominal(int()))).unwrap();
+        assert!(c.conv(&t, &hom(2, Val::Nominal(int()), Val::Nominal(int()))));
+        // And that Hom(2, Int, Int) itself now *checks* as a type —
+        // the degenerate-endpoint reading; `Hom(2, Int, Nat)` rejects.
+        assert!(c.infer(&hom(2, Val::Nominal(int()), Val::Nominal(int()))).is_ok());
+        nat();
+        assert!(c
+            .infer(&hom(2, Val::Nominal(int()), Val::Nominal(nat())))
+            .is_err());
+        // id₁ on a 1-cell is a dimension error (id of a 1-cell is a 2-cell).
+        assert!(matches!(
+            c.infer(&idf(1, f)),
+            Err(TcError::Dim { .. })
+        ));
+        // id₃ stores unchecked.
+        let t = c.infer(&idf(3, Val::Nominal(int()))).unwrap();
+        assert!(matches!(t, Val::Former { .. }));
     }
 }
