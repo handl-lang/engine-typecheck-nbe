@@ -2641,6 +2641,28 @@ impl NbeTypecheckEngine {
             } else if pattern.kind == "var" && node_name(pattern).as_deref() == Some("_") {
                 // wildcard binds nothing.
             }
+            // Destructuring patterns — `sequence`/`entries`/`entry`/`rest`
+            // `pattern_role`s (ADR-0081) — bind element/field vars against
+            // the scrutinee's `element`/`fields` (fresh metas when the
+            // scrutinee is opaque). `leaf` (`var`/`value`/`arr`) and
+            // role-less patterns (`call` ctor patterns, literals) are
+            // handled by the ctor/catchall path above.
+            match lang
+                .ast
+                .get_by_identity(&pattern.kind)
+                .and_then(|s| s.pattern_role.as_deref())
+            {
+                Some("sequence" | "entries" | "entry" | "rest") => {
+                    self.bind_pattern_vars(
+                        lang,
+                        ast,
+                        AstRef::new(pat_idx),
+                        scrutinee_type,
+                        ctx,
+                    )?;
+                }
+                _ => {}
+            }
 
             // Body: against the motive applied at the refined indices
             // when present, else synth for the join.

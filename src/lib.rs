@@ -275,12 +275,30 @@ impl NbeTypecheckEngine {
                 node_ref.index()
             ))
         })?;
-        let rule = lang.types.get_by_identity(&node.kind).ok_or_else(|| {
-            LangError::engine_node(
-                format!("typecheck: no type rule for kind '{}'", node.kind),
-                node,
-            )
-        })?;
+        let Some(rule) = lang.types.get_by_identity(&node.kind) else {
+            // A kind with no declared type rule degrades to `type.unknown`
+            // with a warning — the documented driver fallback (e.g.
+            // `fanout`'s rule is intentionally unwritten in types.yaml).
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: format!(
+                    "typecheck: no type rule for kind '{}' — treating as type.unknown",
+                    node.kind
+                ),
+                span: None,
+            });
+            let typ = ctx
+                .registry
+                .construct("type.unknown", &Value::Null)
+                .ok_or_else(|| {
+                    LangError::engine_node(
+                        "typecheck: construct failed for type.unknown fallback",
+                        node,
+                    )
+                })?;
+            ctx.node_types.insert(node_ref.index(), typ.clone());
+            return Ok(typ);
+        };
         let typ = self.eval_type_scheme(lang, ast, node_ref, &rule.synth, ctx, None)?;
         ctx.node_types.insert(node_ref.index(), typ.clone());
         Ok(typ)
@@ -302,12 +320,13 @@ impl NbeTypecheckEngine {
                 node_ref.index()
             ))
         })?;
-        let rule = lang.types.get_by_identity(&node.kind).ok_or_else(|| {
-            LangError::engine_node(
-                format!("typecheck: no type rule for kind '{}'", node.kind),
-                node,
-            )
-        })?;
+        let Some(rule) = lang.types.get_by_identity(&node.kind) else {
+            // No declared rule — the synth fallback mints `type.unknown`
+            // (with a warning); an unknown-typed node accepts any
+            // expected type.
+            self.synth_node(lang, ast, node_ref, ctx)?;
+            return Ok(());
+        };
         // Dependent introduction (ADR-0152/0120): checking an arrow
         // against `type.pi`/`type.family`, a pair against `type.sigma`,
         // or `refl`/a witness against `Path` goes through the dependent
