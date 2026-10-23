@@ -300,6 +300,114 @@ fn dependent_family_unifies_inside_function() {
     );
 }
 
+/// Phase-3 WS-D — `data`-declared ctor index projections: `data Nat`'s
+/// `Succ`/`Zero` register `App{Succ, x} ↦ x + 1` / `Zero ↦ 0` at
+/// `synth_data` (the Nat-former shape — a unary same-family ctor is
+/// successor arithmetic, the unique bare ctor is `0`), so `Vec(Succ n)`
+/// and `Vec(n + 1)` are *definitionally* equal in both directions,
+/// nested, and at literals.
+#[test]
+fn succ_index_bridges_to_arithmetic() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "fwd : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 1, Bool))) = n ~> v ~> v",
+            "bwd : Pi(Nat, n ~> Pi(Vec(n + 1, Bool), v ~> Vec(Succ(n), Bool))) = n ~> v ~> v",
+            "nested : Pi(Nat, n ~> Pi(Vec(Succ(Succ(n)), Bool), v ~> Vec(n + 2, Bool))) = n ~> v ~> v",
+            "one : Vec(Succ(Zero), Bool) = VCons(true, VNil)",
+            "nil : Vec(Zero, Bool) = VNil",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "Vec(Succ n) ≡ Vec(n + 1) should hold definitionally, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// A `Vec(Succ n)` scrutinee refines through the bridge: the VCons
+/// arm's instantiated `?k + 1` result index meets the bridged `n + 1`
+/// — the arm is provably applicable and its fields check. (VNil stays
+/// *possible* under the rigid `n` — coverage is WS-C's split tree; the
+/// single-arm match is accepted either way.)
+#[test]
+fn match_on_succ_indexed_scrutinee_refines() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VCons(x, xs): x }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "match on Vec(Succ n) should refine the VCons arm, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The bridge does not over-accept: `Vec(Succ n)` vs `Vec(n + 2)` is a
+/// real mismatch, `Vec(Succ Zero)` is decided `Vec(1)` (a 2-vector is
+/// rejected), and an *undeclared* head `f` applied at index level
+/// stays an honest `App` atom — `f(n) ≢ n + 1` is stuck, not silently
+/// accepted.
+#[test]
+fn succ_projection_keeps_decided_contract() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let off_by_one = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "bad : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 2, Bool))) = n ~> v ~> v",
+        ],
+    );
+    let result = typecheck(&lang, off_by_one);
+    assert!(
+        has_error(&result),
+        "Vec(n + 1) vs Vec(n + 2) should not unify"
+    );
+    let decided = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "bad : Vec(Succ(Zero), Bool) = VCons(true, VCons(false, VNil))",
+        ],
+    );
+    let result = typecheck(&lang, decided);
+    assert!(
+        has_error(&result),
+        "a 2-vector at Vec(Succ Zero) ≡ Vec(1) is a decided mismatch"
+    );
+    // An opaque index function — results-bound, no declared projection —
+    // keeps `App{f, n}` honest: never silently equal to `n + 1`.
+    let opaque = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Vec(n + 1, Bool)))) = f ~> n ~> v ~> v",
+        ],
+    );
+    let result = typecheck(&lang, opaque);
+    assert!(
+        has_error(&result),
+        "an undeclared index head should stay stuck, not silently accept"
+    );
+}
+
 /// Constructor patterns in `match` bind their fields against the
 /// instantiated constructor domains. On a non-indexed family there is
 /// no index to refine; the dependent-elimination tests below cover the

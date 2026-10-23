@@ -4844,6 +4844,16 @@ struct TypecheckContext {
     /// statements — the module's signature record `Sig_m` (phase-1
     /// spec WS-B: a module typechecks to its signature).
     exports: Vec<(String, Value)>,
+    /// `data`-declared ctor index projections (phase-3 WS-D): ctor
+    /// name → rewrite template. Populated by `synth_data` from the
+    /// declaration's shape — a unary same-family ctor `S(arg : F)`
+    /// declares successor arithmetic (`x ↦ x + 1`), and when the
+    /// family has exactly one bare ctor `Z`, `Z` declares `0`.
+    /// `eval_index` applies the projection *before* ring
+    /// normalization, so `App{Succ, x}` reads as `x + 1` and
+    /// `var{Zero}` as `0`. Declared metadata keyed by ctor sym —
+    /// nothing `Succ`-shaped is hardcoded in the solver.
+    ctor_proj: HashMap<String, dependent::CtorProj>,
 }
 
 impl TypecheckContext {
@@ -4859,6 +4869,7 @@ impl TypecheckContext {
             node_types: HashMap::new(),
             vcheck: checker::Checker::new(),
             exports: Vec::new(),
+            ctor_proj: HashMap::new(),
         }
     }
 

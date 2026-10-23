@@ -16,10 +16,13 @@
 //! - Index terms — `Value` numbers, `{"__meta__": id}` metas,
 //!   `{"__tag__": "var", "name": n}` rigid variables, `{"__tag__": "Bin",
 //!   "op": kind, "l", "r"}` and `{"__tag__": "Un", "op", "operand"}`
-//!   operators. Index equality is definitional via evaluation
-//!   ([`eval_index`]) — including commutative-ring normalization of
-//!   `add`/`sub`/`mul`/`neg` terms to a polynomial normal form — plus
-//!   the bounded solver behind the [`IndexSolver`] seam.
+//!   operators, `{"__tag__": "App", "callee", "args"}` ctor applications.
+//!   Index equality is definitional via evaluation
+//!   ([`eval_index`]) — `data`-declared ctor projections first
+//!   (`App{Succ, x} ↦ x + 1`, `var{Zero} ↦ 0`; phase-3 WS-D), then
+//!   commutative-ring normalization of `add`/`sub`/`mul`/`neg` terms to
+//!   a polynomial normal form — plus the bounded solver behind the
+//!   [`IndexSolver`] seam.
 //! - `Path{frm, to}` — the proof-relevant index-equality witness bound
 //!   as `eq_<name>` in `results` by branch refinement.
 
@@ -364,9 +367,67 @@ fn canon_bin(op: &str, l: Value, r: Value) -> Value {
     bin_term(op, l, r)
 }
 
+// ---------------------------------------------------------------------------
+// `data`-declared ctor index projections (phase-3 WS-D)
+// ---------------------------------------------------------------------------
+//
+// A `data` declaration contributes per-ctor index projections: index-level
+// `App{C, a⃗}`/`var{C}` rewrites to a declared index-term template inside
+// `eval_index`, *before* ring normalization — so `Succ x` reads as
+// `x + 1` and `Zero` as `0`, and `Vec(Succ n, a) ≡ Vec(n + 1, a)` holds
+// definitionally. The table lives on `TypecheckContext` keyed by ctor
+// sym and is populated by `synth_data` from the declaration's *shape*
+// (the Nat-former shape: a unary ctor `S(arg : F)` building `F` declares
+// successor arithmetic; a unique bare ctor `Z` of such a family declares
+// `0`) — never hardcoded in the solver. Ctors without the shape get no
+// projection and stay honest `App` atoms: the decided-vs-stuck contract
+// is unchanged — `App{F, x}` for unregistered `F` still can't equal
+// `x + 1` (it is `Unknown`, not silently accepted).
+
+/// Hole prefix inside a [`CtorProj`] template: `var{__ctor_proj_<i>}`
+/// stands for the `i`-th index argument.
+const CTOR_PROJ_HOLE: &str = "__ctor_proj_";
+
+/// A declared index projection for a term-level ctor: index-level
+/// `C(a₀,…)` rewrites to `template` with `var{__ctor_proj_<i>} ↦ aᵢ`.
+#[derive(Debug, Clone)]
+pub(crate) struct CtorProj {
+    /// Number of index arguments the projection consumes (`Zero` → 0,
+    /// `Succ` → 1).
+    pub(crate) arity: usize,
+    /// Index-term template; `var{__ctor_proj_<i>}` is argument `i`.
+    pub(crate) template: Value,
+}
+
+/// Instantiate a [`CtorProj`] template: `var{__ctor_proj_<i>} ↦ args[i]`.
+fn proj_instantiate(template: &Value, args: &[Value]) -> Value {
+    if tag_of(template) == Some("var") {
+        if let Some(i) = template
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|n| n.strip_prefix(CTOR_PROJ_HOLE))
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            return args.get(i).cloned().unwrap_or(Value::Null);
+        }
+        return template.clone();
+    }
+    match template {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| (k.clone(), proj_instantiate(x, args)))
+                .collect(),
+        ),
+        Value::Array(xs) => Value::Array(xs.iter().map(|x| proj_instantiate(x, args)).collect()),
+        _ => template.clone(),
+    }
+}
+
 /// Evaluate an index term: resolve `var{name}` through `results`
 /// (self-bindings `var{n} → var{n}` are the rigid fixed point), zonk
-/// metas, fold closed `Bin`/`Un` arithmetic, canonicalize the rest.
+/// metas, apply declared ctor projections (`App{C, a⃗}`/`var{C}` for
+/// registered `C`), fold closed `Bin`/`Un` arithmetic, canonicalize the
+/// rest.
 pub(crate) fn eval_index(v: &Value, ctx: &TypecheckContext) -> Value {
     eval_index_fuel(v, ctx, 64)
 }
@@ -390,7 +451,44 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
             }
             return eval_index_fuel(bound, ctx, fuel - 1);
         }
+        // Declared arity-0 ctor projection: a bare index-position `Z`
+        // naming a registered nullary ctor (`Zero`) reads as its
+        // template (`0`). A `results` binding shadows — checked above.
+        if let Some(p) = ctx.ctor_proj.get(name) {
+            if p.arity == 0 {
+                let t = p.template.clone();
+                return eval_index_fuel(&t, ctx, fuel - 1);
+            }
+        }
         return v.clone();
+    }
+    if tag_of(v) == Some("App") {
+        let callee = v.get("callee").cloned().unwrap_or(Value::Null);
+        let args: Vec<Value> = v
+            .get("args")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| eval_index_fuel(&a, ctx, fuel - 1))
+            .collect();
+        // Declared ctor projection: `App{C, a⃗}` where `C` registered an
+        // `arity`-matching projection rewrites to the instantiated
+        // template — `App{Succ, x} ↦ x + 1` — then keeps normalizing.
+        // Unregistered heads stay honest `App` atoms (args still
+        // evaluate pointwise, so `App{F, 0+1}` canonicalizes to
+        // `App{F, 1}`).
+        if tag_of(&callee) == Some("var") {
+            if let Some(cname) = callee.get("name").and_then(Value::as_str) {
+                if let Some(p) = ctx.ctor_proj.get(cname) {
+                    if p.arity == args.len() {
+                        let t = proj_instantiate(&p.template, &args);
+                        return eval_index_fuel(&t, ctx, fuel - 1);
+                    }
+                }
+            }
+        }
+        return app_term(callee, args);
     }
     if tag_of(v) == Some("Bin") {
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
@@ -2191,7 +2289,10 @@ impl NbeTypecheckEngine {
         // `type.ctor_sig` Γ binding, e.g. `Succ`) is an index *term*
         // (`App{var C, i⃗}`), not an instantiated type — `Vec{Succ n, a}`
         // carries `Succ n` as the index it refines against. Family
-        // callees (`Vec`, `Pi`, …) still synthesize types.
+        // callees (`Vec`, `Pi`, …) still synthesize types. The ctor's
+        // arguments elaborate through `node_to_index_term` — the index
+        // reading: a `var` arg is the rigid index atom `var{n}`, not the
+        // sort `Nat` a bare var resolves to in type position.
         if matches!(node.kind.as_str(), "call" | "index_app") {
             let kids = children_of(node).cloned().unwrap_or_default();
             let callee_name = kids
@@ -2208,10 +2309,28 @@ impl NbeTypecheckEngine {
                     let mut args = Vec::with_capacity(kids.len().saturating_sub(1));
                     for cv in kids.iter().skip(1) {
                         let Some(ai) = cv.as_u64() else { continue };
-                        let t = self.node_index_or_type(lang, ast, ai as usize, ctx)?;
+                        let Some(an) = ast.get(AstRef::new(ai as usize)) else {
+                            continue;
+                        };
+                        let t = self.node_to_index_term(lang, ast, an, ctx);
                         args.push(eval_index(&t, ctx));
                     }
                     return Ok(app_term(var_term(&cname), args));
+                }
+            }
+        }
+        // A bare `var` naming a declared ctor (`Zero` in `Vec(Zero, a)`)
+        // is an index atom `var{C}` — a registered arity-0 projection
+        // (`Zero ↦ 0`) then applies in `eval_index`. Without this arm the
+        // var would instantiate the ctor *signature* (its type), which
+        // is not an index term.
+        if node.kind == "var" {
+            if let Some(cname) = node_name(node) {
+                if ctx
+                    .lookup(&cname)
+                    .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                {
+                    return Ok(var_term(&cname));
                 }
             }
         }
@@ -2384,6 +2503,79 @@ impl NbeTypecheckEngine {
                 "bare": c.bare,
             });
             ctx.extend(c.name.clone(), sig);
+        }
+        // Index projections (phase-3 WS-D): a unary ctor `S(arg : F)`
+        // building `F` declares successor arithmetic — index-level
+        // `S x` reads as `x + 1` — and when the family declares exactly
+        // one bare ctor `Z`, `Z` reads as `0`. This is the Nat-former
+        // shape: `data Nat :: Zero | Succ(pred : Nat)` registers
+        // `Succ ↦ λx.x+1` and `Zero ↦ 0`. Declared, not hardcoded — any
+        // `data` family with the shape contributes its own ctors;
+        // ctors without the shape stay honest `App` atoms.
+        let mut succ: Vec<&str> = Vec::new();
+        let mut bare: Vec<&str> = Vec::new();
+        for c in &ctors {
+            if c.name.is_empty() {
+                continue;
+            }
+            // `result` names this family when absent or spelled `F` /
+            // `F(i⃗)` — a ctor building some *other* family contributes
+            // no projection for `F`'s index discipline.
+            let result_is_self = match c.result {
+                None => true,
+                Some(ri) => {
+                    let head = ast.get(AstRef::new(ri)).and_then(|n| {
+                        if n.kind == "var" {
+                            node_name(n)
+                        } else {
+                            children_of(n)
+                                .and_then(|k| k.first())
+                                .and_then(Value::as_u64)
+                                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                                .and_then(node_name)
+                        }
+                    });
+                    head.as_deref() == Some(name.as_str())
+                }
+            };
+            if c.args.len() == 1
+                && result_is_self
+                && c.args[0]
+                    .1
+                    .and_then(|ti| ast.get(AstRef::new(ti)))
+                    .and_then(node_name)
+                    .as_deref()
+                    == Some(name.as_str())
+            {
+                succ.push(c.name.as_str());
+            } else if c.args.is_empty() && result_is_self {
+                bare.push(c.name.as_str());
+            }
+        }
+        for s in &succ {
+            ctx.ctor_proj.insert(
+                (*s).to_string(),
+                CtorProj {
+                    arity: 1,
+                    template: bin_term(
+                        "binary.add",
+                        var_term(&format!("{CTOR_PROJ_HOLE}0")),
+                        Value::from(1),
+                    ),
+                },
+            );
+        }
+        // The `0` projection only registers when the base is unique —
+        // a `data Bool :: True | False` (two bare ctors, no successor)
+        // must never equate `True ≡ False` at index level.
+        if !succ.is_empty() && bare.len() == 1 {
+            ctx.ctor_proj.insert(
+                bare[0].to_string(),
+                CtorProj {
+                    arity: 0,
+                    template: Value::from(0),
+                },
+            );
         }
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
@@ -5986,5 +6178,119 @@ mod index_solver_tests {
             ),
             IndexVerdict::Proven
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `data`-declared ctor index projections (phase-3 WS-D)
+    // ------------------------------------------------------------------
+
+    fn succ_proj(c: &mut TypecheckContext) {
+        c.ctor_proj.insert(
+            "Succ".to_string(),
+            CtorProj {
+                arity: 1,
+                template: add(var_term(&format!("{CTOR_PROJ_HOLE}0")), num(1)),
+            },
+        );
+        c.ctor_proj.insert(
+            "Zero".to_string(),
+            CtorProj {
+                arity: 0,
+                template: num(0),
+            },
+        );
+    }
+
+    fn succ(x: Value) -> Value {
+        app_term(var("Succ"), vec![x])
+    }
+
+    #[test]
+    fn ctor_projection_normalizes_succ_and_zero() {
+        let mut c = ctx();
+        succ_proj(&mut c);
+        // eval: App{Succ, n} ↦ n + 1 (ring-canonical — constants write
+        // back as f64), nested ↦ n + 2, var{Zero} ↦ 0,
+        // App{Succ, 0+0} ↦ 1 (args evaluate first).
+        assert_eq!(
+            eval_index(&succ(var("n")), &c),
+            add(var("n"), Value::from(1.0))
+        );
+        assert_eq!(
+            eval_index(&succ(succ(var("n"))), &c),
+            add(var("n"), Value::from(2.0))
+        );
+        assert_eq!(eval_index(&var("Zero"), &c), num(0));
+        assert_eq!(
+            eval_index(&succ(add(num(0), num(0))), &c),
+            Value::from(1.0)
+        );
+        // unify: `Vec(Succ n) ≡ Vec(n+1)` both directions, `≡ Vec(n+2)`
+        // for the nested form.
+        assert_eq!(
+            unify_index(&succ(var("n")), &add(var("n"), num(1)), &mut c),
+            (true, false)
+        );
+        assert_eq!(
+            unify_index(&add(var("n"), num(1)), &succ(var("n")), &mut c),
+            (true, false)
+        );
+        assert_eq!(
+            unify_index(&succ(succ(var("n"))), &add(var("n"), num(2)), &mut c),
+            (true, false)
+        );
+        // `Succ` inside a larger arithmetic term normalizes through.
+        assert_eq!(
+            unify_index(
+                &add(succ(var("n")), var("m")),
+                &add(add(var("n"), num(1)), var("m")),
+                &mut c
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn ctor_projection_solver_and_decided_contract() {
+        let mut c = ctx();
+        succ_proj(&mut c);
+        // Linear solving reaches through the projection:
+        // `Succ ?k ≡ 2` solves `?k := 1`.
+        c.metas.push(None);
+        assert_eq!(
+            unify_index(&succ(meta_value(0)), &num(2), &mut c),
+            (true, false)
+        );
+        assert_eq!(c.metas[0], Some(num(1)));
+        // Decided mismatch survives: `Succ Zero ≡ 0` is `1 ≡ 0` —
+        // distinct numerals, a decided failure.
+        let (ok, decided) = unify_index(&succ(var("Zero")), &num(0), &mut c);
+        assert!(!ok && decided);
+        // `Succ n ≡ n` — `n+1` vs `var n`: the var arm's occurs guard
+        // keeps `n ↦ n+1` from binding (same as `var n` vs `n+1`
+        // today), so this is never a decided failure.
+        let (_ok, decided) = unify_index(&succ(var("n")), &var("n"), &mut c);
+        assert!(!decided);
+        // Unregistered heads stay honest atoms — `F n ≢ n + 1` is
+        // Unknown, not accepted.
+        let (ok, decided) = unify_index(
+            &app_term(var("F"), vec![var("n")]),
+            &add(var("n"), num(1)),
+            &mut c,
+        );
+        assert!(!ok && !decided);
+        // …but still ctor-injective against itself.
+        assert_eq!(
+            unify_index(
+                &app_term(var("F"), vec![var("n")]),
+                &app_term(var("F"), vec![var("n")]),
+                &mut c
+            ),
+            (true, false)
+        );
+        // Arity mismatch on a registered head stays an atom too
+        // (`Succ` applied to two args does not read as arithmetic).
+        let over = app_term(var("Succ"), vec![var("n"), var("m")]);
+        assert_eq!(eval_index(&over, &c), over);
     }
 }
