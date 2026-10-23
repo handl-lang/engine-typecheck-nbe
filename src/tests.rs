@@ -11418,3 +11418,53 @@ fn vinfer_literal_mints_constrained_meta() {
     let result = vscheme(scheme);
     assert_eq!(result["__neutral__"]["head"], json!("meta"));
 }
+
+// ---------------------------------------------------------------------------
+// Phase-2 WS-D: ring-normalized index conv through dep_unify
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dep_unify_family_app_ring_commutes() {
+    // Vec(n+m, a) ≡ Vec(m+n, a): family_app index args go through
+    // unify_index → ring normalization makes commutativity definitional.
+    let e = engine();
+    let mut ctx = TypecheckContext::new("handl.canonical", HashMap::new());
+    let var = |n: &str| json!({"__tag__":"var","name":n});
+    let bin = |op: &str, l: Value, r: Value| json!({"__tag__":"Bin","op":op,"l":l,"r":r});
+    let a = json!({"__tag__":"type.family_app","name":"Vec","args":[
+        bin("binary.add", var("n"), var("m")), var("a")]});
+    let b = json!({"__tag__":"type.family_app","name":"Vec","args":[
+        bin("binary.add", var("m"), var("n")), var("a")]});
+    assert!(e.dep_unify(&a, &b, &mut ctx).is_ok());
+}
+
+#[test]
+fn dep_unify_family_app_mul_commutes_and_collects() {
+    // Vec(2*n) ≡ Vec(n*2) and Vec(a+a+b) ≡ Vec(2a+b).
+    let e = engine();
+    let mut ctx = TypecheckContext::new("handl.canonical", HashMap::new());
+    let var = |n: &str| json!({"__tag__":"var","name":n});
+    let bin = |op: &str, l: Value, r: Value| json!({"__tag__":"Bin","op":op,"l":l,"r":r});
+    let a = json!({"__tag__":"type.family_app","name":"Vec","args":[
+        bin("binary.mul", json!(2), var("n")), var("a")]});
+    let b = json!({"__tag__":"type.family_app","name":"Vec","args":[
+        bin("binary.mul", var("n"), json!(2)), var("a")]});
+    assert!(e.dep_unify(&a, &b, &mut ctx).is_ok());
+
+    // a+a+b ≡ a*2+b (collect like terms)
+    let c = json!({"__tag__":"type.family_app","name":"Vec","args":[
+        bin("binary.add", bin("binary.add", var("a"), var("a")), var("b"))]});
+    let d = json!({"__tag__":"type.family_app","name":"Vec","args":[
+        bin("binary.add", bin("binary.mul", var("a"), json!(2)), var("b"))]});
+    assert!(e.dep_unify(&c, &d, &mut ctx).is_ok());
+}
+
+#[test]
+fn dep_unify_family_app_still_decided_mismatch() {
+    // Decided mismatch still errors: Vec(2,a) vs Vec(3,a).
+    let e = engine();
+    let mut ctx = TypecheckContext::new("handl.canonical", HashMap::new());
+    let a = json!({"__tag__":"type.family_app","name":"Vec","args":[json!(2)]});
+    let b = json!({"__tag__":"type.family_app","name":"Vec","args":[json!(3)]});
+    assert!(e.dep_unify(&a, &b, &mut ctx).is_err());
+}
