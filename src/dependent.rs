@@ -3660,12 +3660,36 @@ impl NbeTypecheckEngine {
             LangError::engine("call: callee index not a u64".to_string())
         })? as usize;
         let mut cur = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
+        let is_index_app = node.kind == "index_app";
         for cv in kids.iter().skip(1) {
             let arg_idx = cv.as_u64().ok_or_else(|| {
                 LangError::engine("call: arg index not a u64".to_string())
             })? as usize;
             let arg_ref = AstRef::new(arg_idx);
             cur = zonk_index(&cur, ctx);
+            // `f{i, …}` index application (phase-2 WS-C): each argument
+            // *fills* the next implicit `type.pi` as an index term —
+            // `head{2, Bool}` supplies `n := 2`, `a := Bool` — where a
+            // bare `f(…)` call would have inserted a fresh meta instead.
+            // Once the implicit pis are exhausted the argument falls
+            // through to the ordinary domain check (e.g. `Vec{2, Bool}`
+            // on a `type.family` accumulates index terms the same way
+            // `Vec(2, Bool)` does).
+            if is_index_app
+                && tag_of(&cur) == Some("type.pi")
+                && cur.get("implicit") == Some(&Value::Bool(true))
+            {
+                let binder = cur
+                    .get("binder")
+                    .and_then(Value::as_str)
+                    .unwrap_or("_i")
+                    .to_string();
+                let t = self.node_index_or_type(lang, ast, arg_idx, ctx)?;
+                let mv = eval_index(&t, ctx);
+                let body = cur.get("body").cloned().unwrap_or(Value::Null);
+                cur = subst_index(&body, &var_term(&binder), &mv);
+                continue;
+            }
             // Implicit index binders (phase-2 WS-C `f{a, …}`): insert a
             // fresh meta for each implicit `type.pi` before consuming an
             // explicit argument — the same ordinary meta + unify solving
@@ -3982,7 +4006,14 @@ impl NbeTypecheckEngine {
                     .and_then(|k| k.get(subj))
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .and_then(node_name)
+                    .and_then(|s| {
+                        self.implicit_binder_head(lang, ast, s)
+                            .map(|(n, bs)| {
+                                implicit_binders = bs;
+                                n
+                            })
+                            .or_else(|| node_name(s))
+                    })
                     .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?;
                 (iv, AstRef::new(vidx), Some(AstRef::new(lhs_idx)))
             } else if lhs_node.kind == "function" {
@@ -4017,7 +4048,14 @@ impl NbeTypecheckEngine {
                         .and_then(|k| k.get(subj))
                         .and_then(Value::as_u64)
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .and_then(node_name)
+                        .and_then(|s| {
+                            self.implicit_binder_head(lang, ast, s)
+                                .map(|(n, bs)| {
+                                    implicit_binders = bs;
+                                    n
+                                })
+                                .or_else(|| node_name(s))
+                        })
                         .ok_or_else(|| {
                             LangError::engine("synth_assign: annot var".to_string())
                         })?;
@@ -4113,6 +4151,14 @@ impl NbeTypecheckEngine {
             };
             ctx.restore(binder_mark);
             ctx.results = binder_results;
+            // Self-recursion: the bound name is visible inside its own
+            // initializer at the annotation's type — the bootstrap
+            // scope pass's "a block binding's name is visible to
+            // closures in its own initializer" (the runtime's
+            // update-or-define ScopeStack resolves the wire at call
+            // time). `vec_map{n, a, b} : T := … vec_map{…}(…) …`
+            // resolves the recursive call against the implicit `Pi`s.
+            ctx.extend(name.clone(), ann.clone());
             if matches!(
                 ann.get("__tag__").and_then(Value::as_str),
                 Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app" | "type.array")
