@@ -603,6 +603,25 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         }
         return (true, false);
     }
+    // Constructor-injective `App` heads: `C(a⃗) ≡ C(b⃗)` unifies
+    // pointwise (`Succ p ≡ Succ ?k` solves `?k := p`). Different heads or
+    // arities stay stuck, not decided.
+    if tag_of(&ea) == Some("App") && tag_of(&eb) == Some("App") {
+        if ea.get("callee") == eb.get("callee") {
+            let xs = ea.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+            let ys = eb.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+            if xs.len() == ys.len() {
+                for (x, y) in xs.iter().zip(ys.iter()) {
+                    let (ok, _) = unify_index(x, y, ctx);
+                    if !ok {
+                        return (false, false);
+                    }
+                }
+                return (true, false);
+            }
+        }
+        return (false, false);
+    }
     let (an, bn) = (num_val(&ea), num_val(&eb));
     if let Some(t) = bn {
         if t.fract() == 0.0 {
@@ -623,6 +642,24 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         }
     }
     (false, false)
+}
+
+/// A dependent `match` motive: either the explicit `return … with` AST
+/// clause, or an inferred `{vars, template}` built from the expected
+/// result type (phase-2 WS-C — `match` may drop `return` when an expected
+/// type exists).
+pub(crate) enum MatchMotive {
+    /// The `return … with` clause's AST node index.
+    Ast(usize),
+    /// Inferred motive — `vars` are the rigid index binders the refined
+    /// arm indices substitute into `template` (a type value).
+    Inferred {
+        /// Motive binder names (`im_<pos>_<name>`), applied pointwise.
+        vars: Vec<String>,
+        /// The expected type with abstracted positions replaced by
+        /// `var{vars[i]}` holes.
+        template: Value,
+    },
 }
 
 /// Deep-substitute `to` for `frm` inside an index term (transport).
@@ -705,7 +742,7 @@ fn parse_family_head(
 ) -> Option<(String, Vec<DepParam>)> {
     match node.kind.as_str() {
         "var" => Some((node.payload.as_str()?.to_string(), Vec::new())),
-        "call" => {
+        "call" | "index_app" => {
             let kids = children_of(node)?;
             let callee = ast.get(AstRef::new(kids.first()?.as_u64()? as usize))?;
             let name = callee.payload.as_str()?.to_string();
@@ -1035,7 +1072,73 @@ impl NbeTypecheckEngine {
                 m.insert("body".to_string(), cod);
                 Ok(make_tag(ctx, "type.function", m))
             }
-            "call" => self.dep_synth_call_type(lang, ast, node, ctx),
+            "call" | "index_app" => self.dep_synth_call_type(lang, ast, node, ctx),
+            // `forall b, T` — parse-level `Pi` alias (phase-2 WS-C sugar):
+            // the binder child is `type-annot(var, A)` or a bare `var`
+            // (unsorted — a fresh meta domain), the body child the type
+            // expression. Mints the *same* `type.pi{param, body_closure}`
+            // `Pi(A, b ~> T)` produces — no new semantics.
+            "forall" => {
+                let kids = children_of(node).ok_or_else(|| {
+                    LangError::engine("dep_synth_type: forall has no children")
+                })?;
+                if kids.len() < 2 {
+                    return Err(LangError::engine(
+                        "dep_synth_type: forall needs [binder, body]".to_string(),
+                    ));
+                }
+                let binder_idx = kids[0].as_u64().ok_or_else(|| {
+                    LangError::engine("dep_synth_type: forall binder idx")
+                })? as usize;
+                let body_idx = kids[1].as_u64().ok_or_else(|| {
+                    LangError::engine("dep_synth_type: forall body idx")
+                })? as usize;
+                let bnode = ast.get(AstRef::new(binder_idx)).ok_or_else(|| {
+                    LangError::engine("dep_synth_type: forall binder out of bounds")
+                })?;
+                let (var_name, param) = if bnode.kind == "type-annot"
+                    || role_child_ref(lang, bnode, "annot").is_some()
+                {
+                    let bk = children_of(bnode).cloned().unwrap_or_default();
+                    let subj = lang
+                        .child_role_index(&bnode.kind, "subject")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    let annot = lang
+                        .child_role_index(&bnode.kind, "annot")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(1);
+                    let vn = bk
+                        .get(subj)
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(node_name)
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: forall binder is not a name")
+                        })?;
+                    let ty_idx = bk
+                        .get(annot)
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: forall binder missing sort")
+                        })? as usize;
+                    (vn, self.dep_synth_type(lang, ast, ty_idx, ctx)?)
+                } else {
+                    let vn = node_name(bnode).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: forall binder is not a name")
+                    })?;
+                    (vn, meta_value(ctx.fresh_meta()))
+                };
+                let mut m = Map::new();
+                m.insert("param".to_string(), param);
+                m.insert(
+                    "body_closure".to_string(),
+                    serde_json::json!({"var_name": var_name, "body_child_idx": body_idx, "dep": true}),
+                );
+                Ok(make_tag(ctx, "type.pi", m))
+            }
             "dim_arrow" => {
                 // `A ~[k]~> B` in annotation position — `Hom(k, A, B)`
                 // (ADR-0153). The endpoints are *type expressions* —
@@ -1657,6 +1760,34 @@ impl NbeTypecheckEngine {
         {
             return Ok(self.node_to_index_term(lang, ast, node, ctx));
         }
+        // `C(i⃗)`/`C{i⃗}` where `C` is a *term-level* constructor (a
+        // `type.ctor_sig` Γ binding, e.g. `Succ`) is an index *term*
+        // (`App{var C, i⃗}`), not an instantiated type — `Vec{Succ n, a}`
+        // carries `Succ n` as the index it refines against. Family
+        // callees (`Vec`, `Pi`, …) still synthesize types.
+        if matches!(node.kind.as_str(), "call" | "index_app") {
+            let kids = children_of(node).cloned().unwrap_or_default();
+            let callee_name = kids
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                .filter(|n| n.kind == "var")
+                .and_then(node_name);
+            if let Some(cname) = callee_name {
+                if ctx
+                    .lookup(&cname)
+                    .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                {
+                    let mut args = Vec::with_capacity(kids.len().saturating_sub(1));
+                    for cv in kids.iter().skip(1) {
+                        let Some(ai) = cv.as_u64() else { continue };
+                        let t = self.node_index_or_type(lang, ast, ai as usize, ctx)?;
+                        args.push(eval_index(&t, ctx));
+                    }
+                    return Ok(app_term(var_term(&cname), args));
+                }
+            }
+        }
         self.dep_synth_type(lang, ast, idx, ctx)
     }
 
@@ -1701,6 +1832,25 @@ impl NbeTypecheckEngine {
                 .map(|n| self.node_to_index_term(lang, ast, n, ctx))
                 .unwrap_or(Value::Null),
             "value" | "lit" => node.payload.clone(),
+            // `f(i⃗)`/`f{i⃗}` as an index term — an opaque `App` on the
+            // callee's `var` (constructor or results-bound function).
+            "call" | "index_app" => {
+                let kids = children_of(node).cloned().unwrap_or_default();
+                let callee = kids
+                    .first()
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(node_name)
+                    .unwrap_or_default();
+                let args: Vec<Value> = kids
+                    .iter()
+                    .skip(1)
+                    .filter_map(Value::as_u64)
+                    .filter_map(|i| ast.get(AstRef::new(i as usize)))
+                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .collect();
+                app_term(var_term(&callee), args)
+            }
             _ => Value::Null,
         }
     }
@@ -2107,6 +2257,20 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Option<Result<Value, LangError>> {
+        // `match` checked against an expected type: motive inference —
+        // a `return … with`-less match takes its motive from the expected
+        // type's family-app index pattern (or the constant expected
+        // type), checking each arm body against it rather than joining
+        // synthesized body types.
+        if let Some(node) = ast.get(node_ref) {
+            if node.kind == "match" {
+                match self.dep_check_match(lang, ast, node, expected, ctx) {
+                    Ok(Some(ty)) => return Some(Ok(ty)),
+                    Ok(None) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
         let tag = tag_of(expected)?;
         if tag == "type.family_app" {
             // Family applications check through index unification, not
@@ -2123,7 +2287,15 @@ impl NbeTypecheckEngine {
         match tag {
             "type.pi" | "type.family" | "type.sigma" | "type.forall" => {
                 let node = ast.get(node_ref)?;
-                if node.kind == "function" {
+                if tag == "type.pi"
+                    && expected.get("implicit") == Some(&Value::Bool(true))
+                {
+                    // Implicit index binder (phase-2 WS-C `f{a, …}`): the
+                    // binder does NOT consume a lambda — bind its name
+                    // rigidly (Γ + results) and check the same node
+                    // against the already-elaborated `body`.
+                    Some(self.dep_intro_implicit(lang, ast, node_ref, expected, ctx))
+                } else if node.kind == "function" {
                     Some(self.dep_intro_arrow(lang, ast, node, expected, ctx))
                 } else if tag == "type.sigma" && node.kind == "array" {
                     Some(self.dep_intro_sigma(lang, ast, node, expected, ctx))
@@ -2313,6 +2485,39 @@ impl NbeTypecheckEngine {
 
     /// `[a, b]` checked against `type.sigma` — componentwise: `a` against
     /// `param`, `b` against the closure applied at `a`'s *term*.
+    /// Any node checked against an *implicit* `type.pi` — the `f{a, …}`
+    /// implicit index binder (phase-2 WS-C). The binder never consumes a
+    /// lambda: it is bound rigidly (`var{b}` in `results`, the declared
+    /// `param` sort in Γ) and the *same* node is checked against `body`.
+    /// Nested implicit binders recurse through `check_node`/`dep_check_intro`.
+    fn dep_intro_implicit(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        expected: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let binder = expected
+            .get("binder")
+            .and_then(Value::as_str)
+            .unwrap_or("_i")
+            .to_string();
+        let param = expected.get("param").cloned().unwrap_or(Value::Null);
+        let mark = ctx.mark();
+        let old_results = ctx.results.clone();
+        ctx.extend(binder.clone(), param);
+        ctx.bind_result(binder.clone(), var_term(&binder));
+        let body = expected.get("body").cloned().unwrap_or(Value::Null);
+        let r = self.check_node(lang, ast, node_ref, &body, ctx);
+        ctx.restore(mark);
+        ctx.results = old_results;
+        r?;
+        Ok(expected.clone())
+    }
+
+    /// `[a, b]` checked against `type.sigma` — componentwise: `a` against
+    /// `param`, `b` against the closure applied at `a`'s *term`.
     fn dep_intro_sigma(
         &self,
         lang: &Language,
@@ -2413,6 +2618,11 @@ impl NbeTypecheckEngine {
     /// indices when a `return … with` clause is present. `absurd` arms
     /// discharge decided-impossible index equations.
     #[allow(clippy::too_many_arguments)]
+    /// How the per-arm expected type of a dependent `match` is produced:
+    /// an explicit `return … with` AST motive, or an *inferred* motive
+    /// built from the expected result type (phase-2 WS-C) — `{vars,
+    /// template}` where `template` is a type value carrying `var{vars[i]}`
+    /// holes substituted with the refined index terms per arm.
     pub(crate) fn synth_match_dependent(
         &self,
         lang: &Language,
@@ -2421,6 +2631,33 @@ impl NbeTypecheckEngine {
         arm_indices: &[usize],
         scrutinee_idx: usize,
         motive_idx: Option<usize>,
+        scrutinee_type: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        self.synth_match_with_motive(
+            lang,
+            ast,
+            node,
+            arm_indices,
+            scrutinee_idx,
+            motive_idx.map(MatchMotive::Ast).as_ref(),
+            scrutinee_type,
+            ctx,
+        )
+    }
+
+    /// The motive-general form of [`Self::synth_match_dependent`]: same
+    /// arm machinery, but the motive may be an inferred
+    /// `{vars, template}` instead of an AST clause.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn synth_match_with_motive(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        arm_indices: &[usize],
+        scrutinee_idx: usize,
+        motive: Option<&MatchMotive>,
         scrutinee_type: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
@@ -2666,8 +2903,9 @@ impl NbeTypecheckEngine {
 
             // Body: against the motive applied at the refined indices
             // when present, else synth for the join.
-            if let Some(mi) = motive_idx {
-                let expected = self.apply_motive(lang, ast, mi, &idx_args, scrutinee_idx, ctx)?;
+            if let Some(m) = motive {
+                let expected =
+                    self.apply_motive_repr(lang, ast, m, &idx_args, scrutinee_idx, ctx)?;
                 self.check_node(lang, ast, AstRef::new(body_idx), &expected, ctx)?;
                 arm_types.push(expected);
             } else {
@@ -2684,7 +2922,7 @@ impl NbeTypecheckEngine {
 
         // Result: motive applied at the scrutinee's own indices, else the
         // arm-type join.
-        if let Some(mi) = motive_idx {
+        if let Some(m) = motive {
             let scrut_args: Vec<Value> = match tag_of(scrutinee_type) {
                 Some("type.family_app") => scrutinee_type
                     .get("args")
@@ -2696,7 +2934,7 @@ impl NbeTypecheckEngine {
                     .collect(),
                 _ => Vec::new(),
             };
-            return self.apply_motive(lang, ast, mi, &scrut_args, scrutinee_idx, ctx);
+            return self.apply_motive_repr(lang, ast, m, &scrut_args, scrutinee_idx, ctx);
         }
         let Some(first) = arm_types.first().cloned() else {
             let mut m = Map::new();
@@ -2708,6 +2946,127 @@ impl NbeTypecheckEngine {
             unified = zonk_index(&unified, ctx);
         }
         Ok(unified)
+    }
+
+    /// Apply a [`MatchMotive`] at refined index terms — the AST-clause
+    /// path delegates to [`Self::apply_motive`]; an inferred motive
+    /// substitutes its `vars` holes inside `template` directly.
+    fn apply_motive_repr(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        motive: &MatchMotive,
+        arg_vals: &[Value],
+        scrutinee_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        match motive {
+            MatchMotive::Ast(mi) => {
+                self.apply_motive(lang, ast, *mi, arg_vals, scrutinee_idx, ctx)
+            }
+            MatchMotive::Inferred { vars, template } => {
+                let mut out = template.clone();
+                for (i, v) in vars.iter().enumerate() {
+                    let Some(arg) = arg_vals.get(i) else { break };
+                    out = subst_index(&out, &var_term(v), arg);
+                }
+                Ok(zonk_index(&out, ctx))
+            }
+        }
+    }
+
+    /// `match` in *check* position with no `return … with` clause —
+    /// motive inference (phase-2 WS-C): the expected type gives the
+    /// motive. When both the scrutinee and the expected type are
+    /// applications of the *same* family, the scrutinee's rigid index
+    /// `var`s that occur in the expected args become motive binders
+    /// (`Vec{var n, …}` scrutinee vs `Vec{var n, b}` expected ⇒ motive
+    /// `(i₀) ~> Vec{i₀, b}`); otherwise the motive is the constant
+    /// expected type. Returns `None` when the match carries an explicit
+    /// motive (the existing synth path handles it) — the caller keeps the
+    /// default synth-then-unify path in that case.
+    pub(crate) fn dep_check_match(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        expected: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<Value>, LangError> {
+        if extract_meta_id(expected).is_some() {
+            return Ok(None);
+        }
+        let children = children_of(node)
+            .ok_or_else(|| LangError::engine("match: no children".to_string()))?
+            .clone();
+        if children.len() != 2 {
+            // An explicit `return … with` motive (3 children) stays on the
+            // existing synth path — inference only fills an *absent* one.
+            return Ok(None);
+        }
+        let scrutinee_idx = children[0].as_u64().ok_or_else(|| {
+            LangError::engine("match: scrutinee index not a u64".to_string())
+        })? as usize;
+        let block_idx = children[1].as_u64().ok_or_else(|| {
+            LangError::engine("match: block index not a u64".to_string())
+        })? as usize;
+        let arm_indices: Vec<usize> = ast
+            .get(AstRef::new(block_idx))
+            .and_then(children_of)
+            .map(|bs| bs.iter().filter_map(Value::as_u64).map(|i| i as usize).collect())
+            .unwrap_or_default();
+        let scrutinee_type = self.synth_node(lang, ast, AstRef::new(scrutinee_idx), ctx)?;
+        let motive = Self::inferred_motive(expected, &scrutinee_type, ctx);
+        self.synth_match_with_motive(
+            lang,
+            ast,
+            node,
+            &arm_indices,
+            scrutinee_idx,
+            Some(&motive),
+            &scrutinee_type,
+            ctx,
+        )
+        .map(Some)
+    }
+
+    /// Build the inferred motive `{vars, template}` for `dep_check_match`:
+    /// for each scrutinee index arg that is a rigid `var` occurring in the
+    /// expected family args, mint a motive binder `im_i` and substitute it
+    /// into the expected type.
+    fn inferred_motive(expected: &Value, scrutinee_type: &Value, ctx: &mut TypecheckContext) -> MatchMotive {
+        let mut vars: Vec<String> = Vec::new();
+        let mut template = expected.clone();
+        if tag_of(expected) == Some("type.family_app")
+            && tag_of(scrutinee_type) == Some("type.family_app")
+            && expected.get("name").and_then(Value::as_str)
+                == scrutinee_type.get("name").and_then(Value::as_str)
+        {
+            let sargs = scrutinee_type
+                .get("args")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (j, sa) in sargs.iter().enumerate() {
+                let ea = eval_index(sa, ctx);
+                if tag_of(&ea) == Some("var") {
+                    let sname = ea
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if !sname.is_empty() && var_occurs(&sname, &template) {
+                        let iv = format!("im_{j}_{sname}");
+                        template = subst_index(&template, &ea, &var_term(&iv));
+                        vars.push(iv);
+                    }
+                }
+            }
+        }
+        MatchMotive::Inferred {
+            vars,
+            template,
+        }
     }
 
     /// Motive application `return (i⃗, w) ~> T with`: bind the motive's
@@ -3307,6 +3666,23 @@ impl NbeTypecheckEngine {
             })? as usize;
             let arg_ref = AstRef::new(arg_idx);
             cur = zonk_index(&cur, ctx);
+            // Implicit index binders (phase-2 WS-C `f{a, …}`): insert a
+            // fresh meta for each implicit `type.pi` before consuming an
+            // explicit argument — the same ordinary meta + unify solving
+            // index arguments already use.
+            while tag_of(&cur) == Some("type.pi")
+                && cur.get("implicit") == Some(&Value::Bool(true))
+            {
+                let binder = cur
+                    .get("binder")
+                    .and_then(Value::as_str)
+                    .unwrap_or("_i")
+                    .to_string();
+                let mv = meta_value(ctx.fresh_meta());
+                let body = cur.get("body").cloned().unwrap_or(Value::Null);
+                cur = subst_index(&body, &var_term(&binder), &mv);
+                cur = zonk_index(&cur, ctx);
+            }
             cur = match tag_of(&cur) {
                 Some("type.ctor_sig") => self.instantiate_ctor_full(lang, ast, &cur, ctx)?,
                 Some("type.function") => {
@@ -3427,6 +3803,36 @@ impl NbeTypecheckEngine {
     /// `construct type.unit`, so a last-position annotated assign was
     /// never checked — this op is the fix (ADR-0120 dependent structure
     /// depends on top-level `x : T = v` statements checking `v`).
+    /// `name{b, …}` on an `assign`/`type-annot` subject — implicit index
+    /// binders (phase-2 WS-C). Returns `(name, [(binder, sort_node?)])`
+    /// where each brace arg is a `var` (unsorted) or
+    /// `type-annot(var, sort)`; `None` for any other subject shape.
+    fn implicit_binder_head(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+    ) -> Option<(String, Vec<(String, Option<usize>)>)> {
+        if node.kind != "index_app" {
+            return None;
+        }
+        let kids = children_of(node)?;
+        let callee = ast.get(AstRef::new(kids.first()?.as_u64()? as usize))?;
+        let name = node_name(callee)?;
+        let mut binders = Vec::new();
+        for cv in kids.iter().skip(1) {
+            let b = ast.get(AstRef::new(cv.as_u64()? as usize))?;
+            if b.kind == "type-annot" || role_child_ref(lang, b, "annot").is_some() {
+                let bk = children_of(b)?;
+                let vn = node_name(ast.get(AstRef::new(bk.first()?.as_u64()? as usize))?)?;
+                binders.push((vn, bk.get(1).and_then(Value::as_u64).map(|i| i as usize)));
+            } else {
+                binders.push((node_name(b)?, None));
+            }
+        }
+        Some((name, binders))
+    }
+
     pub(crate) fn synth_assign_judgment(
         &self,
         lang: &Language,
@@ -3440,6 +3846,7 @@ impl NbeTypecheckEngine {
             .and_then(|c| c.as_array())
             .ok_or_else(|| LangError::engine("synth_assign: no children".to_string()))?;
         let mut alias_params: Option<Vec<String>> = None;
+        let mut implicit_binders: Vec<(String, Option<usize>)> = Vec::new();
         let (name, value_ref, ann_ref) = if let Some(n) =
             node.payload.get("name").and_then(|v| v.as_str())
         {
@@ -3484,7 +3891,14 @@ impl NbeTypecheckEngine {
                     .and_then(|k| k.get(subj))
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .and_then(node_name)
+                    .and_then(|s| {
+                        self.implicit_binder_head(lang, ast, s)
+                            .map(|(n, bs)| {
+                                implicit_binders = bs;
+                                n
+                            })
+                            .or_else(|| node_name(s))
+                    })
                     .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?
             } else {
                 node_name(t_node)
@@ -3526,7 +3940,14 @@ impl NbeTypecheckEngine {
                 let iv = ta[0]
                     .as_u64()
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .and_then(node_name)
+                    .and_then(|s| {
+                        self.implicit_binder_head(lang, ast, s)
+                            .map(|(n, bs)| {
+                                implicit_binders = bs;
+                                n
+                            })
+                            .or_else(|| node_name(s))
+                    })
                     .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?;
                 let tidx = ta[1]
                     .as_u64()
@@ -3637,6 +4058,16 @@ impl NbeTypecheckEngine {
             // the refined scrutinee type. Pre-synthesizing would check
             // the arms under an unsolved-meta scrutinee, where `results`
             // stays empty and `transport`/`j`/`absurd` cannot resolve.
+            // Implicit index binders scope (phase-2 WS-C `name{b, …}`):
+            // each binder is bound rigidly — `var{b}` in `results` and Γ —
+            // so occurrences inside the annotation elaborate as the rigid
+            // index variable they name (shadowing any outer `b`).
+            let binder_mark = ctx.mark();
+            let binder_results = ctx.results.clone();
+            for (bn, _) in &implicit_binders {
+                ctx.bind_result(bn.clone(), var_term(bn));
+                ctx.extend(bn.clone(), var_term(bn));
+            }
             let ann = match self
                 .dep_synth_type(lang, ast, ann_ref.index(), ctx)
                 .or_else(|_| crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry))
@@ -3658,6 +4089,30 @@ impl NbeTypecheckEngine {
                     }
                 }
             };
+            // Wrap the elaborated annotation in one implicit `type.pi`
+            // per `name{b, …}` binder — the binder name rides in
+            // `binder`, `implicit` marks it non-lambda-consuming, and the
+            // sort is the declared one or a fresh meta.
+            let ann = if implicit_binders.is_empty() {
+                ann
+            } else {
+                let mut w = ann;
+                for (bn, sort) in implicit_binders.iter().rev() {
+                    let param = match sort {
+                        Some(si) => self.dep_synth_type(lang, ast, *si, ctx)?,
+                        None => meta_value(ctx.fresh_meta()),
+                    };
+                    let mut m = Map::new();
+                    m.insert("param".to_string(), param);
+                    m.insert("body".to_string(), w);
+                    m.insert("implicit".to_string(), Value::Bool(true));
+                    m.insert("binder".to_string(), Value::String(bn.clone()));
+                    w = make_tag(ctx, "type.pi", m);
+                }
+                w
+            };
+            ctx.restore(binder_mark);
+            ctx.results = binder_results;
             if matches!(
                 ann.get("__tag__").and_then(Value::as_str),
                 Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app" | "type.array")

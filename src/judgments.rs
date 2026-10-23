@@ -957,6 +957,23 @@ impl OpHandler for JudgmentOps {
                 }
                 Ok(input)
             }
+            // `flow` — the `eval.flow` value dispatch (the engines'
+            // `x >>> f`): two cell/morphism operands compose (∘₀ —
+            // `Const` payloads take the kernel's `Arrow{first,
+            // second}` mint, domain cells the `infer_comp_axis`
+            // boundary law); anything else applies the right value to
+            // the left. `nbe::eval`'s `Seq{0}` threads schemes; this
+            // arm is the operand-reading counterpart.
+            "flow" => {
+                if args.len() != 2 {
+                    return Err(err("expected [a, b]".into()));
+                }
+                let (a, b) = (args[0].clone(), args[1].clone());
+                if hnl_engine::nbe::is_cell_val(&a) && hnl_engine::nbe::is_cell_val(&b) {
+                    return hnl_engine::nbe::compose_cell_vals(0, 1, dim, &a, &b, self);
+                }
+                hnl_engine::nbe::apply(&b, a, self)
+            }
             "const" => Ok(args.first().cloned().unwrap_or(Val::Const(TaggedValue::Null))),
 
             other => Err(EvalError::Op(format!("unknown judgment op `{other}`"))),
