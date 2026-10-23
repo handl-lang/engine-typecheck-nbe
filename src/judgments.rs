@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use handl_language::{Ast, AstRef, Language};
-use handl_value::nbe::{ArrowVal, Spine, Val};
+use handl_value::nbe::{ArrowVal, Lvl, Spine, Val};
 use handl_value::{Sym, TaggedValue};
 use hnl_engine::nbe::{EvalError, OpHandler};
 use hnl_engine::Term;
@@ -146,6 +146,7 @@ pub(crate) fn eval_arrow_body(
     arrow: &ArrowVal,
     extra: &[(Rc<str>, Val)],
     lang: Option<&Language>,
+    lvl: Lvl,
 ) -> Result<Val, EvalError> {
     let ast = decode_body(&arrow.body_def)?;
     let mut env: FxHashMap<Rc<str>, Val> = (*arrow.binds).clone();
@@ -153,7 +154,7 @@ pub(crate) fn eval_arrow_body(
         env.insert(k.clone(), v.clone());
     }
     let mut fuel = APPLY_FUEL;
-    eval_body_node(&ast, AstRef::new(ast.len() - 1), &env, lang, &mut fuel)
+    eval_body_node(&ast, AstRef::new(ast.len() - 1), &env, lang, &mut fuel, lvl)
 }
 
 /// Evaluate an arena node to a `Val` under `env` (var/call/binary/
@@ -164,6 +165,7 @@ fn eval_body_node(
     env: &FxHashMap<Rc<str>, Val>,
     lang: Option<&Language>,
     fuel: &mut u32,
+    lvl: Lvl,
 ) -> Result<Val, EvalError> {
     if *fuel == 0 {
         return Ok(stuck_val("fuel", vec![]));
@@ -177,17 +179,25 @@ fn eval_body_node(
               ast: &Ast,
               lang: Option<&Language>,
               fuel: &mut u32|
-     -> Result<Val, EvalError> { eval_body_node(ast, i, env, lang, fuel) };
+     -> Result<Val, EvalError> { eval_body_node(ast, i, env, lang, fuel, lvl) };
     match node.kind.as_str() {
-        "value" | "lit" => Ok(const_val(
-            node.payload.get("value").cloned().unwrap_or_else(|| {
-                if node.payload.is_object() {
-                    Value::Null
-                } else {
-                    node.payload.clone()
-                }
-            }),
-        )),
+        "value" | "lit" => {
+            // A `lit`/`value` payload *is* a boundary literal — the
+            // `instantiate` convention every exec engine follows
+            // (`TaggedValue::from(payload)`). A `{"value": …}` envelope
+            // unwraps first; any other object payload decodes as data
+            // and lifts into the domain, so desugar-minted `lit{__sym__}`
+            // (`push_sym_lit`) and `reify_ast`-produced
+            // `lit{__former__}`/`lit{__type__}`/`lit{__neutral__}` nodes
+            // evaluate to their nominal/former/universe/neutral payload
+            // rather than `Null`.
+            let payload = node
+                .payload
+                .get("value")
+                .cloned()
+                .unwrap_or_else(|| node.payload.clone());
+            Ok(lift(lvl, &TaggedValue::from(payload)))
+        }
         "var" => {
             let name = node
                 .payload
@@ -354,7 +364,7 @@ fn eval_body_node(
                 let Some(i) = k.as_u64() else { continue };
                 args.push(ev(AstRef::new(i as usize), env, ast, lang, fuel)?);
             }
-            apply_body_value(callee, args, lang, fuel)
+            apply_body_value(callee, args, lang, fuel, lvl)
         }
         // The cell forms evaluate to their canonical former data — the
         // same shapes `synth_dim_arrow`/`synth_axis_flow` emit.
@@ -543,6 +553,7 @@ fn apply_body_value(
     args: Vec<Val>,
     lang: Option<&Language>,
     fuel: &mut u32,
+    lvl: Lvl,
 ) -> Result<Val, EvalError> {
     let mut f = f;
     let mut args = args.into_iter();
@@ -631,7 +642,7 @@ fn apply_body_value(
             return Ok(stuck_val("fuel", vec![]));
         }
         *fuel -= 1;
-        f = eval_body_node(&ast, AstRef::new(ast.len() - 1), &env2, lang, fuel)?;
+        f = eval_body_node(&ast, AstRef::new(ast.len() - 1), &env2, lang, fuel, lvl)?;
     }
 }
 
@@ -991,7 +1002,10 @@ impl OpHandler for JudgmentOps {
             .first()
             .map(|p| vec![(Rc::from(p.as_str()), arg)])
             .unwrap_or_default();
-        Some(eval_arrow_body(arrow, &extra, self.lang.as_deref()))
+        // Ambient level for `lift` inside body evaluation (boundary
+        // `__neutral__` literal payloads restore rigid levels from it).
+        let lvl = self.checker.borrow().lvl();
+        Some(eval_arrow_body(arrow, &extra, self.lang.as_deref(), lvl))
     }
 }
 
@@ -1115,5 +1129,95 @@ mod tests {
             eval(&t, Val::Const(TaggedValue::Null), &ops),
             Err(EvalError::Op(_))
         ));
+    }
+
+    /// Phase-3 WS-F: a `lit` whose payload is a *boundary-encoded* object
+    /// (`__sym__`/`__former__`/`__type__` — what desugar's `push_sym_lit`
+    /// mints into `data` blocks and `reify_ast` emits) evaluates through
+    /// `eval_arrow_body` to the payload's lifted `Val`, not `Null`.
+    #[test]
+    fn lit_object_payload_lifts_into_domain() {
+        let arrow_with_body = |payload: Value| ArrowVal {
+            params: Rc::from(vec!["x".to_string()]),
+            body_def: TaggedValue::from(serde_json::json!({
+                "__ast__": {"nodes": [
+                    {"kind": "lit", "payload": payload}
+                ]}
+            })),
+            binds: Rc::new(FxHashMap::default()),
+        };
+
+        // `lit{__sym__}` — the desugar's ctor/former sym literal —
+        // evaluates to the nominal, not `Const(Null)`.
+        let sym_payload =
+            handl_value::tagged_to_value(&TaggedValue::Sym(Sym::seeded("data.Option.Some")));
+        let v = eval_arrow_body(&arrow_with_body(sym_payload), &[], None, 0).unwrap();
+        match v {
+            Val::Nominal(s) => assert_eq!(s.name(), "Some"),
+            other => panic!("lit{{__sym__}} should lift to Nominal, got {other:?}"),
+        }
+
+        // `lit{__former__}` (quote's `{sym, args}` spelling) → `Val::Former`.
+        let former_payload = serde_json::json!({
+            "__former__": {
+                "sym": handl_value::tagged_to_value(&TaggedValue::Sym(Sym::seeded("vec.Vec"))),
+                "args": [2, handl_value::tagged_to_value(&TaggedValue::Sym(Sym::seeded("type.Int")))]
+            }
+        });
+        let v = eval_arrow_body(&arrow_with_body(former_payload), &[], None, 0).unwrap();
+        match v {
+            Val::Former { head, args } => {
+                assert_eq!(head.name(), "Vec");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0], Val::Const(TaggedValue::Int(2))));
+                assert!(matches!(&args[1], Val::Nominal(s) if s.name() == "Int"));
+            }
+            other => panic!("lit{{__former__}} should lift to Former, got {other:?}"),
+        }
+
+        // `lit{__type__}` → `Val::Universe`.
+        let v = eval_arrow_body(&arrow_with_body(serde_json::json!({"__type__": 1})), &[], None, 0)
+            .unwrap();
+        assert!(matches!(v, Val::Universe(1)));
+
+        // A plain object payload is the literal itself — `Const(Obj)`,
+        // not `Null`.
+        let v = eval_arrow_body(&arrow_with_body(serde_json::json!({"a": 1})), &[], None, 0).unwrap();
+        assert!(matches!(v, Val::Const(TaggedValue::Obj(_))));
+
+        // The `{"value": …}` envelope still unwraps first.
+        let v =
+            eval_arrow_body(&arrow_with_body(serde_json::json!({"value": 7})), &[], None, 0).unwrap();
+        assert!(matches!(v, Val::Const(TaggedValue::Int(7))));
+
+        // Scalar payloads are unchanged.
+        let v = eval_arrow_body(&arrow_with_body(serde_json::json!(3)), &[], None, 0).unwrap();
+        assert!(matches!(v, Val::Const(TaggedValue::Int(3))));
+    }
+
+    /// The same `lit{__sym__}` reached through the full `apply_arrow`
+    /// op path (saturated single-param arrow application).
+    #[test]
+    fn apply_arrow_lit_sym_body_evaluates_payload() {
+        let ops = JudgmentOps::new();
+        let arrow = ArrowVal {
+            params: Rc::from(vec!["x".to_string()]),
+            body_def: TaggedValue::from(serde_json::json!({
+                "__ast__": {"nodes": [
+                    {"kind": "lit", "payload":
+                        handl_value::tagged_to_value(
+                            &TaggedValue::Sym(Sym::seeded("data.Nat.Succ")))}
+                ]}
+            })),
+            binds: Rc::new(FxHashMap::default()),
+        };
+        let v = ops
+            .apply_arrow(&arrow, Val::Const(TaggedValue::Int(0)))
+            .expect("saturated arrow")
+            .unwrap();
+        match v {
+            Val::Nominal(s) => assert_eq!(s.name(), "Succ"),
+            other => panic!("apply_arrow lit{{__sym__}} body should be Nominal, got {other:?}"),
+        }
     }
 }

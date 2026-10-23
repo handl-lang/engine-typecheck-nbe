@@ -452,7 +452,8 @@ impl Checker {
                     doms.push(self.meta_val(m));
                     extra.push((Rc::from(p.as_str()), r));
                 }
-                let body_ty = crate::judgments::eval_arrow_body(a, &extra, None)
+                let lvl = self.lvl();
+                let body_ty = crate::judgments::eval_arrow_body(a, &extra, None, lvl)
                     .ok()
                     .and_then(|body| self.infer(&body).ok());
                 self.restore(mark);
@@ -516,10 +517,12 @@ impl Checker {
                     Val::Arrow(a) => {
                         let mark = self.mark();
                         let x = self.bind("dom", dom.clone());
+                        let lvl = self.lvl();
                         let applied = crate::judgments::eval_arrow_body(
                             a,
                             &[(Rc::from("dom"), x)],
                             None,
+                            lvl,
                         );
                         self.restore(mark);
                         applied.map_err(|_| TcError::CannotInfer("dependent pi codomain"))?
