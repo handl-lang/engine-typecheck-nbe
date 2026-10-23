@@ -855,17 +855,12 @@ fn dependent_hnl_parses_and_typechecks() {
     );
     let lang = canonical_lang();
     let ast = parse_block(&lang, &stmts);
-    // The deeply-nested `Path` body needs ~10 MiB of check stack —
-    // every judgment hop is several `eval_judgment` frames on top of
-    // the libtest thread's 8 MiB default. Run the check on a
-    // large-stack thread; the assertion is about the type data, not
-    // the recursion budget.
-    let result = std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || typecheck(&lang, ast))
-        .expect("spawn typecheck thread")
-        .join()
-        .expect("typecheck thread panicked");
+    // The deeply-nested `Path` body needs ~3–4 MiB of check stack —
+    // the judgment hops ride `stacker` growable segments (WS-H
+    // `STACK_RED_ZONE`/`STACK_SEGMENT` seams), so the default test
+    // thread's stack suffices (previously this spawned a 64 MiB
+    // thread). `stack_probe` pins the bound explicitly.
+    let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
         "dependent.hnl should typecheck cleanly, got {:?}",

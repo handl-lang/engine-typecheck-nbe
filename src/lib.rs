@@ -103,6 +103,21 @@ use hnl_engine::TermData;
 pub mod checker;
 mod dependent;
 pub mod judgments;
+
+/// Growable-stack seams (WS-H). Type-rule interpretation recurses the
+/// scheme/AST/term structures with several *large* debug frames per
+/// hop — `eval_judgment` alone is a ~2700-line `match`, and the
+/// `dependent.hnl` `Path` bodies used to require a 64 MiB spawned
+/// thread. Every structurally-recursive entry point below wraps its
+/// body in [`stacker::maybe_grow`]: when the current stack is within
+/// `STACK_RED_ZONE` of exhaustion the call moves to a fresh
+/// `STACK_SEGMENT` mmap'd segment, so check depth is bounded by
+/// memory, not the host thread's stack size.
+pub(crate) const STACK_RED_ZONE: usize = 4 * 1024 * 1024;
+
+/// Fresh stack segment allocated by `stacker::maybe_grow` on overflow
+/// (see [`STACK_RED_ZONE`]).
+pub(crate) const STACK_SEGMENT: usize = 8 * 1024 * 1024;
 mod predicate_eval;
 mod totality_check;
 
@@ -214,6 +229,8 @@ impl NbeTypecheckEngine {
     /// values map to their primitive types.
     fn value_to_type(&self, val: &Value) -> Value {
         use serde_json::json;
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         match val {
             Value::Null => self
                 .registry
@@ -258,6 +275,7 @@ impl NbeTypecheckEngine {
                 }
             }
         }
+        })
     }
 
     /// Synthesize the type of a node by looking up its type rule and
@@ -269,6 +287,8 @@ impl NbeTypecheckEngine {
         node_ref: AstRef,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let node = ast.get(node_ref).ok_or_else(|| {
             LangError::engine(format!(
                 "typecheck: node index {} out of bounds",
@@ -302,6 +322,7 @@ impl NbeTypecheckEngine {
         let typ = self.eval_type_scheme(lang, ast, node_ref, &rule.synth, ctx, None)?;
         ctx.node_types.insert(node_ref.index(), typ.clone());
         Ok(typ)
+        })
     }
 
     /// Check a node against an expected type by interpreting the `check`
@@ -314,6 +335,8 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let node = ast.get(node_ref).ok_or_else(|| {
             LangError::engine(format!(
                 "typecheck: node index {} out of bounds",
@@ -380,6 +403,7 @@ impl NbeTypecheckEngine {
             ctx.node_types.insert(node_ref.index(), ty);
             Ok(())
         }
+        })
     }
 
     /// Interpret a type-rule [`Term`] combinator tree.
@@ -424,6 +448,8 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
         incoming: Option<Value>,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         match scheme.tag() {
             "Arr" => Ok(scheme.get("value").cloned().unwrap_or(Value::Null)),
             "Op" => {
@@ -715,6 +741,7 @@ impl NbeTypecheckEngine {
             }
             _ => Ok(incoming.unwrap_or(Value::Null)),
         }
+        })
     }
 
     /// Extract a grade name from a value, falling back to its tag or "?".
@@ -768,6 +795,8 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
         incoming: Option<Value>,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         match op {
             "synth_child" | "synth_type_child" => {
                 let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
@@ -3496,6 +3525,7 @@ impl NbeTypecheckEngine {
                 other
             ))),
         }
+        })
     }
 
     /// Apply a type closure (from a `type.pi`, `type.sigma`, `type.forall`,
@@ -3541,6 +3571,8 @@ impl NbeTypecheckEngine {
     /// prevents solving a metavariable to a value that contains itself,
     /// which would create an infinite loop (ADR-0054 legacy migration).
     fn occurs_in(&self, meta_id: usize, v: &Value) -> bool {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         if let Some(obj) = v.as_object() {
             if let Some(meta) = obj.get("__meta__") {
                 if meta.as_u64() == Some(meta_id as u64) {
@@ -3562,6 +3594,7 @@ impl NbeTypecheckEngine {
             }
         }
         false
+        })
     }
 
     /// Resolve (zonk) all solved metavariables inside a type value.
@@ -3587,6 +3620,8 @@ impl NbeTypecheckEngine {
         ctx: &TypecheckContext,
         visited: &mut std::collections::HashSet<u64>,
     ) -> Value {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         if let Some(id) = extract_meta_id(v) {
             if visited.contains(&id) {
                 // Cycle — break it by leaving the meta as-is.
@@ -3615,6 +3650,7 @@ impl NbeTypecheckEngine {
             ),
             _ => v.clone(),
         }
+        })
     }
 
     /// Extend the typing context with all variables bound by a `match` arm
@@ -3631,6 +3667,8 @@ impl NbeTypecheckEngine {
         scrutinee_type: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let pattern = ast.get(pattern_ref).ok_or_else(|| {
             LangError::engine(format!(
                 "bind_pattern_vars: pattern node {} out of bounds",
@@ -3750,6 +3788,7 @@ impl NbeTypecheckEngine {
                 self.bind_pattern_vars_legacy(lang, ast, pattern, pattern_ref, scrutinee_type, ctx)
             }
         }
+        })
     }
 
     /// Bind a single `entry` pattern (`key: value`) using the `key`/`value`
@@ -4519,6 +4558,8 @@ impl NbeTypecheckEngine {
     /// payload fields (ADR-0054 legacy migration). Otherwise returns an
     /// engine error.
     fn unify(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> Result<(), LangError> {
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         if a == b {
             return Ok(());
         }
@@ -4683,6 +4724,7 @@ impl NbeTypecheckEngine {
             "typecheck: cannot unify {:?} with {:?}",
             a, b
         )))
+        })
     }
 }
 

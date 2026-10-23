@@ -976,6 +976,8 @@ impl NbeTypecheckEngine {
         idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
             LangError::engine(format!("dep_synth_type: node {} out of bounds", idx))
         })?;
@@ -1224,6 +1226,7 @@ impl NbeTypecheckEngine {
                 }
             }
         }
+        })
     }
 
     /// `var` in type position — ctor-sig instantiation, family →
@@ -1365,6 +1368,8 @@ impl NbeTypecheckEngine {
         node: &AstNode,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("dep_synth_type: call has no children"))?;
         if kids.is_empty() {
@@ -1527,6 +1532,7 @@ impl NbeTypecheckEngine {
                 "dep_synth_type: call callee is not a name".to_string(),
             )),
         }
+        })
     }
 
     /// `type.Name` (a `field-access` on the `var "type"` namespace) or
@@ -1587,6 +1593,8 @@ impl NbeTypecheckEngine {
         args: &[Value],
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let params: Vec<String> = bound
             .get("params")
             .and_then(Value::as_array)
@@ -1619,6 +1627,7 @@ impl NbeTypecheckEngine {
         let r = self.dep_synth_type(lang, ast, body_idx, ctx);
         ctx.results = old_results;
         r
+        })
     }
 
     /// The sig argument of `IO(sig)` — an `object` literal becomes a
@@ -1763,6 +1772,8 @@ impl NbeTypecheckEngine {
         idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
             LangError::engine(format!("dep: node {} out of bounds", idx))
         })?;
@@ -1801,6 +1812,7 @@ impl NbeTypecheckEngine {
             }
         }
         self.dep_synth_type(lang, ast, idx, ctx)
+        })
     }
 
     /// AST node → index *term* (`var`/`Bin`/`Un`/literal/meta) — the raw
@@ -1812,6 +1824,8 @@ impl NbeTypecheckEngine {
         node: &AstNode,
         ctx: &mut TypecheckContext,
     ) -> Value {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
             let kids = children_of(node).cloned().unwrap_or_default();
             if node.kind.starts_with("unary.") {
@@ -1865,6 +1879,7 @@ impl NbeTypecheckEngine {
             }
             _ => Value::Null,
         }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2136,6 +2151,8 @@ impl NbeTypecheckEngine {
         b: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         if a == b {
             return Ok(());
         }
@@ -2256,6 +2273,7 @@ impl NbeTypecheckEngine {
                 self.unify(a, b, ctx)
             }
         }
+        })
     }
 
     /// Dependent introduction — check `node` against a dependent former
@@ -2269,6 +2287,8 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Option<Result<Value, LangError>> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         // `match` checked against an expected type: motive inference —
         // a `return … with`-less match takes its motive from the expected
         // type's family-app index pattern (or the constant expected
@@ -2433,6 +2453,7 @@ impl NbeTypecheckEngine {
             }
             _ => None,
         }
+        })
     }
 
     /// `function` checked against `type.pi`/`type.family` — bind the
@@ -3446,6 +3467,8 @@ impl NbeTypecheckEngine {
         node: &AstNode,
         ctx: &mut TypecheckContext,
     ) {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         if node.kind == "var" {
             if let Some(name) = node_name(node) {
                 let resolvable = name == "_"
@@ -3468,6 +3491,7 @@ impl NbeTypecheckEngine {
                 }
             }
         }
+        })
     }
 
     /// `f >>> g` — composition in `type.function` coordinates
@@ -4432,6 +4456,8 @@ impl NbeTypecheckEngine {
         ast: &Ast,
         node: &AstNode,
     ) -> Option<Value> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let kids = children_of(node).cloned().unwrap_or_default();
         let at = |i: usize| -> Option<&AstNode> {
             kids.get(i)
@@ -4551,6 +4577,7 @@ impl NbeTypecheckEngine {
             }
             _ => None,
         }
+        })
     }
 
     /// `node_to_ann_term` + `eval_ann_term` (the model's `eval_node_`).
@@ -4584,6 +4611,8 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
         fuel: u32,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         if fuel == 0 {
             return Ok(term.clone());
         }
@@ -4794,6 +4823,7 @@ impl NbeTypecheckEngine {
             }
             _ => Ok(term.clone()),
         }
+        })
     }
 
     /// Apply an evaluated annotation value to evaluated arguments (the
@@ -4809,6 +4839,8 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
         fuel: u32,
     ) -> Result<Value, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         match tag_of(f) {
             Some("LamVal") => {
                 let params: Vec<String> = f
@@ -4849,6 +4881,7 @@ impl NbeTypecheckEngine {
             }
             _ => Ok(app_term(f.clone(), args.to_vec())),
         }
+        })
     }
 }
 

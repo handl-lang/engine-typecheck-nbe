@@ -16,6 +16,10 @@ hnl-engine = { git = "https://github.com/handl-lang/engine", branch = "main" }
 handl-plugin-lib-tag = { git = "https://github.com/handl-lang/host", branch = "main" }
 rustc-hash = "2"
 serde_json = "1"
+# WS-H: growable stack for judgment evaluation — `eval_judgment` hops
+# are several large debug frames each, so deep AST/term recursion is
+# bounded by memory, not the host thread's stack size.
+stacker = "0.1"
 
 [dev-dependencies]
 hnl-engine-exec-tree-walk = { git = "https://github.com/handl-lang/engine-exec-tree-walk", branch = "main" }

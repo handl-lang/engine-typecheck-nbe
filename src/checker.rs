@@ -363,9 +363,9 @@ impl Checker {
         if self.conv(a, b) {
             return true;
         }
-        let a = self.metas.force_head(a).clone();
-        let b = self.metas.force_head(b).clone();
-        match (&a, &b) {
+        let af = self.metas.force_head_rc(a);
+        let bf = self.metas.force_head_rc(b);
+        match (af.as_val(), bf.as_val()) {
             (Val::Universe(i), Val::Universe(j)) => i <= j,
             (Val::Nominal(x), Val::Nominal(y)) => x.has_ancestor(y),
             // `IO(sa) <: IO(sb)` — signature subtyping: `sb` must name
@@ -396,9 +396,9 @@ impl Checker {
     /// values (op signatures compare by `conv` — structural, per
     /// ADR-0154 §3). Non-record sigs fall back to conversion.
     fn sig_width_subtype(&mut self, wider: &Val, narrower: &Val) -> bool {
-        let w = self.metas.force_head(wider).clone();
-        let n = self.metas.force_head(narrower).clone();
-        match (&w, &n) {
+        let w = self.metas.force_head_rc(wider);
+        let n = self.metas.force_head_rc(narrower);
+        match (w.as_val(), n.as_val()) {
             (
                 Val::Const(TaggedValue::Obj(wm)),
                 Val::Const(TaggedValue::Obj(nm)),
@@ -407,36 +407,36 @@ impl Checker {
                     self.conv(&Val::Const(wv.clone()), &Val::Const(v.clone()))
                 })
             }),
-            _ => self.conv(&w, &n),
+            _ => self.conv(w.as_val(), n.as_val()),
         }
     }
 
     /// Synthesize the type of `v`.
     pub fn infer(&mut self, v: &Val) -> Result<Val, TcError> {
-        let v = self.metas.force_head(v).clone();
-        match v {
+        let vf = self.metas.force_head_rc(v);
+        match vf.as_val() {
             // `Type(i) : Type(i+1)` (0154 §4).
-            Val::Universe(i) => Ok(Val::Universe(i + 1)),
+            Val::Universe(i) => Ok(Val::Universe(*i + 1)),
             Val::Nominal(s) => Ok(self
                 .nominal_ty
                 .get(&s.handle())
                 .cloned()
                 .unwrap_or(Val::Universe(0))),
-            Val::Former { head, args } => self.infer_former(&head, &args),
+            Val::Former { head, args } => self.infer_former(head, args),
             Val::Rigid { lvl, spine } if spine.is_empty() => self
-                .lookup(lvl)
+                .lookup(*lvl)
                 .cloned()
                 .ok_or(TcError::CannotInfer("unbound rigid")),
             Val::Flex { meta, spine } if spine.is_empty() => self
                 .meta_tys
-                .get(meta as usize)
+                .get(*meta as usize)
                 .cloned()
-                .ok_or(TcError::UnsolvedMeta(meta)),
+                .ok_or(TcError::UnsolvedMeta(*meta)),
             Val::Unfold { value, .. } => value
                 .get()
                 .ok_or(TcError::CannotInfer("unfold-forced"))
                 .and_then(|v| self.infer(v)),
-            Val::Const(tv) => self.infer_const(&tv),
+            Val::Const(tv) => self.infer_const(tv),
             Val::Arrow(a) => {
                 // Saturate the arrow on rigid binders (fresh domain
                 // metas for the domains), evaluate the `{"__ast__"}`
@@ -452,7 +452,7 @@ impl Checker {
                     doms.push(self.meta_val(m));
                     extra.push((Rc::from(p.as_str()), r));
                 }
-                let body_ty = crate::judgments::eval_arrow_body(&a, &extra, None)
+                let body_ty = crate::judgments::eval_arrow_body(a, &extra, None)
                     .ok()
                     .and_then(|body| self.infer(&body).ok());
                 self.restore(mark);
