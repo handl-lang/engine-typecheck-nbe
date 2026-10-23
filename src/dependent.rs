@@ -1188,7 +1188,19 @@ impl NbeTypecheckEngine {
                         None => dim_meta(ctx),
                     }
                 } else {
-                    dim_meta(ctx)
+                    // A scope-bound dimension variable (`f<N> : T`
+                    // binder, ADR-0106 §12) elaborates as its rigid
+                    // index term — same rule `synth_dim_arrow` applies
+                    // in term position.
+                    let resolved = node_name(dim_inner)
+                        .filter(|_| dim_inner.kind == "var")
+                        .and_then(|n| ctx.results.get(n.as_str()).cloned())
+                        .map(|b| eval_index(&b, ctx))
+                        .filter(|v| tag_of(v) == Some("var") || num_val(v).is_some());
+                    match resolved {
+                        Some(v) => domain_lift(&v, ctx),
+                        None => dim_meta(ctx),
+                    }
                 };
                 let va = domain_lift(&src, ctx);
                 let vb = domain_lift(&tgt, ctx);
@@ -3351,7 +3363,29 @@ impl NbeTypecheckEngine {
         let tgt_idx = kids[2].as_u64().ok_or_else(|| {
             LangError::engine("dim_arrow: tgt index not a u64".to_string())
         })? as usize;
-        let src = self.synth_node(lang, ast, AstRef::new(src_idx), ctx)?;
+        // The `source`/`target` endpoints are quoted *law terms*
+        // (ADR-0119): the bootstrap scope pass checks them in pattern
+        // mode — a free `var` is a pattern variable (`g` in
+        // `dedupe<N> := (g >>> g) ~[N]~> g`), not a wire reference —
+        // so each unresolvable name binds a fresh meta for the
+        // duration of the endpoint synth.
+        let law_mark = ctx.mark();
+        for idx in [src_idx, tgt_idx] {
+            if let Some(n) = ast.get(AstRef::new(idx)) {
+                self.bind_law_pattern_vars(lang, ast, n, ctx);
+            }
+        }
+        let judged = (|ctx: &mut TypecheckContext| -> Result<(Value, Value), LangError> {
+            let src = self.synth_node(lang, ast, AstRef::new(src_idx), ctx)?;
+            // The dim expression still synthesizes (node_types + meta
+            // solving); the emitted former no longer carries a `grade`
+            // field — the dimension index IS the first `Hom` arg.
+            let _grade = self.synth_node(lang, ast, AstRef::new(dim_idx), ctx)?;
+            let tgt = self.synth_node(lang, ast, AstRef::new(tgt_idx), ctx)?;
+            Ok((src, tgt))
+        })(ctx);
+        ctx.restore(law_mark);
+        let (src, tgt) = judged?;
         // Dimension literal (from the child payload), then its type.
         let dim_node = ast.get(AstRef::new(dim_idx)).ok_or_else(|| {
             LangError::engine("dim_arrow: dim node out of bounds".to_string())
@@ -3374,22 +3408,66 @@ impl NbeTypecheckEngine {
         } else {
             None
         };
-        // The dim expression still synthesizes (node_types + meta
-        // solving); the emitted former no longer carries a `grade`
-        // field — the dimension index IS the first `Hom` arg.
-        let _grade = self.synth_node(lang, ast, AstRef::new(dim_idx), ctx)?;
-        let tgt = self.synth_node(lang, ast, AstRef::new(tgt_idx), ctx)?;
         // Canonical `Former{type.hom}` data (ADR-0153): `~[n]~>` is
-        // `Hom(n, src, tgt)` — a literal dim is a `Const` natural, a
-        // symbolic dim (`f<d>`) mints a `Dim`-typed meta. Endpoints
-        // lift through the `__tag__` bridge into the `Val` domain.
+        // `Hom(n, src, tgt)` — a literal dim is a `Const` natural; a
+        // scope-bound dimension variable (`f<N> := … ~[N]~> …`,
+        // ADR-0106 §12) elaborates as its rigid index term; any other
+        // symbolic dim mints a `Dim`-typed meta. Endpoints lift through
+        // the `__tag__` bridge into the `Val` domain.
         let dim_v = match dim_lit.and_then(|d| d.as_i64()) {
             Some(n) => Val::Const(TaggedValue::Int(n)),
-            None => dim_meta(ctx),
+            None => {
+                let resolved = node_name(dim_inner)
+                    .filter(|_| dim_inner.kind == "var")
+                    .and_then(|n| ctx.results.get(n.as_str()).cloned())
+                    .map(|b| eval_index(&b, ctx))
+                    .filter(|v| tag_of(v) == Some("var") || num_val(v).is_some());
+                match resolved {
+                    Some(v) => domain_lift(&v, ctx),
+                    None => dim_meta(ctx),
+                }
+            }
         };
         let va = domain_lift(&src, ctx);
         let vb = domain_lift(&tgt, ctx);
         Ok(hom_former(dim_v, va, vb, ctx))
+    }
+
+    /// Bind the free `var`s of a `~[N]~>` law endpoint to fresh metas —
+    /// the pattern-mode counterpart of the scope pass's rule-term
+    /// check. A name already resolvable (Γ, results, injected or
+    /// ambient globals) is a real reference and is left alone; `_`
+    /// binds nothing. Callers scope the bindings with
+    /// `ctx.mark`/`ctx.restore`.
+    fn bind_law_pattern_vars(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) {
+        if node.kind == "var" {
+            if let Some(name) = node_name(node) {
+                let resolvable = name == "_"
+                    || ctx.lookup(&name).is_some()
+                    || ctx.results.contains_key(name.as_str())
+                    || lang.globals.contains_key(name.as_str());
+                if !resolvable {
+                    let meta = ctx.fresh_meta();
+                    ctx.extend(name, meta_value(meta));
+                }
+            }
+            return;
+        }
+        if let Some(kids) = children_of(node) {
+            for cv in kids {
+                if let Some(i) = cv.as_u64() {
+                    if let Some(child) = ast.get(AstRef::new(i as usize)) {
+                        self.bind_law_pattern_vars(lang, ast, child, ctx);
+                    }
+                }
+            }
+        }
     }
 
     /// `f >>> g` — composition in `type.function` coordinates
@@ -3828,8 +3906,11 @@ impl NbeTypecheckEngine {
     /// never checked — this op is the fix (ADR-0120 dependent structure
     /// depends on top-level `x : T = v` statements checking `v`).
     /// `name{b, …}` on an `assign`/`type-annot` subject — implicit index
-    /// binders (phase-2 WS-C). Returns `(name, [(binder, sort_node?)])`
-    /// where each brace arg is a `var` (unsorted) or
+    /// binders (phase-2 WS-C) — or `name<N, …>` — generic dimension
+    /// parameters (ADR-0106 §12: `f<N> := body` means `f := N ~> body`;
+    /// the `dimension` node's `args` scope over the bound value, same
+    /// class of binding). Returns `(name, [(binder, sort_node?)])`
+    /// where each arg is a `var` (unsorted) or
     /// `type-annot(var, sort)`; `None` for any other subject shape.
     fn implicit_binder_head(
         &self,
@@ -3837,7 +3918,7 @@ impl NbeTypecheckEngine {
         ast: &Ast,
         node: &AstNode,
     ) -> Option<(String, Vec<(String, Option<usize>)>)> {
-        if node.kind != "index_app" {
+        if node.kind != "index_app" && node.kind != "dimension" {
             return None;
         }
         let kids = children_of(node)?;
@@ -4066,9 +4147,19 @@ impl NbeTypecheckEngine {
                     ));
                 }
             } else {
-                let n = node_name(lhs_node)
+                // A bare `name{b, …}`/`name<N>` lhs (`dedupe<N> := v`)
+                // declares generic binders — extract the head the same
+                // way the annotated subject arms do, so the binders
+                // scope over the initializer below.
+                let n = self
+                    .implicit_binder_head(lang, ast, lhs_node)
+                    .map(|(n, bs)| {
+                        implicit_binders = bs;
+                        n
+                    })
+                    .or_else(|| node_name(lhs_node))
                     .ok_or_else(|| LangError::engine("synth_assign: var name".to_string()))?;
-                (n.to_string(), AstRef::new(vidx), None)
+                (n, AstRef::new(vidx), None)
             }
         };
         let bound_type = if let Some(params) = alias_params {
@@ -4115,6 +4206,17 @@ impl NbeTypecheckEngine {
                 // against the bound-value env before classification.
                 Ok(a) if is_ann_term(&a) => {
                     self.eval_ann_term(lang, ast, &a, ctx, ANN_FUEL)?
+                }
+                // `type.unknown` is the *unruled-kind fallback*, not a
+                // real annotation — an ordered value annotation
+                // (`x : E := v`, ADR-0103) evaluates `E` as a term
+                // first (`5 >>> inc` → `6`); keep the placeholder only
+                // when the term path fails too.
+                Ok(a) if tag_of(&a) == Some("type.unknown") => {
+                    match self.eval_ann_node(lang, ast, ann_ref.index(), ctx) {
+                        Ok(v) => v,
+                        Err(_) => a,
+                    }
                 }
                 Ok(a) => a,
                 Err(interp_err) => {
@@ -4211,7 +4313,23 @@ impl NbeTypecheckEngine {
             }
             ann
         } else {
-            self.synth_node(lang, ast, value_ref, ctx)?
+            // A `name{b,…}`/`name<N>` head on a bare assign scopes its
+            // generic binders over the initializer (ADR-0106 §12 —
+            // `f<N> := body` means `f := N ~> body`; the bootstrap
+            // scope pass's `dim_param_names`/`implicit_binder_names`
+            // bind the same names over the value only). Bound rigidly —
+            // `var{N}` in results and Γ — so the value's occurrences
+            // (`… ~[N]~> …`) resolve to the bound dimension variable.
+            let binder_mark = ctx.mark();
+            let binder_results = ctx.results.clone();
+            for (bn, _) in &implicit_binders {
+                ctx.bind_result(bn.clone(), var_term(bn));
+                ctx.extend(bn.clone(), var_term(bn));
+            }
+            let ty = self.synth_node(lang, ast, value_ref, ctx);
+            ctx.restore(binder_mark);
+            ctx.results = binder_results;
+            ty?
         };
         ctx.extend(name.clone(), bound_type);
         // ADR-0103: record the bound *term* of the value — the bound-value
