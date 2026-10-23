@@ -17,8 +17,9 @@
 //!   `{"__tag__": "var", "name": n}` rigid variables, `{"__tag__": "Bin",
 //!   "op": kind, "l", "r"}` and `{"__tag__": "Un", "op", "operand"}`
 //!   operators. Index equality is definitional via evaluation
-//!   ([`eval_index`]) plus the bounded solver [`solve_index`] — no
-//!   bespoke rewriting beyond the model's canonicalization.
+//!   ([`eval_index`]) — including commutative-ring normalization of
+//!   `add`/`sub`/`mul`/`neg` terms to a polynomial normal form — plus
+//!   the bounded solver behind the [`IndexSolver`] seam.
 //! - `Path{frm, to}` — the proof-relevant index-equality witness bound
 //!   as `eq_<name>` in `results` by branch refinement.
 
@@ -411,7 +412,7 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
                 return Value::from(n);
             }
         }
-        return canon_bin(op, l, r);
+        return ring_canon(canon_bin(op, l, r));
     }
     if tag_of(v) == Some("Un") {
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
@@ -421,9 +422,307 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
                 return Value::from(-n);
             }
         }
-        return un_term(op, o);
+        return ring_canon(un_term(op, o));
     }
     v.clone()
+}
+
+// ---------------------------------------------------------------------------
+// Ring normal form (phase-2 WS-D)
+// ---------------------------------------------------------------------------
+//
+// Commutative-ring normalization for `Nat`-index terms over
+// `add`/`sub`/`mul`/`neg`: every such term rewrites to a *polynomial
+// normal form* — a constant plus a sorted sum of monomials, each a
+// coefficient times a sorted product of atoms. Atoms are the
+// non-arithmetic evaluated subterms (`var{name}`, metas, `App` ctor
+// terms, opaque `div`/`mod`/`pow`/`eq` nodes), keyed by a canonical
+// string so like terms collect: `a+b+a → a*2+b`, `n+m ≡ m+n`,
+// `2*n ≡ n*2`, `n*(m+k) → n*m+n*k`, `n*0 → 0`, `(n-1)+1 → n`.
+//
+// The rewrite is *decidable, not a rewrite rule*: it runs inside
+// `eval_index`, so every consumer (`unify_index`, `dep_unify`, match
+// refinement, `closed_num`, `eval_ann_term`) sees normal forms before
+// meta-solving. Distribution is bounded (`POLY_*` caps) — a product too
+// large to expand keeps the factored `canon_bin` shape instead of
+// blowing up; that case is not silent, it just stays unnormalized.
+
+/// Maximum monomials produced by one `mul` distribution.
+const POLY_MAX_TERMS: usize = 64;
+/// Maximum factors kept inside one monomial.
+const POLY_MAX_FACTORS: usize = 16;
+/// Maximum `poly_of` recursion depth.
+const POLY_MAX_DEPTH: u32 = 24;
+
+/// A monomial: `coeff × Π atoms`, atoms sorted by canonical key.
+struct IndexMono {
+    coeff: f64,
+    atoms: Vec<(String, Value)>,
+}
+
+/// A polynomial normal form: canonical-key → monomial (like terms
+/// already merged), plus a separate constant summand.
+#[derive(Default)]
+struct IndexPoly {
+    terms: std::collections::BTreeMap<String, IndexMono>,
+    constant: f64,
+}
+
+/// Canonical atom key — `var`s key by name, unsolved metas by id, and
+/// every other evaluated subterm (`App`, `div`/`mod`/`pow`/`eq` nodes)
+/// by its deterministic JSON serialization (serde_json `Map` is
+/// `BTreeMap` — sorted keys).
+fn index_atom_key(v: &Value) -> String {
+    if let Some(id) = extract_meta_id(v) {
+        return format!("m:{id}");
+    }
+    if tag_of(v) == Some("var") {
+        return format!("v:{}", v.get("name").and_then(Value::as_str).unwrap_or(""));
+    }
+    format!("j:{}", serde_json::to_string(v).unwrap_or_default())
+}
+
+fn poly_atom(v: &Value) -> IndexPoly {
+    let key = index_atom_key(v);
+    let mut terms = std::collections::BTreeMap::new();
+    terms.insert(
+        key.clone(),
+        IndexMono {
+            coeff: 1.0,
+            atoms: vec![(key, v.clone())],
+        },
+    );
+    IndexPoly {
+        terms,
+        constant: 0.0,
+    }
+}
+
+fn poly_scale(p: &mut IndexPoly, k: f64) {
+    if k == 0.0 {
+        p.terms.clear();
+        p.constant = 0.0;
+        return;
+    }
+    p.constant *= k;
+    for m in p.terms.values_mut() {
+        m.coeff *= k;
+    }
+}
+
+fn poly_merge(dst: &mut IndexPoly, src: IndexPoly) {
+    dst.constant += src.constant;
+    for (k, m) in src.terms {
+        dst.terms
+            .entry(k)
+            .or_insert(IndexMono {
+                coeff: 0.0,
+                atoms: m.atoms.clone(),
+            })
+            .coeff += m.coeff;
+    }
+    dst.terms.retain(|_, m| m.coeff != 0.0);
+}
+
+/// Distribute `a * b` over the sums — `(x+y)*(u+v) → xu+xv+yu+yv`.
+/// Returns `None` when expansion would exceed the bound; the caller
+/// keeps the factored form.
+fn poly_mul(a: &IndexPoly, b: &IndexPoly) -> Option<IndexPoly> {
+    let a_terms = a.terms.len().max(1);
+    let b_terms = b.terms.len().max(1);
+    if a_terms * b_terms > POLY_MAX_TERMS {
+        return None;
+    }
+    let mut out = IndexPoly {
+        constant: a.constant * b.constant,
+        ..Default::default()
+    };
+    // a.terms * b.constant and a.constant * b.terms
+    for (k, m) in &a.terms {
+        out.terms.insert(
+            k.clone(),
+            IndexMono {
+                coeff: m.coeff * b.constant,
+                atoms: m.atoms.clone(),
+            },
+        );
+    }
+    for (k, m) in &b.terms {
+        out.terms
+            .entry(k.clone())
+            .or_insert(IndexMono {
+                coeff: 0.0,
+                atoms: m.atoms.clone(),
+            })
+            .coeff += m.coeff * a.constant;
+    }
+    // a.terms * b.terms — merge atom bags (sorted by key).
+    for ma in a.terms.values() {
+        for mb in b.terms.values() {
+            let mut atoms: Vec<(String, Value)> = ma
+                .atoms
+                .iter()
+                .chain(mb.atoms.iter())
+                .cloned()
+                .collect();
+            atoms.sort_by(|x, y| x.0.cmp(&y.0));
+            if atoms.len() > POLY_MAX_FACTORS {
+                return None;
+            }
+            let key = atoms
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join("*");
+            out.terms
+                .entry(key)
+                .or_insert(IndexMono {
+                    coeff: 0.0,
+                    atoms,
+                })
+                .coeff += ma.coeff * mb.coeff;
+        }
+    }
+    out.terms.retain(|_, m| m.coeff != 0.0);
+    if out.terms.len() > POLY_MAX_TERMS {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse an *evaluated* index term into its polynomial normal form.
+/// `None` = outside the bounded fragment (the term keeps its `canon_bin`
+/// shape — still canonical, just not expanded).
+fn poly_of(t: &Value, depth: u32) -> Option<IndexPoly> {
+    if depth > POLY_MAX_DEPTH {
+        return None;
+    }
+    if let Some(n) = num_val(t) {
+        return Some(IndexPoly {
+            constant: n,
+            ..Default::default()
+        });
+    }
+    let tag = tag_of(t)?;
+    if tag == "Bin" {
+        let op = t.get("op").and_then(Value::as_str).unwrap_or("");
+        if !matches!(op, "binary.add" | "binary.sub" | "binary.mul") {
+            return Some(poly_atom(t));
+        }
+        let mut l = poly_of(t.get("l").unwrap_or(&Value::Null), depth + 1)?;
+        let mut r = poly_of(t.get("r").unwrap_or(&Value::Null), depth + 1)?;
+        return match op {
+            "binary.add" => {
+                poly_merge(&mut l, r);
+                Some(l)
+            }
+            "binary.sub" => {
+                poly_scale(&mut r, -1.0);
+                poly_merge(&mut l, r);
+                Some(l)
+            }
+            _ => poly_mul(&l, &r),
+        };
+    }
+    if tag == "Un" {
+        let op = t.get("op").and_then(Value::as_str).unwrap_or("");
+        if op != "unary.neg" {
+            return Some(poly_atom(t));
+        }
+        let mut o = poly_of(t.get("operand").unwrap_or(&Value::Null), depth + 1)?;
+        poly_scale(&mut o, -1.0);
+        return Some(o);
+    }
+    Some(poly_atom(t))
+}
+
+/// Render one monomial `coeff × Π atoms` — atoms left-associated
+/// `a*b*c`, the coefficient (when ≠ ±1) appended on the right,
+/// preserving the `open × closed` convention.
+fn mono_term(m: &IndexMono) -> Value {
+    let mut term: Option<Value> = None;
+    for (_, a) in &m.atoms {
+        term = Some(match term {
+            None => a.clone(),
+            Some(t) => bin_term("binary.mul", t, a.clone()),
+        });
+    }
+    let term = term.unwrap_or(Value::from(1));
+    let c = m.coeff.abs();
+    if c == 1.0 {
+        term
+    } else {
+        bin_term("binary.mul", term, Value::from(c))
+    }
+}
+
+fn add_fold(terms: &[Value]) -> Option<Value> {
+    terms
+        .iter()
+        .cloned()
+        .reduce(|a, b| bin_term("binary.add", a, b))
+}
+
+/// Rebuild a canonical `Bin`/`Un`/numeral term from a polynomial:
+/// positive monomials folded with `add`, then the constant summand, then
+/// negative monomials subtracted — so `x - y` keeps a `binary.sub`
+/// spelling and `2 + x` writes `x + 2`.
+fn poly_to_term(p: &IndexPoly) -> Value {
+    let mut pos: Vec<Value> = Vec::new();
+    let mut neg: Vec<Value> = Vec::new();
+    for (_, m) in &p.terms {
+        if m.coeff > 0.0 {
+            pos.push(mono_term(m));
+        } else if m.coeff < 0.0 {
+            neg.push(mono_term(m));
+        }
+    }
+    if p.constant > 0.0 {
+        pos.push(Value::from(p.constant));
+    } else if p.constant < 0.0 {
+        neg.push(Value::from(-p.constant));
+    }
+    let ps = add_fold(&pos);
+    let ns = add_fold(&neg);
+    match (ps, ns) {
+        (Some(p), Some(n)) => bin_term("binary.sub", p, n),
+        (Some(p), None) => p,
+        (None, Some(n)) => {
+            if neg.len() == 1 {
+                un_term("unary.neg", n)
+            } else {
+                bin_term("binary.sub", Value::from(0), n)
+            }
+        }
+        (None, None) => Value::from(0),
+    }
+}
+
+/// Rewrite an evaluated `Bin`/`Un` index term into ring normal form.
+/// `None` when the term is outside the bounded fragment — the caller
+/// keeps the `canon_bin` shape (not silent-accepted, just not expanded).
+fn ring_normalize(v: &Value) -> Option<Value> {
+    match tag_of(v) {
+        Some("Bin") => {
+            let op = v.get("op").and_then(Value::as_str).unwrap_or("");
+            if !matches!(op, "binary.add" | "binary.sub" | "binary.mul") {
+                return None;
+            }
+        }
+        Some("Un") => {
+            if v.get("op").and_then(Value::as_str) != Some("unary.neg") {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    poly_of(v, 0).map(|p| poly_to_term(&p))
+}
+
+/// `canon_bin` first (unit laws, folding, commutation), then the ring
+/// normal form when the term is in the bounded fragment.
+fn ring_canon(v: Value) -> Value {
+    ring_normalize(&v).unwrap_or(v)
 }
 
 /// The closed numeric value of a term, if it evaluates to a numeral.
@@ -570,9 +869,87 @@ fn solve_index(term: &Value, target: i64, ctx: &mut TypecheckContext) -> Solve {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `IndexSolver` — bounded index-equality seam (phase-2 WS-D)
+// ---------------------------------------------------------------------------
+
+/// Verdict of a bounded `a ≡ b` index-equality query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexVerdict {
+    /// Convertible (possibly after solving metas).
+    Proven,
+    /// Provably unsatisfiable within the decidable fragment — a real
+    /// error, never "stuck".
+    Disproven,
+    /// Outside the decidable fragment — stuck/postpone. `Unknown` is
+    /// never silently accepted as equality.
+    Unknown,
+}
+
+/// Bounded solver interface the `conv` path calls for index equality
+/// (phase-2 spec WS-D). Contract for every implementation:
+///
+/// - **Decidable fragments first**: ring-normalization, then linear
+///   integer solving, exact division, integer roots.
+/// - **Bounded**: fuel + term-size caps (`eval_index` fuel, `POLY_*`),
+///   deterministic — same inputs, same verdict.
+/// - **Honest**: decided-unsatisfiable → [`IndexVerdict::Disproven`];
+///   undecidable → [`IndexVerdict::Unknown`] (stuck/postpone), never
+///   silent-accept. Two symbolic factors (`?n * ?m`) stay `Unknown`.
+///
+/// The seam is sized so an SMT backend (Z3/CVC class) can slot in later
+/// behind the same signature — e.g. as an `OpHandler`/service
+/// implementation swapped at this one static, with no call-site changes
+/// in `unify_index`/`dep_unify`. Not built here.
+trait IndexSolver {
+    /// Prove `a ≡ b` on index terms, else decide/stay unknown.
+    fn prove(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> IndexVerdict;
+}
+
+/// The built-in solver: ring-normalized terms first (identity through
+/// [`eval_index`]), metas solve, numerals compare, open terms go through
+/// the linear/division/root fragment in [`solve_index`].
+struct BuiltinIndexSolver;
+
+impl IndexSolver for BuiltinIndexSolver {
+    fn prove(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> IndexVerdict {
+        let ea = eval_index(a, ctx);
+        let eb = eval_index(b, ctx);
+        // Ring normal forms: `n+m ≡ m+n`, `2*n ≡ n*2`, `n*(m+k) ≡ n*m+n*k`
+        // hold by normalization *before* any meta-solving.
+        if ea == eb {
+            return IndexVerdict::Proven;
+        }
+        if let Some(id) = extract_meta_id(&ea) {
+            ctx.solve_meta(id, eb);
+            return IndexVerdict::Proven;
+        }
+        if let Some(id) = extract_meta_id(&eb) {
+            ctx.solve_meta(id, ea);
+            return IndexVerdict::Proven;
+        }
+        for (target, term) in [(num_val(&eb), &ea), (num_val(&ea), &eb)] {
+            if let Some(t) = target {
+                if t.fract() == 0.0 {
+                    return match solve_index(term, t as i64, ctx) {
+                        Solve::Ok => IndexVerdict::Proven,
+                        Solve::Decided => IndexVerdict::Disproven,
+                        Solve::Stuck => IndexVerdict::Unknown,
+                    };
+                }
+            }
+        }
+        IndexVerdict::Unknown
+    }
+}
+
+/// The solver the `conv` path uses. Swap this static for an SMT-backed
+/// `IndexSolver` when one lands — call sites stay unchanged.
+static INDEX_SOLVER: BuiltinIndexSolver = BuiltinIndexSolver;
+
 /// Index-term unification: `a ≡ b` — metas solve, rigids bind through
-/// `results`, closed terms compare, open `Bin`s go through
-/// [`solve_index`]. Returns `(ok, decided_failure)`.
+/// `results`, closed terms compare, open `Bin`s go through the bounded
+/// [`IndexSolver`]. Returns `(ok, decided_failure)`.
 fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool) {
     let ea = eval_index(a, ctx);
     let eb = eval_index(b, ctx);
@@ -622,26 +999,11 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         }
         return (false, false);
     }
-    let (an, bn) = (num_val(&ea), num_val(&eb));
-    if let Some(t) = bn {
-        if t.fract() == 0.0 {
-            return match solve_index(&ea, t as i64, ctx) {
-                Solve::Ok => (true, false),
-                Solve::Decided => (false, true),
-                Solve::Stuck => (false, false),
-            };
-        }
+    match INDEX_SOLVER.prove(&ea, &eb, ctx) {
+        IndexVerdict::Proven => (true, false),
+        IndexVerdict::Disproven => (false, true),
+        IndexVerdict::Unknown => (false, false),
     }
-    if let Some(t) = an {
-        if t.fract() == 0.0 {
-            return match solve_index(&eb, t as i64, ctx) {
-                Solve::Ok => (true, false),
-                Solve::Decided => (false, true),
-                Solve::Stuck => (false, false),
-            };
-        }
-    }
-    (false, false)
 }
 
 /// A dependent `match` motive: either the explicit `return … with` AST
@@ -5196,4 +5558,187 @@ fn signature_name(ast: &Ast, node: &AstNode) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Ring-normalization + solver tests (phase-2 WS-D)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod index_solver_tests {
+    use super::*;
+
+    fn ctx() -> TypecheckContext {
+        TypecheckContext::new("handl.canonical", HashMap::new())
+    }
+
+    fn var(n: &str) -> Value {
+        var_term(n)
+    }
+    fn add(l: Value, r: Value) -> Value {
+        bin_term("binary.add", l, r)
+    }
+    fn sub(l: Value, r: Value) -> Value {
+        bin_term("binary.sub", l, r)
+    }
+    fn mul(l: Value, r: Value) -> Value {
+        bin_term("binary.mul", l, r)
+    }
+    fn num(x: i64) -> Value {
+        Value::from(x)
+    }
+
+    #[test]
+    fn ring_unit_identities() {
+        let c = ctx();
+        // n+0 → n, 0+n → n, n*1 → n, 1*n → n, n*0 → 0
+        assert_eq!(eval_index(&add(var("n"), num(0)), &c), var("n"));
+        assert_eq!(eval_index(&add(num(0), var("n")), &c), var("n"));
+        assert_eq!(eval_index(&mul(var("n"), num(1)), &c), var("n"));
+        assert_eq!(eval_index(&mul(num(1), var("n")), &c), var("n"));
+        assert_eq!(eval_index(&mul(var("n"), num(0)), &c), num(0));
+        // nested: (n - 1) + 1 → n
+        assert_eq!(
+            eval_index(&add(sub(var("n"), num(1)), num(1)), &c),
+            var("n")
+        );
+    }
+
+    #[test]
+    fn ring_sort_collect_and_distribute() {
+        let c = ctx();
+        // Commutativity: n+m ≡ m+n — same normal form.
+        assert_eq!(
+            eval_index(&add(var("n"), var("m")), &c),
+            eval_index(&add(var("m"), var("n")), &c)
+        );
+        // Collect like terms: a+b+a → a*2+b.
+        assert_eq!(
+            eval_index(&add(add(var("a"), var("b")), var("a")), &c),
+            add(mul(var("a"), Value::from(2.0)), var("b"))
+        );
+        // Distribution: n*(m+k) → n*m + n*k.
+        assert_eq!(
+            eval_index(&mul(var("n"), add(var("m"), var("k"))), &c),
+            eval_index(
+                &add(mul(var("n"), var("m")), mul(var("n"), var("k"))),
+                &c
+            )
+        );
+        // Constant pooling: (n + 2) + 3 → n + 5.
+        assert_eq!(
+            eval_index(&add(add(var("n"), num(2)), num(3)), &c),
+            add(var("n"), Value::from(5.0))
+        );
+    }
+
+    #[test]
+    fn conv_vec_commutes_and_doubles() {
+        let mut c = ctx();
+        // Vec(n+m) ≡ Vec(m+n) — by normalization before meta-solving.
+        assert_eq!(
+            unify_index(&add(var("n"), var("m")), &add(var("m"), var("n")), &mut c),
+            (true, false)
+        );
+        // Vec(2*n) ≡ Vec(n*2).
+        assert_eq!(
+            unify_index(&mul(num(2), var("n")), &mul(var("n"), num(2)), &mut c),
+            (true, false)
+        );
+        // Vec(n+1+0) ≡ Vec(n+1).
+        assert_eq!(
+            unify_index(
+                &add(add(var("n"), num(1)), num(0)),
+                &add(var("n"), num(1)),
+                &mut c
+            ),
+            (true, false)
+        );
+        // append-shaped: the `Vec(n,m) ~> Vec(n+m)` codomain commutes —
+        // Vec(rows+cols) ≡ Vec(cols+rows) under two rigid binders.
+        assert_eq!(
+            unify_index(
+                &add(var("rows"), var("cols")),
+                &add(var("cols"), var("rows")),
+                &mut c
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn ring_under_rigid_binders() {
+        let mut c = ctx();
+        // Rigid `var` indices bound under a Pi — `n` is scope-bound,
+        // not a meta: `n + m + 0 ≡ m + n` holds definitionally.
+        c.bind_result("n".to_string(), var("n"));
+        c.bind_result("m".to_string(), var("m"));
+        assert_eq!(
+            unify_index(
+                &add(add(var("n"), var("m")), num(0)),
+                &add(var("m"), var("n")),
+                &mut c
+            ),
+            (true, false)
+        );
+        // `var n` vs `n + 1`: the var arm reports ok without recording a
+        // cyclic `n ↦ n+1` binding (the occurs guard fires) — same as
+        // before normalization.
+        let (ok, decided) = unify_index(&var("n"), &add(var("n"), num(1)), &mut c);
+        assert!(ok);
+        assert!(!decided);
+    }
+
+    #[test]
+    fn solver_fragment_unchanged() {
+        let mut c = ctx();
+        // Linear: ?k + 3 ≡ 7 solves ?k := 4.
+        c.metas.push(None);
+        let k = meta_value(0);
+        assert_eq!(
+            unify_index(&add(k, num(3)), &num(7), &mut c),
+            (true, false)
+        );
+        assert_eq!(c.metas[0], Some(num(4)));
+        // Exact division: ?k * 3 ≡ 9 → ?k := 3; non-divisible is decided.
+        c.metas.push(None);
+        let k2 = meta_value(1);
+        assert_eq!(
+            unify_index(&mul(k2, num(3)), &num(9), &mut c),
+            (true, false)
+        );
+        c.metas.push(None);
+        let k3 = meta_value(2);
+        assert_eq!(
+            unify_index(&mul(k3, num(3)), &num(10), &mut c),
+            (false, true)
+        );
+        // Integer root: ?k * ?k ≡ 25 → ?k := 5.
+        c.metas.push(None);
+        let k4 = meta_value(3);
+        assert_eq!(
+            unify_index(&mul(k4.clone(), k4), &num(25), &mut c),
+            (true, false)
+        );
+        // Distinct numerals: decided failure.
+        assert_eq!(unify_index(&num(2), &num(5), &mut c), (false, true));
+        // Two symbolic factors stay Unknown — never silently accepted.
+        c.metas.push(None);
+        c.metas.push(None);
+        let (ok, decided) = unify_index(&mul(meta_value(4), meta_value(5)), &num(6), &mut c);
+        assert!(!ok && !decided);
+        // Solver verdicts directly.
+        assert_eq!(
+            INDEX_SOLVER.prove(&var("x"), &var("y"), &mut c),
+            IndexVerdict::Unknown
+        );
+        assert_eq!(
+            INDEX_SOLVER.prove(
+                &add(var("n"), var("m")),
+                &add(var("m"), var("n")),
+                &mut c
+            ),
+            IndexVerdict::Proven
+        );
+    }
 }
