@@ -98,16 +98,22 @@ fn typecheck_empty_ast_errors() {
 
 #[test]
 fn typecheck_no_rule_errors() {
+    // A kind with no declared type rule degrades to `type.unknown` with a
+    // warning diagnostic — it is not a transport `Err`.
     let engine = engine();
     let lang = Language::new();
     let mut ast = Ast::new();
     ast.push(AstNode::new("lit").with_payload(json!(42)));
     let req = TypecheckRequest::new(ast);
-    let err = engine.typecheck(&lang, &req).unwrap_err();
+    let result = engine
+        .typecheck(&lang, &req)
+        .expect("no-rule kind degrades to type.unknown");
     assert!(
-        matches!(err, LangError::Engine { ref message, .. } if message.contains("no type rule for kind 'lit'")),
-        "expected no-rule error, got {:?}",
-        err
+        result.diagnostics.iter().any(|d| d
+            .message
+            .contains("no type rule for kind 'lit'")),
+        "expected no-rule warning, got {:?}",
+        result.diagnostics
     );
 }
 

@@ -1098,6 +1098,24 @@ impl NbeTypecheckEngine {
                     {
                         self.instantiate_ctor_full(lang, ast, &ty, ctx)
                     }
+                    // An injected `type.unknown` global is a *placeholder*
+                    // for a wire name the source-only check cannot see —
+                    // `hnl typecheck`/`hnl run` seed the whole prelude name
+                    // set, which covers the `bool` module's `true`/`false`
+                    // value exports. It must not shadow an ambient
+                    // `lang.globals` binding whose JSON type is known
+                    // (mirroring the builtin-name precedence in
+                    // `dep_synth_var_type`). A Γ binding still wins, even
+                    // when it is itself `type.unknown` — source-level
+                    // bindings are real, not placeholders.
+                    Some(ty)
+                        if ty.get("__tag__").and_then(Value::as_str)
+                            == Some("type.unknown")
+                            && ctx.lookup_gamma(name).is_none()
+                            && lang.globals.contains_key(name) =>
+                    {
+                        self.construct_json_type(&lang.globals[name], ctx)
+                    }
                     Some(ty) => Ok(ty),
                     // `refl` — the canonical `Path` introduction (ADR-0120):
                     // it inhabits `Path(a, a)` — checking routes through
