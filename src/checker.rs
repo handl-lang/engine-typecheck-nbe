@@ -1856,8 +1856,9 @@ mod tests {
         let e = c.bind("e", hom(2, f2.clone(), f2.clone()));
         let t = c.infer(&idf(3, e.clone())).unwrap();
         assert!(c.conv(&t, &hom(3, e.clone(), e.clone())));
+        let x3 = c.bind("x3", hom(3, e.clone(), e.clone()));
         assert!(matches!(
-            c.infer(&idf(3, c.bind("x3", hom(3, e.clone(), e.clone())))),
+            c.infer(&idf(3, x3)),
             Err(TcError::Dim { .. })
         ));
         let t = c.infer(&idf(4, e.clone())).unwrap();
