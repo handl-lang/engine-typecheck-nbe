@@ -287,14 +287,16 @@ impl NbeTypecheckEngine {
         node_ref: AstRef,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
-        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let node = ast.get(node_ref).ok_or_else(|| {
             LangError::engine(format!(
                 "typecheck: node index {} out of bounds",
                 node_ref.index()
             ))
         })?;
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`). Judgment
+        // failures surface with this node's source span (`with_node`
+        // only fills an empty span, so an inner node's position wins).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let Some(rule) = lang.types.get_by_identity(&node.kind) else {
             // A kind with no declared type rule degrades to `type.unknown`
             // with a warning — the documented driver fallback (e.g.
@@ -305,7 +307,7 @@ impl NbeTypecheckEngine {
                     "typecheck: no type rule for kind '{}' — treating as type.unknown",
                     node.kind
                 ),
-                span: None,
+                span: node.span,
             });
             let typ = ctx
                 .registry
@@ -323,6 +325,7 @@ impl NbeTypecheckEngine {
         ctx.node_types.insert(node_ref.index(), typ.clone());
         Ok(typ)
         })
+        .map_err(|e: LangError| e.with_node(node))
     }
 
     /// Check a node against an expected type by interpreting the `check`
@@ -335,14 +338,16 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
-        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
-        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let node = ast.get(node_ref).ok_or_else(|| {
             LangError::engine(format!(
                 "typecheck: node index {} out of bounds",
                 node_ref.index()
             ))
         })?;
+        // Growable-stack seam (WS-H, see `STACK_RED_ZONE`). Judgment
+        // failures surface with this node's source span (`with_node`
+        // only fills an empty span, so an inner node's position wins).
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         let Some(rule) = lang.types.get_by_identity(&node.kind) else {
             // No declared rule — the synth fallback mints `type.unknown`
             // (with a warning); an unknown-typed node accepts any
@@ -404,6 +409,7 @@ impl NbeTypecheckEngine {
             Ok(())
         }
         })
+        .map_err(|e: LangError| e.with_node(node))
     }
 
     /// Interpret a type-rule [`Term`] combinator tree.
@@ -4619,8 +4625,9 @@ impl NbeTypecheckEngine {
             }
             ctx.vcheck.store_restore(mark);
             return Err(LangError::engine(format!(
-                "typecheck: cannot unify {:?} with {:?}",
-                a, b
+                "typecheck: cannot unify — expected {}, got {}",
+                dependent::display_type(b, ctx),
+                dependent::display_type(a, ctx)
             )));
         }
         // Recursive structural unification of tagged type values with the
@@ -4731,8 +4738,9 @@ impl NbeTypecheckEngine {
             }
         }
         Err(LangError::engine(format!(
-            "typecheck: cannot unify {:?} with {:?}",
-            a, b
+            "typecheck: cannot unify — expected {}, got {}",
+            dependent::display_type(b, ctx),
+            dependent::display_type(a, ctx)
         )))
         })
     }

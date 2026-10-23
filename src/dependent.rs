@@ -368,6 +368,233 @@ fn canon_bin(op: &str, l: Value, r: Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic rendering (phase-3 WS-G)
+// ---------------------------------------------------------------------------
+
+/// Render a type value for user-facing diagnostics — surface spellings
+/// like `Number ~> Bool`, `Vec(n + 1, a)`, `Type_0`, `?m4` instead of
+/// the raw `{"__tag__": …}` / `__former__` JSON payloads. Solved tagged
+/// metas are zonked first so messages show solutions, not `?m` handles.
+pub(crate) fn display_type(v: &Value, ctx: &TypecheckContext) -> String {
+    display_inner(&zonk_index(v, ctx), 0)
+}
+
+/// Recursion guard — a pathological payload (deep nesting) gets a
+/// bounded render rather than an unbounded walk.
+const DISPLAY_DEPTH: usize = 40;
+
+fn display_list(xs: &[Value], depth: usize) -> String {
+    xs.iter()
+        .map(|x| display_inner(x, depth + 1))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn display_inner(v: &Value, depth: usize) -> String {
+    if depth > DISPLAY_DEPTH {
+        return "…".to_string();
+    }
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        // Integral floats render without the `.0` (index arithmetic is
+        // computed in f64 — `n + 1`, not `n + 1.0`).
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if f.is_finite() && f.fract() == 0.0 => format!("{}", f as i64),
+            _ => n.to_string(),
+        },
+        Value::String(s) => s.clone(),
+        Value::Array(xs) => format!("[{}]", display_list(xs, depth)),
+        Value::Object(o) => {
+            if let Some(id) = extract_meta_id(v) {
+                return format!("?m{id}");
+            }
+            // `quote` spellings — domain `Val`s reified to boundary JSON.
+            if let Some(sym) = o.get("__sym__") {
+                return sym
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+            }
+            if let Some(f) = o.get("__former__") {
+                let sym = f.get("sym").unwrap_or(f);
+                let name = sym
+                    .get("__sym__")
+                    .and_then(|s| s.get("name"))
+                    .or_else(|| sym.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                return match f
+                    .get("args")
+                    .or_else(|| f.get("indices"))
+                    .and_then(Value::as_array)
+                {
+                    Some(xs) if !xs.is_empty() => {
+                        format!("{name}({})", display_list(xs, depth))
+                    }
+                    _ => name.to_string(),
+                };
+            }
+            if let Some(n) = o.get("__neutral__") {
+                let base = match n.get("head").and_then(Value::as_str) {
+                    Some("rigid") => format!(
+                        "#{}",
+                        n.get("index").and_then(Value::as_u64).unwrap_or(0)
+                    ),
+                    Some("meta") => {
+                        format!("?m{}", n.get("id").and_then(Value::as_u64).unwrap_or(0))
+                    }
+                    Some("unfold") => n
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unfold")
+                        .to_string(),
+                    other => other.unwrap_or("?").to_string(),
+                };
+                return match n.get("spine").and_then(Value::as_array) {
+                    Some(xs) if !xs.is_empty() => format!("{base}({})", display_list(xs, depth)),
+                    _ => base,
+                };
+            }
+            if let Some(i) = o.get("__type__").and_then(Value::as_u64) {
+                return format!("Type_{i}");
+            }
+            // Legacy tagged type values (`{"__tag__": …}`).
+            if let Some(tag) = tag_of(v) {
+                return display_tagged(tag, o, depth);
+            }
+            // A plain record — render fields compactly.
+            let fields = o
+                .iter()
+                .map(|(k, x)| format!("{k}: {}", display_inner(x, depth + 1)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
+        }
+    }
+}
+
+/// `type.*` tag → its user-facing name via the canonical nominal table
+/// (`type.number` → `type.Number` → `Number`); tags the table doesn't
+/// know pass through capitalized (`Path` → `Path`).
+fn display_tag_name(tag: &str) -> String {
+    let seed = checker::canonical_tag_seed(tag);
+    let name = seed.strip_prefix("type.").unwrap_or(seed);
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => name.to_string(),
+    }
+}
+
+/// Render a `{"__tag__": tag, …}` value — the checker-internal index
+/// terms (`var`/`Bin`/`Un`/`App`) get infix/prefix spellings; unknown
+/// tags fall back to `Name(field: v, …)`.
+fn display_tagged(tag: &str, o: &Map<String, Value>, depth: usize) -> String {
+    let field = |k: &str| {
+        o.get(k)
+            .map(|x| display_inner(x, depth + 1))
+            .unwrap_or_else(|| "?".to_string())
+    };
+    match tag {
+        "type.function" => {
+            let base = format!("{} ~> {}", field("param"), field("body"));
+            match o.get("effects") {
+                Some(e) => format!("{base} | {}", display_inner(e, depth + 1)),
+                None => base,
+            }
+        }
+        "type.pi" | "type.sigma" | "type.forall" | "type.vau" => {
+            let name = display_tag_name(tag);
+            let var = o
+                .get("body_closure")
+                .and_then(|b| b.get("var_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("x");
+            let param_field = if tag == "type.forall" { "kind" } else { "param" };
+            format!("{name}({var}: {})", field(param_field))
+        }
+        "type.family_app" | "type.family" => {
+            let name = o.get("name").and_then(Value::as_str).unwrap_or("?");
+            match o.get("args").and_then(Value::as_array) {
+                Some(xs) if !xs.is_empty() => format!("{name}({})", display_list(xs, depth)),
+                _ => name.to_string(),
+            }
+        }
+        "Path" => format!("Path({}, {})", field("frm"), field("to")),
+        "type.eq" => format!("Eq({}, {})", field("left"), field("right")),
+        "type.record" => {
+            let fields = o
+                .get("fields")
+                .and_then(Value::as_object)
+                .map(|fs| {
+                    fs.iter()
+                        .map(|(k, x)| format!("{k}: {}", display_inner(x, depth + 1)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            match o.get("rest") {
+                Some(r) => format!("{{{fields}, …|{}}}", display_inner(r, depth + 1)),
+                None => format!("{{{fields}}}"),
+            }
+        }
+        "type.array" => match o.get("elements").and_then(Value::as_array) {
+            Some(xs) => format!("[{}]", display_list(xs, depth)),
+            None => "Array".to_string(),
+        },
+        "type.effects" => match o.get("ops").and_then(Value::as_array) {
+            Some(xs) => format!("effects({})", display_list(xs, depth)),
+            None => "effects".to_string(),
+        },
+        "type.universe" => format!(
+            "Type_{}",
+            o.get("level").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        // Index terms.
+        "var" => o
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string(),
+        "Bin" => {
+            let sym = match o.get("op").and_then(Value::as_str) {
+                Some("binary.add") => "+",
+                Some("binary.sub") => "-",
+                Some("binary.mul") => "*",
+                Some("binary.div") => "/",
+                Some("binary.mod") => "%",
+                _ => "?",
+            };
+            format!("{} {sym} {}", field("l"), field("r"))
+        }
+        "Un" => format!("-{}", field("operand")),
+        "App" => {
+            let callee = field("callee");
+            match o.get("args").and_then(Value::as_array) {
+                Some(xs) if !xs.is_empty() => format!("{callee}({})", display_list(xs, depth)),
+                _ => callee,
+            }
+        }
+        _ => {
+            let name = display_tag_name(tag);
+            let fields = o
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__") && k.as_str() != "body_closure")
+                .map(|(k, x)| format!("{k}: {}", display_inner(x, depth + 1)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if fields.is_empty() {
+                name
+            } else {
+                format!("{name}({fields})")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `data`-declared ctor index projections (phase-3 WS-D)
 // ---------------------------------------------------------------------------
 //
@@ -2787,28 +3014,37 @@ impl NbeTypecheckEngine {
                 let nb = b.get("name").and_then(Value::as_str).unwrap_or("");
                 if na != nb {
                     return Err(LangError::engine(format!(
-                        "typecheck: cannot unify family {na} with {nb}"
+                        "typecheck: cannot unify — expected {}, got {}",
+                        display_type(b, ctx),
+                        display_type(a, ctx)
                     )));
                 }
                 let xs = a.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
                 let ys = b.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
                 if xs.len() != ys.len() {
-                    return Err(LangError::engine("typecheck: family arity mismatch".to_string()));
+                    return Err(LangError::engine(format!(
+                        "typecheck: cannot unify — expected {}, got {}",
+                        display_type(b, ctx),
+                        display_type(a, ctx)
+                    )));
                 }
                 for (x, y) in xs.iter().zip(ys.iter()) {
                     let (ok, decided) = unify_index(x, y, ctx);
                     if !ok {
                         if decided {
                             return Err(LangError::engine(format!(
-                                "typecheck: index mismatch in {na}({:?}) vs {na}({:?})",
-                                xs, ys
+                                "typecheck: cannot unify — expected {}, got {}",
+                                display_type(b, ctx),
+                                display_type(a, ctx)
                             )));
                         }
                         // Stuck indices still try the structural path
                         // (e.g. type-argument metas).
                         self.unify(x, y, ctx).map_err(|_| {
                             LangError::engine(format!(
-                                "typecheck: stuck index {x:?} vs {y:?} in {na}"
+                                "typecheck: cannot unify — expected {}, got {}",
+                                display_type(b, ctx),
+                                display_type(a, ctx)
                             ))
                         })?;
                     }
@@ -2822,11 +3058,19 @@ impl NbeTypecheckEngine {
                 let tb = b.get("to").cloned().unwrap_or(Value::Null);
                 let (ok, _) = unify_index(&fa, &fb, ctx);
                 if !ok {
-                    return Err(LangError::engine("typecheck: Path sources differ".to_string()));
+                    return Err(LangError::engine(format!(
+                        "typecheck: cannot unify Path sources — expected {}, got {}",
+                        display_type(&fb, ctx),
+                        display_type(&fa, ctx)
+                    )));
                 }
                 let (ok, _) = unify_index(&ta, &tb, ctx);
                 if !ok {
-                    return Err(LangError::engine("typecheck: Path targets differ".to_string()));
+                    return Err(LangError::engine(format!(
+                        "typecheck: cannot unify Path targets — expected {}, got {}",
+                        display_type(&tb, ctx),
+                        display_type(&ta, ctx)
+                    )));
                 }
                 Ok(())
             }
@@ -2848,7 +3092,11 @@ impl NbeTypecheckEngine {
             }
             (Some("type.function"), Some("type.family_app"))
             | (Some("type.family_app"), Some("type.function")) => Err(LangError::engine(
-                "typecheck: function is not a family member".to_string(),
+                format!(
+                    "typecheck: cannot unify — expected {}, got {}",
+                    display_type(b, ctx),
+                    display_type(a, ctx)
+                ),
             )),
             _ => {
                 // `Former{type.io}` — signature subtyping (record-width
@@ -2863,7 +3111,9 @@ impl NbeTypecheckEngine {
                     }
                     ctx.vcheck.store_restore(mark);
                     return Err(LangError::engine(format!(
-                        "typecheck: IO signature mismatch {a:?} vs {b:?}"
+                        "typecheck: cannot unify — expected {}, got {}",
+                        display_type(b, ctx),
+                        display_type(a, ctx)
                     )));
                 }
                 self.unify(a, b, ctx)
