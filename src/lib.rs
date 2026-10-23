@@ -1898,6 +1898,16 @@ impl NbeTypecheckEngine {
                 })?;
                 self.synth_export_judgment(lang, ast, node, ctx)
             }
+            "synth_handle" => {
+                // `handle <body> with <h>` (phase-2 WS-F): check `h`'s
+                // declared impls against the body's `IO(S)` op set and
+                // re-wrap the residual — covered entries take the impl's
+                // declared return, uncovered stay `IO` ops.
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_handle: node out of bounds".to_string())
+                })?;
+                self.synth_handle_judgment(lang, ast, node, ctx)
+            }
             "synth_dim_arrow" => {
                 let node = ast.get(node_ref).ok_or_else(|| {
                     LangError::engine("synth_dim_arrow: node out of bounds".to_string())

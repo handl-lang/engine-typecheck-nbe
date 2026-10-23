@@ -277,6 +277,7 @@ fn is_builtin_type_name(name: &str) -> bool {
             | "Type0"
             | "List"
             | "Family"
+            | "Sig"
             | "Pi"
             | "Sigma"
             | "Forall"
@@ -1024,9 +1025,37 @@ pub(crate) enum MatchMotive {
     },
 }
 
+/// The name a `Former{var, [n]}` value carries — the domain reification
+/// of `var_term(n)` (`domain_lift` of an index var). `IO(s)` sigs quoted
+/// into `Former{type.io}.args` carry `s` that way.
+fn former_var_name(v: &Value) -> Option<&str> {
+    let f = v.get("__former__")?;
+    let sym = f.get("sym")?;
+    let name = sym
+        .get("__sym__")
+        .and_then(|s| s.get("name"))
+        .or_else(|| sym.get("name"))
+        .and_then(Value::as_str)?;
+    if name != "var" {
+        return None;
+    }
+    f.get("args")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str)
+}
+
 /// Deep-substitute `to` for `frm` inside an index term (transport).
 fn subst_index(term: &Value, frm: &Value, to: &Value) -> Value {
     if term == frm {
+        return to.clone();
+    }
+    // `var{n}` inside a domain-encoded former — the `Former{var,[n]}`
+    // spelling the `var_term` shape lifts/round-trips to (e.g. an
+    // `IO(s)` sig var inside `Former{type.io}.args`).
+    if tag_of(frm) == Some("var")
+        && former_var_name(term) == frm.get("name").and_then(Value::as_str)
+    {
         return to.clone();
     }
     match term {
@@ -1695,6 +1724,10 @@ impl NbeTypecheckEngine {
                 ));
             }
             "Type" | "Universe" | "Type0" => "type.universe",
+            // `Sig` — the `IO(sig)` signature-record sort (a row
+            // binder's declared sort in `f{s : Sig} : … IO(s)`): an
+            // op-name → signature record, i.e. the `Obj` nominal.
+            "Sig" => "type.obj",
             "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
             _ => {
                 return Err(LangError::engine(format!(
@@ -2034,6 +2067,15 @@ impl NbeTypecheckEngine {
                     else {
                         continue;
                     };
+                    // `IO({puts})` — a bare-name child declares the op
+                    // with an unstated request (`type.unknown`).
+                    if en.kind == "var" {
+                        if let Some(k) = node_name(en) {
+                            let mut u = Map::new();
+                            m.insert(k, make_tag(ctx, "type.unknown", std::mem::take(&mut u)));
+                        }
+                        continue;
+                    }
                     if en.kind != "entry" {
                         continue;
                     }
@@ -4275,6 +4317,210 @@ impl NbeTypecheckEngine {
             };
         }
         Ok(zonk_index(&cur, ctx))
+    }
+
+    /// `synth_handle` — `handle <body> with <h>` typed-effect handler
+    /// typing (phase-2 WS-F; ADR-0153 §4 "effects are objects in the
+    /// codomain").
+    ///
+    /// The body's `IO(S)` former has its op set checked against `h`'s
+    /// declared impls, and the result re-wraps as `IO(S')` mirroring the
+    /// runtime's interpret-in-place semantics ([`engine-exec-tree-walk`]
+    /// `interpret_io_former`): each covered entry's declared type is
+    /// replaced by the impl's declared *return* type (the op is
+    /// interpreted, its result is data); each uncovered entry keeps its
+    /// declared signature (the op stays `IO` data for an outer handler
+    /// or user destructuring). The residual sig is therefore
+    /// `S'` = `(S \ S_h) ∪ {op: ret_ty}` — the spec's
+    /// `IO(S \ S_h) × results` shape.
+    ///
+    /// Coverage rules:
+    /// - `h`'s op names are its record fields (`type.record{fields}`).
+    ///   A covered impl `h_k : dom ~> ret` must accept the op's declared
+    ///   sig entry — `S[k] <: dom` — and `ret` is the result type.
+    /// - An impl `h` declares for an op `S` never names → diagnostic
+    ///   (spurious — the impl can never fire).
+    /// - `S` non-empty with `h` covering none of it → diagnostic (the
+    ///   `handle` is a guaranteed no-op — almost certainly a bug).
+    /// - `h` op-untyped (meta / `type.Obj` / `type.unknown`) or `S`
+    ///   symbolic (a sig meta/var — row-polymorphic `IO(s)`) → the
+    ///   check is undecidable → pass through unchanged (honest bound).
+    /// - `body`'s type is `A ~> IO(S)` (a `type.function` whose codomain
+    ///   is an `IO` former) — the deep-handler case (`handle f with h`
+    ///   binds the handled arrow, runtime `attach_carried_handler`):
+    ///   the codomain's sig is checked the same way, producing
+    ///   `A ~> IO(S')`. A `type.pi` codomain (a closure) can't rewrite
+    ///   statically → passthrough.
+    pub(crate) fn synth_handle_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let target_idx = role_child_ref(lang, node, "target")
+            .or_else(|| child_at(ast, node, 0))
+            .ok_or_else(|| LangError::engine("handle: missing target child".to_string()))?;
+        let impl_idx = role_child_ref(lang, node, "impl")
+            .or_else(|| child_at(ast, node, 1))
+            .ok_or_else(|| LangError::engine("handle: missing impl child".to_string()))?;
+        let t_body = self.synth_node(lang, ast, target_idx, ctx)?;
+        let t_impl = self.synth_node(lang, ast, impl_idx, ctx)?;
+        self.handle_result_type(&t_body, &t_impl, ctx)
+    }
+
+    /// The `IO(S')` result of `handle` given the body's and handler's
+    /// types — see [`Self::synth_handle_judgment`] for the coverage
+    /// rules.
+    fn handle_result_type(
+        &self,
+        t_body: &Value,
+        t_impl: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let tb = self.zonk(t_body, ctx);
+        if io_headed(&tb) {
+            return self.handle_sig_check(&tb, t_impl, ctx);
+        }
+        if tag_of(&tb) == Some("type.function") {
+            let body = self.zonk(&tb.get("body").cloned().unwrap_or(Value::Null), ctx);
+            if io_headed(&body) {
+                let residual = self.handle_sig_check(&body, t_impl, ctx)?;
+                let mut out = tb.as_object().cloned().unwrap_or_default();
+                out.insert("body".to_string(), residual);
+                return Ok(Value::Object(out));
+            }
+        }
+        Ok(tb)
+    }
+
+    /// Compute `IO(S')` for an `IO(S)`-headed value and a handler type —
+    /// the coverage check itself.
+    fn handle_sig_check(
+        &self,
+        io_val: &Value,
+        t_impl: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        // The sig record — `{"__former__": {…, "args": [sig]}}` (the
+        // `dep_synth_type`/`quote` spelling) or the runtime-style
+        // `{"indices": [sig]}` mint (`type.IO` in lib-type).
+        let sig = io_val
+            .get("__former__")
+            .and_then(|f| f.get("args"))
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .or_else(|| {
+                io_val
+                    .get("indices")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        let sig = self.zonk(&sig, ctx);
+        let Some(sig_obj) = sig.as_object() else {
+            // `IO(⊤)` (arity-0, any sig) or a symbolic sig (a row
+            // meta/var `IO(s)` — coverage is undecidable at this use;
+            // solving happens at the arrow's call site).
+            return Ok(io_val.clone());
+        };
+        // The handler's declared op set — `type.record{fields}`.
+        let ti = self.zonk(t_impl, ctx);
+        let fields = if tag_of(&ti) == Some("type.record") {
+            ti.get("fields").and_then(Value::as_object).cloned()
+        } else {
+            None
+        };
+        let Some(fields) = fields else {
+            // `type.Obj` / meta / unknown handler — its op set is
+            // unknowable statically; the runtime still dispatches by
+            // name. Passthrough (honest bound).
+            return Ok(io_val.clone());
+        };
+        // Spurious impls — `h` declares ops the body can never perform.
+        let spurious: Vec<&String> = fields
+            .keys()
+            .filter(|k| !sig_obj.contains_key(*k))
+            .collect();
+        if !spurious.is_empty() {
+            return Err(LangError::engine(format!(
+                "typecheck: handle: handler declares impls for ops the body's sig never names: {}",
+                spurious
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let covered: Vec<&String> = sig_obj
+            .keys()
+            .filter(|k| fields.contains_key(*k))
+            .collect();
+        if !sig_obj.is_empty() && covered.is_empty() {
+            return Err(LangError::engine(format!(
+                "typecheck: handle: handler covers none of the body's declared ops ({}) — the handle is a guaranteed no-op",
+                sig_obj.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let mut out_sig = Map::new();
+        for (k, req) in sig_obj.iter() {
+            match fields.get(k) {
+                Some(it) => {
+                    // Covered — interpret in place: the entry's declared
+                    // type becomes the impl's declared return type.
+                    let it = self.zonk(it, ctx);
+                    let ret = if tag_of(&it) == Some("type.function") {
+                        let dom = it.get("param").cloned().unwrap_or(Value::Null);
+                        // `dispatch_op` feeds the sig entry's *value* to
+                        // the impl — its domain must accept the declared
+                        // sig entry.
+                        if tag_of(req) == Some("type.unknown") {
+                            // `IO({puts})`-style unstated requests: skip
+                            // the domain check, and an unsolved return
+                            // meta defaults to the request (a shared
+                            // `?m` inside the sig object can't solve in
+                            // `conv` — Const compares structurally).
+                            let body = it.get("body").cloned().unwrap_or(Value::Null);
+                            if let Some(id) = extract_meta_id(&body) {
+                                ctx.solve_meta(id, req.clone());
+                            }
+                            self.zonk(&body, ctx)
+                        } else {
+                            self.check_subtype(req, &dom, ctx).map_err(|_| {
+                                LangError::engine(format!(
+                                    "typecheck: handle: impl '{k}' domain does not accept the op's declared signature"
+                                ))
+                            })?;
+                            it.get("body").cloned().unwrap_or(Value::Null)
+                        }
+                    } else {
+                        // A non-arrow impl produces its declared type.
+                        it
+                    };
+                    out_sig.insert(k.clone(), ret);
+                }
+                None => {
+                    // Uncovered — the op request stays (still `IO` data
+                    // for an outer handler).
+                    out_sig.insert(k.clone(), req.clone());
+                }
+            }
+        }
+        // Re-wrap in the body's own spelling.
+        let mut out = io_val.as_object().cloned().unwrap_or_default();
+        if let Some(f) = out.get_mut("__former__").and_then(Value::as_object_mut) {
+            if let Some(args) = f.get_mut("args").and_then(Value::as_array_mut) {
+                if let Some(slot) = args.first_mut() {
+                    *slot = Value::Object(out_sig);
+                }
+            }
+        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut) {
+            if let Some(slot) = indices.first_mut() {
+                *slot = Value::Object(out_sig);
+            }
+        }
+        Ok(Value::Object(out))
     }
 }
 
