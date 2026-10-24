@@ -31,11 +31,11 @@ use handl_value::TaggedValue;
 use handl_value::nbe::{MetaId, Val};
 use hnl_engine_typecheck::TypecheckDiagnostic;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
-    checker, extract_meta_id, is_assign_node, meta_value, role_child_ref, NbeTypecheckEngine,
-    TypecheckContext,
+    InstanceEntry, checker, extract_meta_id, is_assign_node, meta_value, role_child_ref,
+    NbeTypecheckEngine, TypecheckContext,
 };
 
 /// Build a tagged type value `{"__tag__": tag, "__registry__": id, …fields}`.
@@ -1104,8 +1104,25 @@ enum Solve {
 /// Solve `term ≡ target` (the model's `solve_index_`): linear `X + c`,
 /// `X - c`, `c - X`; `X * c` by exact division (non-divisible is
 /// *decided*); `X * X` and `X ** k` by integer root; metas solve
-/// (occurs-guarded); anything else is stuck.
+/// (occurs-guarded); anything else is stuck — unless the
+/// nonnegativity gap decides it (see [`nonneg_gap_decides`]).
 fn solve_index(term: &Value, target: i64, ctx: &mut TypecheckContext) -> Solve {
+    match solve_index_cases(term, target, ctx) {
+        Solve::Stuck => {
+            let t = eval_index(term, ctx);
+            if nonneg_gap_decides(&t, target, ctx) {
+                Solve::Decided
+            } else {
+                Solve::Stuck
+            }
+        }
+        r => r,
+    }
+}
+
+/// The case-analysis body of [`solve_index`] — `Stuck` returns funnel
+/// through the wrapper's nonnegativity-gap check.
+fn solve_index_cases(term: &Value, target: i64, ctx: &mut TypecheckContext) -> Solve {
     let t = eval_index(term, ctx);
     if let Some(n) = num_val(&t) {
         return if n as i64 == target && n == target as f64 {
@@ -1116,6 +1133,12 @@ fn solve_index(term: &Value, target: i64, ctx: &mut TypecheckContext) -> Solve {
     }
     if let Some(id) = extract_meta_id(&t) {
         if var_occurs(&format!("__meta__{id}"), &Value::from(target)) {
+            return Solve::Decided;
+        }
+        // A `Nat`-sorted metavariable can never solve to a negative
+        // numeral — decided-unsatisfiable, not `?k := -1` (phase-3
+        // WS-C; this is what discharges `VCons: absurd` on `Vec(0)`).
+        if ctx.nonneg_metas.contains(&id) && target < 0 {
             return Solve::Decided;
         }
         ctx.solve_meta(id, Value::from(target));
@@ -1193,6 +1216,68 @@ fn solve_index(term: &Value, target: i64, ctx: &mut TypecheckContext) -> Solve {
         }
         _ => Solve::Stuck,
     }
+}
+
+/// Whether an evaluated index *atom* is known nonnegative — a literal
+/// `≥ 0`, a `Nat`-sorted metavariable (its family parameter was
+/// declared `n : Nat`), or a rigid `var` marked `Nat`-sorted by the
+/// match coverage machinery (split vars inherit their ctor-arg sort).
+/// Opaque `App`s and unknown-sorted names are honestly *not* nonneg.
+fn index_atom_nonneg(v: &Value, ctx: &TypecheckContext) -> bool {
+    if let Some(n) = num_val(v) {
+        return n >= 0.0;
+    }
+    if let Some(id) = extract_meta_id(v) {
+        return ctx.nonneg_metas.contains(&id);
+    }
+    if tag_of(v) == Some("var") {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+        return ctx.nonneg_index_vars.contains(name);
+    }
+    false
+}
+
+/// `term ≡ target` decided-unsatisfiable by the nonnegativity gap: the
+/// term's ring normal form is `c + Σ monomials` where every monomial
+/// atom is known-nonneg — all-positive coefficients bound it below by
+/// `c` (`term ≥ c > target`), all-negative bound it above
+/// (`term ≤ c < target`). This is what decides `m + 1 ≡ 0` for a
+/// `Nat`-sorted `m` — the `n ↦ Succ m` split leaf's `VNil` proof —
+/// where the pointwise linear fragment stays stuck.
+fn nonneg_gap_decides(t: &Value, target: i64, ctx: &TypecheckContext) -> bool {
+    let Some(p) = poly_of(t, 0) else {
+        return false;
+    };
+    if p.terms.is_empty() {
+        return false;
+    }
+    let all_nonneg = p
+        .terms
+        .values()
+        .all(|m| m.atoms.iter().all(|(_, a)| index_atom_nonneg(a, ctx)));
+    if !all_nonneg {
+        return false;
+    }
+    let pos = p.terms.values().all(|m| m.coeff > 0.0);
+    let neg = p.terms.values().all(|m| m.coeff < 0.0);
+    let t_f = target as f64;
+    (pos && p.constant > t_f) || (neg && p.constant < t_f)
+}
+
+/// The `var` head of an `App` index term when the head names a
+/// `data`-declared constructor — the index-level ctor-disjointness
+/// table key. Unregistered heads (`f` a bound function) stay `None`:
+/// `App{f, x}` is an honest atom, never decided against a numeral.
+fn app_ctor_name<'a>(v: &'a Value, ctx: &TypecheckContext) -> Option<&'a str> {
+    if tag_of(v) != Some("App") {
+        return None;
+    }
+    let callee = v.get("callee")?;
+    if tag_of(callee) != Some("var") {
+        return None;
+    }
+    let name = callee.get("name").and_then(Value::as_str)?;
+    ctx.ctor_family.contains_key(name).then_some(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,16 +1368,30 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         return (true, false);
     }
     if let Some(id) = extract_meta_id(&ea) {
+        // A `Nat`-sorted meta never solves to a negative numeral.
+        if ctx.nonneg_metas.contains(&id) && num_val(&eb).is_some_and(|n| n < 0.0) {
+            return (false, true);
+        }
         ctx.solve_meta(id, eb);
         return (true, false);
     }
     if let Some(id) = extract_meta_id(&eb) {
+        if ctx.nonneg_metas.contains(&id) && num_val(&ea).is_some_and(|n| n < 0.0) {
+            return (false, true);
+        }
         ctx.solve_meta(id, ea);
         return (true, false);
     }
     if tag_of(&ea) == Some("var") {
         let name = ea.get("name").and_then(Value::as_str).unwrap_or("").to_string();
         if !name.is_empty() && !var_occurs(&name, &eb) {
+            // A `Nat`-sorted rigid var cannot rewrite to a negative
+            // numeral — decided-unsatisfiable, not bound.
+            if ctx.nonneg_index_vars.contains(name.as_str())
+                && num_val(&eb).is_some_and(|n| n < 0.0)
+            {
+                return (false, true);
+            }
             ctx.bind_result(name.clone(), eb.clone());
             ctx.bind_result(format!("eq_{name}"), path_val(ea.clone(), eb));
         }
@@ -1301,14 +1400,23 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
     if tag_of(&eb) == Some("var") {
         let name = eb.get("name").and_then(Value::as_str).unwrap_or("").to_string();
         if !name.is_empty() && !var_occurs(&name, &ea) {
+            if ctx.nonneg_index_vars.contains(name.as_str())
+                && num_val(&ea).is_some_and(|n| n < 0.0)
+            {
+                return (false, true);
+            }
             ctx.bind_result(name.clone(), ea.clone());
             ctx.bind_result(format!("eq_{name}"), path_val(eb.clone(), ea));
         }
         return (true, false);
     }
     // Constructor-injective `App` heads: `C(a⃗) ≡ C(b⃗)` unifies
-    // pointwise (`Succ p ≡ Succ ?k` solves `?k := p`). Different heads or
-    // arities stay stuck, not decided.
+    // pointwise (`Succ p ≡ Succ ?k` solves `?k := p`). Two *declared*
+    // ctor heads that differ — or a declared ctor against a numeral —
+    // are decided-impossible (a `__ctor__` index value is never a
+    // numeral and two ctors never coincide); unknown heads stay
+    // honestly stuck. `Succ`/`Zero`-projected heads never reach here —
+    // `eval_index` already rewrote them to arithmetic.
     if tag_of(&ea) == Some("App") && tag_of(&eb) == Some("App") {
         if ea.get("callee") == eb.get("callee") {
             let xs = ea.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1322,8 +1430,45 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
                 }
                 return (true, false);
             }
+            // Same head, different arity — decided when the head is a
+            // declared ctor (ctor arity is fixed), stuck otherwise.
+            if app_ctor_name(&ea, ctx).is_some() {
+                return (false, true);
+            }
+            return (false, false);
+        }
+        if app_ctor_name(&ea, ctx).is_some() && app_ctor_name(&eb, ctx).is_some() {
+            return (false, true);
         }
         return (false, false);
+    }
+    if app_ctor_name(&ea, ctx).is_some() && num_val(&eb).is_some()
+        || app_ctor_name(&eb, ctx).is_some() && num_val(&ea).is_some()
+    {
+        return (false, true);
+    }
+    // Indexed-family applications (phase-3 WS-A): `F(i⃗) ≡ F(j⃗)`
+    // unifies pointwise — `type.family_app` rides in index position
+    // through instance constraints (`Eq (List a)` vs `Eq (List n)`
+    // binds `a := n`). Different nominal heads or arities are a
+    // decided mismatch — families are nominal, never accidentally
+    // equal.
+    if tag_of(&ea) == Some("type.family_app") && tag_of(&eb) == Some("type.family_app") {
+        if ea.get("name") != eb.get("name") {
+            return (false, true);
+        }
+        let xs = ea.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+        let ys = eb.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+        if xs.len() != ys.len() {
+            return (false, true);
+        }
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let (ok, _) = unify_index(x, y, ctx);
+            if !ok {
+                return (false, false);
+            }
+        }
+        return (true, false);
     }
     match INDEX_SOLVER.prove(&ea, &eb, ctx) {
         IndexVerdict::Proven => (true, false),
@@ -1348,6 +1493,258 @@ pub(crate) enum MatchMotive {
         /// `var{vars[i]}` holes.
         template: Value,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Split-tree coverage for indexed `match` (phase-3 WS-C) — data types
+// ---------------------------------------------------------------------------
+
+/// Split-tree bounds: at most this many nested index-var case-splits
+/// deep, and this many leaf probes total, per `match`. Over the bound
+/// the undecided obligation degrades to a `coverage unknown` warning —
+/// never a silent accept.
+const SPLIT_MAX_DEPTH: usize = 3;
+const SPLIT_MAX_NODES: usize = 64;
+
+/// The sort of an index term's home position — where a splittable
+/// `var` case-splits. `Nat` (declared `Nat`-shaped family or a
+/// `nat`-flagged builtin index position) splits `v ↦ 0` /
+/// `v ↦ m + 1`; `Family(G)` splits `v ↦ App{K, f⃗}` per ctor of `G`.
+#[derive(Debug, Clone)]
+enum IndexSort {
+    /// Natural-number sort — `n : Nat`.
+    Nat,
+    /// A `data`-declared family's name — its ctors are the cases.
+    Family(String),
+}
+
+/// How one match arm participates in coverage.
+#[derive(Debug)]
+enum ArmCover {
+    /// `C(p⃗)`/`C` where `C` is a ctor of the scrutinee's family.
+    Ctor(String),
+    /// `_` or a binding pattern — covers every ctor.
+    Catchall,
+    /// `absurd` — discharges a decided-impossible ctor; covers none.
+    Absurd,
+    /// Any other shape (literal, sequence, foreign ctor) — covers
+    /// no ctor of this family.
+    Other,
+}
+
+/// A ctor's reachability at one split-tree leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtorStatus {
+    /// Index equations unify under the leaf substitution.
+    Possible,
+    /// Decided-unsatisfiable — cannot occur here.
+    Impossible,
+    /// Stuck — a split deeper may still decide it.
+    Undecided,
+}
+
+/// Mutable state for one match's bounded split-tree traversal.
+struct CoverRun {
+    /// Leaf nodes visited (bounded by [`SPLIT_MAX_NODES`]).
+    nodes: usize,
+    /// Fresh split-var counter (`__split_<n>` names).
+    fresh: usize,
+    /// `var` → declared index sort, including split-introduced vars.
+    sorts: HashMap<String, IndexSort>,
+    /// `(ctor, witness path)` — reachable-but-uncovered, first leaf.
+    uncovered: Vec<(String, String)>,
+    /// Ctors that stayed undecided-uncovered at a final leaf.
+    warned: HashSet<String>,
+    /// A leaf hit a split bound (depth or nodes).
+    bound_hit: bool,
+}
+
+/// The `var` head of a match arm pattern and its bound field names —
+/// `var`/`call` pattern shapes only; `None` head for `_` and
+/// non-ctor-shaped patterns.
+fn match_pattern_head(ast: &Ast, pattern: &AstNode) -> (Option<String>, Vec<String>) {
+    match pattern.kind.as_str() {
+        "var" => {
+            let n = node_name(pattern).unwrap_or_default();
+            if n == "_" {
+                (None, vec![])
+            } else {
+                (Some(n), vec![])
+            }
+        }
+        "call" => {
+            let pk = children_of(pattern).cloned().unwrap_or_default();
+            let cname = pk
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                .and_then(|n| {
+                    if n.kind == "var" {
+                        node_name(n)
+                    } else {
+                        None
+                    }
+                });
+            let names: Vec<String> = pk
+                .iter()
+                .skip(1)
+                .filter_map(Value::as_u64)
+                .filter_map(|i| {
+                    ast.get(AstRef::new(i as usize))
+                        .and_then(|n| (n.kind == "var").then(|| node_name(n))?)
+                })
+                .collect();
+            (cname, names)
+        }
+        _ => (None, vec![]),
+    }
+}
+
+/// Collect the `var` names occurring in an evaluated index term.
+fn collect_index_vars(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+    if tag_of(v) == Some("var") {
+        if let Some(n) = v.get("name").and_then(Value::as_str) {
+            out.insert(n.to_string());
+        }
+        return;
+    }
+    match v {
+        Value::Object(m) => m.values().for_each(|x| collect_index_vars(x, out)),
+        Value::Array(xs) => xs.iter().for_each(|x| collect_index_vars(x, out)),
+        _ => {}
+    }
+}
+
+/// Whether an index-projection template is the successor shape —
+/// `hole + k` or `k + hole` with `k > 0` — as minted by `synth_data`
+/// for a unary same-family ctor (`Succ ↦ λx. x + 1`).
+fn proj_is_successor(t: &Value) -> bool {
+    if tag_of(t) != Some("Bin") || t.get("op").and_then(Value::as_str) != Some("binary.add") {
+        return false;
+    }
+    let is_hole = |v: &Value| {
+        tag_of(v) == Some("var")
+            && v.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.starts_with(CTOR_PROJ_HOLE))
+    };
+    let l = t.get("l").unwrap_or(&Value::Null);
+    let r = t.get("r").unwrap_or(&Value::Null);
+    (is_hole(l) && num_val(r).is_some_and(|n| n > 0.0))
+        || (is_hole(r) && num_val(l).is_some_and(|n| n > 0.0))
+}
+
+/// Whether `g`'s ctor set is fully index-projected as naturals — every
+/// ctor carries a `CtorProj` that is either a nonneg numeral (the bare
+/// base) or a successor step. `data Nat :: Zero | Succ(pred : Nat)` is
+/// the exemplar; the test reads declared metadata, never the name.
+fn nat_shaped_family(g: &str, ctx: &TypecheckContext) -> bool {
+    let Some(ctors) = ctx.family_ctors.get(g) else {
+        return false;
+    };
+    !ctors.is_empty()
+        && ctors.iter().all(|c| {
+            ctx.ctor_proj.get(c).is_some_and(|p| match p.arity {
+                0 => num_val(&p.template).is_some_and(|n| n >= 0.0),
+                _ => proj_is_successor(&p.template),
+            })
+        })
+}
+
+/// Whether a sort marks its vars nonnegative (`Nat` outright, or a
+/// declared family whose ctors all project as naturals).
+fn index_sort_nonneg(sort: &IndexSort, ctx: &TypecheckContext) -> bool {
+    match sort {
+        IndexSort::Nat => true,
+        IndexSort::Family(g) => nat_shaped_family(g, ctx),
+    }
+}
+
+/// The declared-index-sort descriptor for one `type.family` position:
+/// the position's evaluated sort value + the family's `nat` flag (the
+/// `n : Nat` annotation convention — needed because `Nat` evaluates to
+/// `type.number` when no `data Nat` shadows it).
+fn position_index_sort(
+    elem: Option<&Value>,
+    nat_flag: bool,
+    ctx: &TypecheckContext,
+) -> Option<IndexSort> {
+    let e = elem?;
+    match tag_of(e) {
+        Some("type.family_app") | Some("type.family") => {
+            let name = e.get("name").and_then(Value::as_str)?;
+            ctx.family_ctors
+                .contains_key(name)
+                .then(|| IndexSort::Family(name.to_string()))
+        }
+        Some("type.number") => nat_flag.then_some(IndexSort::Nat),
+        _ => None,
+    }
+}
+
+/// The sort of a fresh split var for ctor arg `i` — the arg's
+/// instantiated domain when it names a declared family, else the
+/// `arg : Nat` annotation convention on the raw `type.number` sort.
+fn ctor_arg_index_sort(
+    domain: &Value,
+    arg_node: Option<&AstNode>,
+    ctx: &TypecheckContext,
+) -> Option<IndexSort> {
+    match tag_of(domain) {
+        Some("type.family_app") | Some("type.family") => {
+            let name = domain.get("name").and_then(Value::as_str)?;
+            ctx.family_ctors
+                .contains_key(name)
+                .then(|| IndexSort::Family(name.to_string()))
+        }
+        Some("type.number") => arg_node
+            .and_then(node_name)
+            .is_some_and(|n| n == "Nat")
+            .then_some(IndexSort::Nat),
+        _ => None,
+    }
+}
+
+/// Whether the arms cover `ctor` — a `C`-headed non-absurd arm, or any
+/// catchall.
+fn arm_covers(arms: &[ArmCover], ctor: &str) -> bool {
+    arms.iter().any(|a| match a {
+        ArmCover::Ctor(c) => c == ctor,
+        ArmCover::Catchall => true,
+        _ => false,
+    })
+}
+
+/// Pick the split var: a `var` occurring in an undecided scrutinee
+/// index position whose sort the census knows how to case-split.
+/// Deterministic (sorted by name) for reproducible diagnostics.
+fn pick_split_var(
+    eargs: &[Value],
+    undecided_positions: &[usize],
+    sorts: &HashMap<String, IndexSort>,
+) -> Option<(String, IndexSort)> {
+    let mut vars = std::collections::BTreeSet::new();
+    for &i in undecided_positions {
+        if let Some(t) = eargs.get(i) {
+            collect_index_vars(t, &mut vars);
+        }
+    }
+    vars.into_iter()
+        .find_map(|v| sorts.get(&v).map(|s| (v, s.clone())))
+}
+
+/// Render a leaf's accumulated substitution for diagnostics —
+/// `n ↦ 0, m ↦ k + 1`-style context on the non-exhaustive error.
+fn render_split_path(path: &[(String, String)]) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let s = path
+        .iter()
+        .map(|(v, t)| format!("{v} ↦ {t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" under {s}")
 }
 
 /// The name a `Former{var, [n]}` value carries — the domain reification
@@ -2015,8 +2412,19 @@ impl NbeTypecheckEngine {
                         .and_then(Value::as_array)
                         .map(|e| e.len())
                         .unwrap_or(0);
+                    let nat_flags = ctx
+                        .family_param_nat
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default();
                     let args: Vec<Value> = (0..n)
-                        .map(|_| meta_value(ctx.fresh_meta()))
+                        .map(|i| {
+                            let id = ctx.fresh_meta();
+                            if nat_flags.get(i).copied().unwrap_or(false) {
+                                ctx.nonneg_metas.insert(id);
+                            }
+                            meta_value(id)
+                        })
                         .collect();
                     let mut m = Map::new();
                     m.insert("name".to_string(), Value::String(name.to_string()));
@@ -2665,7 +3073,25 @@ impl NbeTypecheckEngine {
                 let mut base_m = Map::new();
                 base_m.insert("elements".to_string(), Value::Array(vec![]));
                 m.insert("base".to_string(), make_tag(ctx, "type.array", base_m));
-                ctx.extend(name, make_tag(ctx, "type.family", m));
+                ctx.extend(name.clone(), make_tag(ctx, "type.family", m));
+                // WS-C census: the ctor names are declared even though
+                // no `ctor_sig` telescopes exist on this path — a probe
+                // that can't instantiate stays honestly undecided.
+                let names: Vec<String> = node
+                    .payload
+                    .get("constructors")
+                    .and_then(Value::as_array)
+                    .map(|cs| {
+                        cs.iter()
+                            .filter_map(|c| c.get("name").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for c in &names {
+                    ctx.ctor_family.insert(c.clone(), name.clone());
+                }
+                ctx.family_ctors.insert(name.clone(), names);
             }
             let mut m = Map::new();
             return Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)));
@@ -2730,6 +3156,26 @@ impl NbeTypecheckEngine {
                 "bare": c.bare,
             });
             ctx.extend(c.name.clone(), sig);
+        }
+        // WS-C coverage census: the family's ctor list + the reverse
+        // ctor → family table (index-level ctor disjointness reads it),
+        // plus the per-parameter `nat` flags the `type.family` value's
+        // evaluated `base.elements` can no longer see (`Nat` lands as
+        // `type.number`).
+        ctx.family_ctors.insert(
+            name.clone(),
+            ctors
+                .iter()
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty())
+                .collect(),
+        );
+        ctx.family_param_nat
+            .insert(name.clone(), params.iter().map(|p| p.nat).collect());
+        for c in &ctors {
+            if !c.name.is_empty() {
+                ctx.ctor_family.insert(c.name.clone(), name.clone());
+            }
         }
         // Index projections (phase-3 WS-D): a unary ctor `S(arg : F)`
         // building `F` declares successor arithmetic — index-level
@@ -2826,6 +3272,9 @@ impl NbeTypecheckEngine {
         for p in &params {
             let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
             let id = ctx.fresh_meta();
+            if p.get("nat").and_then(Value::as_bool).unwrap_or(false) {
+                ctx.nonneg_metas.insert(id);
+            }
             let mv = meta_value(id);
             if !pname.is_empty() {
                 ctx.extend(pname.to_string(), mv.clone());
@@ -2872,6 +3321,9 @@ impl NbeTypecheckEngine {
         for p in &params {
             let pname = p.get("name").and_then(Value::as_str).unwrap_or("").to_string();
             let id = ctx.fresh_meta();
+            if p.get("nat").and_then(Value::as_bool).unwrap_or(false) {
+                ctx.nonneg_metas.insert(id);
+            }
             let mv = meta_value(id);
             if !pname.is_empty() {
                 ctx.extend(pname.clone(), mv.clone());
@@ -2951,6 +3403,408 @@ impl NbeTypecheckEngine {
         Ok(ty)
     }
 
+    // -----------------------------------------------------------------------
+    // Split-tree coverage for indexed `match` (phase-3 WS-C)
+    // -----------------------------------------------------------------------
+    //
+    // Per-arm index unification decides *this arm is impossible*; it says
+    // nothing about the cases no arm mentions. Coverage computes the
+    // Kőszegi-style split tree: at each leaf, every ctor of the
+    // scrutinee's family is {possible | impossible | undecided} against
+    // the leaf's refined index substitution — an undecided ctor with no
+    // covering arm triggers a case-split on a splittable index `var`
+    // (`n ↦ 0` / `n ↦ m + 1` for a `Nat` sort, `n ↦ App{K, f⃗}` per ctor
+    // for a declared index family), recursing until every leaf decides
+    // or the bound runs out. A decided-reachable ctor with no arm is a
+    // non-exhaustive error; a ctor still undecided at a final leaf is a
+    // `coverage unknown` warning — bounded, never silent (decision 4b).
+    //
+    // Scope: single-scrutinee matches on `type.family_app` scrutinees
+    // whose family was `data`-declared (the `family_ctors` census).
+    // Nested/multi-scrutinee patterns are not split — the bound is the
+    // honest cut.
+
+    /// Probe one ctor at the current leaf: instantiate its signature
+    /// under a full ctx snapshot and unify each result index against
+    /// the leaf's scrutinee indices. Returns the status plus the
+    /// scrutinee positions whose equations stayed undecided (the split
+    /// candidates live there).
+    fn ctor_leaf_status(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        ctor_name: &str,
+        family: &str,
+        eargs: &[Value],
+        ctx: &mut TypecheckContext,
+    ) -> (CtorStatus, Vec<usize>) {
+        let Some(sig) = ctx
+            .lookup(ctor_name)
+            .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+            .cloned()
+        else {
+            // Declared in the census but no telescope to instantiate —
+            // honestly undecidable.
+            return (CtorStatus::Undecided, Vec::new());
+        };
+        // A probe is pure speculation: snapshot every mutable channel
+        // the instantiation/unification can touch.
+        let mark = ctx.mark();
+        let saved_results = ctx.results.clone();
+        let saved_metas = ctx.metas.clone();
+        let diag_len = ctx.diagnostics.len();
+        let mut status = CtorStatus::Possible;
+        let mut undecided: Vec<usize> = Vec::new();
+        match self.instantiate_ctor_full(lang, ast, &sig, ctx) {
+            Ok(inst) => {
+                let (_doms, res) = self.peel_ctor(&inst);
+                if tag_of(&res) == Some("type.family_app")
+                    && res.get("name").and_then(Value::as_str) == Some(family)
+                {
+                    let c_args = res
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (i, (s, c)) in eargs.iter().zip(c_args.iter()).enumerate() {
+                        let (ok, decided) = unify_index(s, c, ctx);
+                        if !ok {
+                            if decided {
+                                status = CtorStatus::Impossible;
+                                break;
+                            }
+                            status = CtorStatus::Undecided;
+                            undecided.push(i);
+                        }
+                    }
+                } else {
+                    // The ctor's result names another family — it cannot
+                    // produce this scrutinee.
+                    status = CtorStatus::Impossible;
+                }
+            }
+            Err(_) => status = CtorStatus::Undecided,
+        }
+        ctx.restore(mark);
+        ctx.results = saved_results;
+        ctx.metas = saved_metas;
+        ctx.diagnostics.truncate(diag_len);
+        (status, undecided)
+    }
+
+    /// The split children of index var `v`'s sort: `Nat` gives `v ↦ 0`
+    /// and `v ↦ m + 1`; a declared family gives `v ↦ App{K, f⃗}` per
+    /// ctor (the index term `eval_index` then projects, e.g.
+    /// `App{Succ, m} ↦ m + 1`). Each child carries the fresh vars it
+    /// introduced with their own index sorts for deeper splits.
+    fn split_branches(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        sort: &IndexSort,
+        run: &mut CoverRun,
+        ctx: &mut TypecheckContext,
+    ) -> Vec<(Value, String, Vec<(String, IndexSort)>)> {
+        match sort {
+            IndexSort::Nat => {
+                let m = format!("__split_{}", run.fresh);
+                run.fresh += 1;
+                vec![
+                    (Value::from(0), "0".to_string(), Vec::new()),
+                    (
+                        bin_term("binary.add", var_term(&m), Value::from(1)),
+                        format!("{m} + 1"),
+                        vec![(m, IndexSort::Nat)],
+                    ),
+                ]
+            }
+            IndexSort::Family(g) => {
+                let Some(ctors) = ctx.family_ctors.get(g).cloned() else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                for k in &ctors {
+                    let Some(sig) = ctx
+                        .lookup(k)
+                        .cloned()
+                        .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+                    else {
+                        continue;
+                    };
+                    let Ok(inst) = self.instantiate_ctor_full(lang, ast, &sig, ctx) else {
+                        continue;
+                    };
+                    let (doms, _res) = self.peel_ctor(&inst);
+                    let arg_nodes: Vec<Option<usize>> = sig
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .map(|xs| {
+                            xs.iter()
+                                .map(|a| {
+                                    a.get("node").and_then(Value::as_u64).map(|n| n as usize)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut fresh: Vec<(String, IndexSort)> = Vec::new();
+                    let mut args = Vec::with_capacity(doms.len());
+                    for (i, (_pname, dom)) in doms.iter().enumerate() {
+                        let fv = format!("__split_{}", run.fresh);
+                        run.fresh += 1;
+                        let arg_node = arg_nodes
+                            .get(i)
+                            .and_then(|o| *o)
+                            .and_then(|ix| ast.get(AstRef::new(ix)));
+                        if let Some(s) = ctor_arg_index_sort(dom, arg_node, ctx) {
+                            fresh.push((fv.clone(), s));
+                        }
+                        args.push(var_term(&fv));
+                    }
+                    out.push((app_term(var_term(k), args), k.clone(), fresh));
+                }
+                out
+            }
+        }
+    }
+
+    /// One leaf of the split tree: probe every ctor against the
+    /// scrutinee indices as the accumulated substitution evaluates
+    /// them, record reachable-but-uncovered errors, and case-split a
+    /// splittable index var while an undecided-uncovered ctor remains
+    /// and the bounds allow it. Over-bound leaves warn `coverage
+    /// unknown` — never a silent accept (decision 4b).
+    #[allow(clippy::too_many_arguments)]
+    fn cover_split_tree(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        family: &str,
+        s_args: &[Value],
+        ctors: &[String],
+        arms: &[ArmCover],
+        ctx: &mut TypecheckContext,
+        run: &mut CoverRun,
+        path: &mut Vec<(String, String)>,
+        depth: usize,
+    ) {
+        run.nodes += 1;
+        let eargs: Vec<Value> = s_args.iter().map(|a| eval_index(a, ctx)).collect();
+        let mut undecided_positions: Vec<usize> = Vec::new();
+        let mut open_ctors: Vec<String> = Vec::new();
+        for cname in ctors {
+            let (status, upos) = self.ctor_leaf_status(lang, ast, cname, family, &eargs, ctx);
+            match status {
+                CtorStatus::Possible => {
+                    if !arm_covers(arms, cname)
+                        && !run.uncovered.iter().any(|(c, _)| c == cname)
+                    {
+                        run.uncovered
+                            .push((cname.clone(), render_split_path(path)));
+                    }
+                }
+                CtorStatus::Undecided => {
+                    undecided_positions.extend(upos);
+                    if !arm_covers(arms, cname) {
+                        open_ctors.push(cname.clone());
+                    }
+                }
+                CtorStatus::Impossible => {}
+            }
+        }
+        if open_ctors.is_empty() {
+            return;
+        }
+        let split = pick_split_var(&eargs, &undecided_positions, &run.sorts);
+        let Some((vname, sort)) = split else {
+            for c in open_ctors {
+                run.warned.insert(c);
+            }
+            return;
+        };
+        if depth >= SPLIT_MAX_DEPTH || run.nodes + 1 > SPLIT_MAX_NODES {
+            run.bound_hit = true;
+            for c in open_ctors {
+                run.warned.insert(c);
+            }
+            return;
+        }
+        let branches = self.split_branches(lang, ast, &sort, run, ctx);
+        if branches.is_empty() || run.nodes + branches.len() > SPLIT_MAX_NODES {
+            run.bound_hit = true;
+            for c in open_ctors {
+                run.warned.insert(c);
+            }
+            return;
+        }
+        for (term, desc, fresh) in branches {
+            let saved_results = ctx.results.clone();
+            let saved_metas = ctx.metas.clone();
+            ctx.bind_result(vname.clone(), term);
+            path.push((vname.clone(), desc));
+            for (fv, fs) in &fresh {
+                run.sorts.insert(fv.clone(), fs.clone());
+                if index_sort_nonneg(fs, ctx) {
+                    ctx.nonneg_index_vars.insert(fv.clone());
+                }
+            }
+            self.cover_split_tree(
+                lang, ast, node, family, s_args, ctors, arms, ctx, run, path,
+                depth + 1,
+            );
+            path.pop();
+            ctx.results = saved_results;
+            ctx.metas = saved_metas;
+            for (fv, _) in &fresh {
+                run.sorts.remove(fv);
+                ctx.nonneg_index_vars.remove(fv);
+            }
+        }
+    }
+
+    /// Drive split-tree coverage for a `match` on a `data`-declared
+    /// family scrutinee. Errors on a decided-reachable ctor with no
+    /// covering arm (`non-exhaustive`); warns `coverage unknown` per
+    /// ctor still undecided at a final leaf.
+    #[allow(clippy::too_many_arguments)]
+    fn match_coverage(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        family: &str,
+        s_args: &[Value],
+        arms: &[ArmCover],
+        index_sorts: HashMap<String, IndexSort>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let Some(ctors) = ctx.family_ctors.get(family).cloned() else {
+            return Ok(());
+        };
+        if ctors.is_empty() {
+            return Ok(());
+        }
+        let mut run = CoverRun {
+            nodes: 0,
+            fresh: 0,
+            sorts: index_sorts,
+            uncovered: Vec::new(),
+            warned: HashSet::new(),
+            bound_hit: false,
+        };
+        let mut path = Vec::new();
+        self.cover_split_tree(
+            lang, ast, node, family, s_args, &ctors, arms, ctx, &mut run, &mut path, 0,
+        );
+        if !run.uncovered.is_empty() {
+            let names = run
+                .uncovered
+                .iter()
+                .map(|(c, _)| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let witness = run
+                .uncovered
+                .first()
+                .map(|(_, w)| w.clone())
+                .unwrap_or_default();
+            let (plural, pronoun) = if run.uncovered.len() == 1 {
+                ("", "it")
+            } else {
+                ("s", "them")
+            };
+            return Err(LangError::engine_node(
+                format!(
+                    "match: non-exhaustive — constructor{plural} {names} can occur{witness} \
+                     but no arm covers {pronoun}"
+                ),
+                node,
+            ));
+        }
+        for c in &run.warned {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: format!(
+                    "match: coverage unknown — cannot decide whether constructor `{c}` \
+                     is reachable{}",
+                    if run.bound_hit {
+                        " (split bound reached)"
+                    } else {
+                        ""
+                    }
+                ),
+                span: node.span,
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve the scrutinee's declared family and raw index args for
+    /// coverage: `type.family_app{name, args}` direct, `type.family`
+    /// as the arity-0 spelling. Returns `None` for non-family
+    /// scrutinees — they get no coverage pass.
+    fn match_scrutinee_family(
+        &self,
+        scrutinee_type: &Value,
+    ) -> Option<(String, Vec<Value>)> {
+        match tag_of(scrutinee_type) {
+            Some("type.family_app") => Some((
+                scrutinee_type
+                    .get("name")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                scrutinee_type
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            )),
+            Some("type.family") => Some((
+                scrutinee_type
+                    .get("name")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                Vec::new(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Per-index-position split sorts for `family`: the family's
+    /// `base.elements` sorts crossed with its `nat` flags.
+    fn family_index_sorts(
+        &self,
+        family: &str,
+        scrutinee_type: &Value,
+        ctx: &TypecheckContext,
+    ) -> Vec<Option<IndexSort>> {
+        let fam = if tag_of(scrutinee_type) == Some("type.family") {
+            scrutinee_type.clone()
+        } else {
+            ctx.lookup(family).cloned().unwrap_or(Value::Null)
+        };
+        let Some(elems) = fam
+            .get("base")
+            .and_then(|b| b.get("elements"))
+            .and_then(Value::as_array)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let flags = ctx.family_param_nat.get(family).cloned().unwrap_or_default();
+        elems
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                position_index_sort(
+                    Some(e),
+                    flags.get(i).copied().unwrap_or(false),
+                    ctx,
+                )
+            })
+            .collect()
+    }
+
     /// Peel an instantiated ctor `type.function` chain into
     /// `(domains, family_app_result)`.
     fn peel_ctor(&self, ty: &Value) -> (Vec<(Value, Value)>, Value) {
@@ -2965,9 +3819,321 @@ impl NbeTypecheckEngine {
         (domains, cur)
     }
 
-    /// Dependent `unify`: `family_app` indices through [`unify_index`],
-    /// `Path` endpoints the same, everything else the structural
-    /// `unify`.
+    // -----------------------------------------------------------------------
+    // Instance resolution (phase-3 WS-A, ADR-0106 §11)
+    // -----------------------------------------------------------------------
+    //
+    // `instance <C(i⃗)> := <dict>` declares `dict` as the dictionary
+    // value for the constraint former application `C(i⃗)` — an algebra
+    // is an ordinary object whose `type` link is the former app, and a
+    // "trait instance" is a value you hold and pass. Implicit
+    // `type.pi` domains `C(i⃗)` whose head has registered instances are
+    // *evidence* binders: discharged by dictionary search (this table),
+    // not by a fresh index meta — the second erasure class the
+    // implicit-binder slot carries (runtime-relevant, NOT index-erased).
+
+    /// `synth_instance` — elaborate the constraint to a
+    /// `type.family_app{head, args}`, enforce coherence, check the
+    /// dictionary, bind it in Γ *at the constraint type* under a
+    /// generated name, and register `(head, args) ↦ dict-name`.
+    ///
+    /// Index variables in the constraint that name nothing bound
+    /// implicitly generalize (`instance Eq (List a)` — the generic
+    /// instance): they bind as rigid `var` terms for the elaboration,
+    /// so the registered index shape carries `var{a}` holes that
+    /// per-lookup unification instantiates. A bare `instance Eq` under
+    /// a parameterized former mints `Eq ?` — unsolved metas in the
+    /// shape are rewritten to per-instance rigid vars so a lookup can
+    /// never *solve* the registered shape itself.
+    ///
+    /// Coherence: one instance per `(head, index-shape)` — a second
+    /// registration whose index shape unifies with an existing one is
+    /// a declaration-time error (no overlap/priority — decided
+    /// policy; ordered/first-match is the deferred alternative).
+    pub(crate) fn synth_instance_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = children_of(node).ok_or_else(|| {
+            LangError::engine_node(
+                "synth_instance: instance needs [constraint, dict] children".to_string(),
+                node,
+            )
+        })?;
+        let constraint_idx = kids
+            .first()
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LangError::engine_node(
+                    "synth_instance: missing constraint child".to_string(),
+                    node,
+                )
+            })? as usize;
+        let dict_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine_node("synth_instance: missing dict child".to_string(), node)
+        })? as usize;
+        // Implicit generalization — bind the constraint's unbound
+        // index vars rigidly for the elaboration.
+        let mut gen_vars = Vec::new();
+        collect_unbound_index_vars(ast, AstRef::new(constraint_idx), ctx, &mut gen_vars);
+        let old_results = ctx.results.clone();
+        for n in &gen_vars {
+            ctx.bind_result(n.clone(), var_term(n));
+        }
+        let constraint = self
+            .dep_synth_type(lang, ast, constraint_idx, ctx)
+            .map(|c| zonk_index(&c, ctx));
+        ctx.results = old_results;
+        let constraint = constraint?;
+        let Some((head, args)) = instance_goal_parts(&constraint) else {
+            return Err(LangError::engine_node(
+                format!(
+                    "synth_instance: constraint must be a former application `C(i⃗)` — got {}",
+                    display_type(&constraint, ctx)
+                ),
+                node,
+            ));
+        };
+        // The head must name a declared former — `type.family` is how
+        // `data` registers its head; an instance for an unknown or
+        // non-former head is a declaration error, not a silently
+        // registered candidate.
+        if !ctx
+            .lookup(&head)
+            .is_some_and(|b| tag_of(b) == Some("type.family"))
+        {
+            return Err(LangError::engine_node(
+                format!(
+                    "synth_instance: `{head}` is not a declared family — an instance constraint's head must be a `data` former"
+                ),
+                node,
+            ));
+        }
+        // Arity: the constraint must apply the family's full index
+        // telescope (a bare `instance Eq` mints `Eq ?` through the
+        // family self-application — that still counts).
+        let declared_arity = ctx
+            .lookup(&head)
+            .and_then(|b| b.get("base").cloned())
+            .and_then(|b| b.get("elements").cloned())
+            .and_then(|e| e.as_array().map(|a| a.len()));
+        if let Some(n) = declared_arity {
+            if n != args.len() {
+                return Err(LangError::engine_node(
+                    format!(
+                        "synth_instance: instance constraint `{head}` takes {n} index argument(s), got {}",
+                        args.len()
+                    ),
+                    node,
+                ));
+            }
+        }
+        // Unsolved metas in the shape (the bare `instance Eq` catch-all)
+        // become per-instance rigid vars — a lookup must instantiate the
+        // *shape*, never solve the shared meta cell.
+        let inst_no = ctx.instance_count;
+        let mut arg_pos = 0usize;
+        let args: Vec<Value> = args
+            .iter()
+            .map(|a| freeze_metas(a, inst_no, &mut arg_pos))
+            .collect();
+        // Coherence — no two instances may declare unifiable index
+        // shapes for one head (decision: error at declaration time,
+        // not ordered first-match at search). The candidate list is
+        // cloned out — `unify_index`/`store_restore` borrow `ctx`
+        // mutably inside the scan.
+        if let Some(existing) = ctx.instances.get(&head).cloned() {
+            for cand in &existing {
+                if cand.args.len() != args.len() {
+                    continue;
+                }
+                let mark = ctx.store_mark();
+                let mut unifiable = true;
+                for (ca, na) in cand.args.iter().zip(args.iter()) {
+                    let (ok, _) = unify_index(ca, na, ctx);
+                    if !ok {
+                        unifiable = false;
+                        break;
+                    }
+                }
+                ctx.store_restore(mark);
+                if unifiable {
+                    return Err(LangError::engine_node(
+                        format!(
+                            "synth_instance: overlapping instance for `{}` — an instance with a unifiable index shape is already declared",
+                            display_type(&constraint, ctx)
+                        ),
+                        node,
+                    ));
+                }
+            }
+        }
+        // The dictionary is ordinary data — it must synth (a record,
+        // a ctor application, an arrow). Its *declared* type is the
+        // constraint: the instance assertion is that this value's
+        // `type` link is the former application.
+        self.synth_node(lang, ast, AstRef::new(dict_idx), ctx)?;
+        let inst_name = format!("$instance:{head}:{inst_no}");
+        ctx.instance_count += 1;
+        ctx.extend(inst_name.clone(), constraint.clone());
+        ctx.bind_result(inst_name.clone(), var_term(&inst_name));
+        ctx.instances
+            .entry(head)
+            .or_default()
+            .push(InstanceEntry {
+                name: inst_name,
+                args,
+            });
+        let mut m = Map::new();
+        Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
+    }
+
+    /// Dictionary search: the declared candidates for `head` tried in
+    /// declaration order — each candidate's index shape unifies with
+    /// the goal's through [`unify_index`] under a store mark, and a
+    /// failed candidate's meta/result side effects restore before the
+    /// next try. The first unifiable candidate wins; declaration-time
+    /// coherence makes the order observably irrelevant. Returns the
+    /// elaboration term `var{dict-name}`.
+    fn resolve_instance(
+        &self,
+        head: &str,
+        goal_args: &[Value],
+        ctx: &mut TypecheckContext,
+    ) -> Option<Value> {
+        let candidates = ctx.instances.get(head).cloned().unwrap_or_default();
+        for cand in &candidates {
+            if cand.args.len() != goal_args.len() {
+                continue;
+            }
+            let mark = ctx.store_mark();
+            let mut ok = true;
+            for (ca, ga) in cand.args.iter().zip(goal_args.iter()) {
+                let (u, _) = unify_index(ca, ga, ctx);
+                if !u {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Some(var_term(&cand.name));
+            }
+            ctx.store_restore(mark);
+        }
+        None
+    }
+
+    /// The term filling one implicit `type.pi` binder at a call site:
+    /// an implicit domain `C(i⃗)` whose head has registered instances
+    /// is *evidence* — discharged by dictionary search before the
+    /// index-meta fallback. A goal whose index args still hold
+    /// unsolved metas (the drain reaches `{eq : Eq a}` before the
+    /// explicit args solve `?a`) becomes a deferred obligation —
+    /// retried at end-of-call and at end-of-module — while a plain
+    /// meta fills the binder meanwhile.
+    fn implicit_pi_fill(
+        &self,
+        node: &AstNode,
+        param: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let goal = zonk_index(param, ctx);
+        let Some((head, args)) = instance_goal_parts(&goal) else {
+            return Ok(meta_value(ctx.fresh_meta()));
+        };
+        if !ctx.instances.contains_key(&head) {
+            return Ok(meta_value(ctx.fresh_meta()));
+        }
+        if args.iter().any(|a| has_unsolved_meta(a, ctx)) {
+            let m = ctx.fresh_meta();
+            ctx.pending_instances.push(crate::PendingInstance {
+                meta: m,
+                goal,
+                span: node.span,
+            });
+            return Ok(meta_value(m));
+        }
+        let guarded = guard_rigid_vars(&args);
+        match self.resolve_instance(&head, &guarded, ctx) {
+            Some(dict) => Ok(dict),
+            None => Err(LangError::engine_node(
+                format!(
+                    "typecheck: no instance for `{}`",
+                    display_type(&goal, ctx)
+                ),
+                node,
+            )),
+        }
+    }
+
+    /// Retry deferred evidence obligations — at the end of a call
+    /// (`final_ = false`: determined goals resolve or requeue;
+    /// underdetermined ones stay pending) and at the end of the
+    /// module (`final_ = true`: every still-open obligation is an
+    /// honest `no instance` error, never a silently unsolved
+    /// dictionary meta).
+    pub(crate) fn retry_pending_instances(
+        &self,
+        ctx: &mut TypecheckContext,
+        final_: bool,
+    ) -> Result<(), LangError> {
+        if ctx.pending_instances.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut ctx.pending_instances);
+        let mut still = Vec::new();
+        for p in pending {
+            let goal = zonk_index(&p.goal, ctx);
+            let Some((head, args)) = instance_goal_parts(&goal) else {
+                continue;
+            };
+            if args.iter().any(|a| has_unsolved_meta(a, ctx)) {
+                if final_ {
+                    let mut e = LangError::engine(format!(
+                        "typecheck: no instance for `{}` — the constraint's index is underdetermined",
+                        display_type(&goal, ctx)
+                    ));
+                    if let Some(span) = p.span {
+                        e = e.with_span(span);
+                    }
+                    return Err(e);
+                }
+                still.push(crate::PendingInstance {
+                    meta: p.meta,
+                    goal,
+                    span: p.span,
+                });
+                continue;
+            }
+            let guarded = guard_rigid_vars(&args);
+            match self.resolve_instance(&head, &guarded, ctx) {
+                Some(dict) => ctx.solve_meta(p.meta, dict),
+                None if final_ => {
+                    let mut e = LangError::engine(format!(
+                        "typecheck: no instance for `{}`",
+                        display_type(&goal, ctx)
+                    ));
+                    if let Some(span) = p.span {
+                        e = e.with_span(span);
+                    }
+                    return Err(e);
+                }
+                // Determined but unresolvable for now — a later
+                // `instance` declaration may still satisfy it; the
+                // final drain owns the error.
+                None => still.push(crate::PendingInstance {
+                    meta: p.meta,
+                    goal,
+                    span: p.span,
+                }),
+            }
+        }
+        ctx.pending_instances = still;
+        Ok(())
+    }
     pub(crate) fn dep_unify(
         &self,
         a: &Value,
@@ -3540,7 +4706,34 @@ impl NbeTypecheckEngine {
         scrutinee_type: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        // --- WS-C pre-pass: scrutinee index-var sorts + nonneg marks ---
+        // Rigid `var`s in a `Nat`-sorted index position are known
+        // nonnegative for the duration of this match — that's what lets
+        // `0 ≡ n + 1` decide `VNil` impossible on a `Vec(Succ n)`
+        // scrutinee. Scoped: restored before every return so a
+        // same-named binder elsewhere can't inherit the fact.
+        let saved_nonneg = ctx.nonneg_index_vars.clone();
+        let scrut = self.match_scrutinee_family(scrutinee_type);
+        let mut index_sorts: HashMap<String, IndexSort> = HashMap::new();
+        if let Some((fname, sargs)) = &scrut {
+            let pos_sorts = self.family_index_sorts(fname, scrutinee_type, ctx);
+            for (i, sa) in sargs.iter().enumerate() {
+                let Some(sort) = pos_sorts.get(i).cloned().flatten() else {
+                    continue;
+                };
+                let ea = eval_index(sa, ctx);
+                let mut vars = std::collections::BTreeSet::new();
+                collect_index_vars(&ea, &mut vars);
+                for v in vars {
+                    index_sorts.entry(v.clone()).or_insert_with(|| sort.clone());
+                    if index_sort_nonneg(&sort, ctx) {
+                        ctx.nonneg_index_vars.insert(v);
+                    }
+                }
+            }
+        }
         let mut arm_types: Vec<Value> = Vec::new();
+        let mut arm_covers: Vec<ArmCover> = Vec::new();
         for &arm_idx in arm_indices {
             let arm = ast.get(AstRef::new(arm_idx)).ok_or_else(|| {
                 LangError::engine(format!("match: arm {arm_idx} out of bounds"))
@@ -3571,43 +4764,42 @@ impl NbeTypecheckEngine {
             let old_results = ctx.results.clone();
 
             // Resolve the pattern to (ctor_name, arg var names).
-            let (cons_name, arg_names): (Option<String>, Vec<String>) =
-                match pattern.kind.as_str() {
-                    "var" => {
-                        let n = node_name(pattern).unwrap_or_default();
-                        if n == "_" {
-                            (None, vec![])
+            let (cons_name, arg_names) = match_pattern_head(ast, pattern);
+            // WS-C: classify the arm for the coverage pass — `absurd`
+            // covers nothing; a `var`/`call` head naming a ctor of this
+            // family covers that ctor; any other binding shape catches
+            // everything.
+            arm_covers.push(if is_absurd {
+                ArmCover::Absurd
+            } else {
+                match &cons_name {
+                    Some(n) => {
+                        let family = scrut
+                            .as_ref()
+                            .map(|(f, _)| f.as_str())
+                            .unwrap_or("");
+                        let is_own_ctor = ctx
+                            .lookup(n)
+                            .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+                            .and_then(|s| s.get("family").and_then(Value::as_str))
+                            .is_some_and(|f| f == family);
+                        if is_own_ctor {
+                            ArmCover::Ctor(n.clone())
+                        } else if ctx.ctor_family.contains_key(n.as_str()) {
+                            ArmCover::Other
                         } else {
-                            (Some(n), vec![])
+                            ArmCover::Catchall
                         }
                     }
-                    "call" => {
-                        let pk = children_of(pattern).cloned().unwrap_or_default();
-                        let cname = pk
-                            .first()
-                            .and_then(Value::as_u64)
-                            .and_then(|i| ast.get(AstRef::new(i as usize)))
-                            .and_then(|n| {
-                                if n.kind == "var" {
-                                    node_name(n)
-                                } else {
-                                    None
-                                }
-                            });
-                        let names: Vec<String> = pk
-                            .iter()
-                            .skip(1)
-                            .filter_map(Value::as_u64)
-                            .filter_map(|i| {
-                                ast.get(AstRef::new(i as usize)).and_then(|n| {
-                                    (n.kind == "var").then(|| node_name(n))?
-                                })
-                            })
-                            .collect();
-                        (cname, names)
+                    None => {
+                        if pattern.kind == "var" {
+                            ArmCover::Catchall
+                        } else {
+                            ArmCover::Other
+                        }
                     }
-                    _ => (None, vec![]),
-                };
+                }
+            });
 
             // Instantiate the ctor sig (if the pattern is a constructor).
             let ctor_inst: Option<Value> = cons_name
@@ -3798,6 +4990,24 @@ impl NbeTypecheckEngine {
             }
             ctx.results = old_results;
         }
+
+        // WS-C split-tree coverage: every ctor the scrutinee's indices
+        // leave possible must have a covering arm — decided-reachable
+        // and uncovered is a non-exhaustive error; still-undecided at a
+        // final leaf is a `coverage unknown` warning (bounded split).
+        if let Some((fname, sargs)) = &scrut {
+            self.match_coverage(
+                lang,
+                ast,
+                node,
+                fname,
+                sargs,
+                &arm_covers,
+                index_sorts,
+                ctx,
+            )?;
+        }
+        ctx.nonneg_index_vars = saved_nonneg;
 
         // Result: motive applied at the scrutinee's own indices, else the
         // arm-type join.
@@ -4638,10 +5848,12 @@ impl NbeTypecheckEngine {
                 cur = subst_index(&body, &var_term(&binder), &mv);
                 continue;
             }
-            // Implicit index binders (phase-2 WS-C `f{a, …}`): insert a
-            // fresh meta for each implicit `type.pi` before consuming an
-            // explicit argument — the same ordinary meta + unify solving
-            // index arguments already use.
+            // Implicit index binders (phase-2 WS-C `f{a, …}`): fill each
+            // implicit `type.pi` before consuming an explicit argument.
+            // Phase-3 WS-A: a domain `C(i⃗)` whose head has registered
+            // instances is *evidence* — dictionary search runs first
+            // (`implicit_pi_fill`), with the fresh-meta index fill as
+            // the fallback for ordinary index binders.
             while tag_of(&cur) == Some("type.pi")
                 && cur.get("implicit") == Some(&Value::Bool(true))
             {
@@ -4650,9 +5862,14 @@ impl NbeTypecheckEngine {
                     .and_then(Value::as_str)
                     .unwrap_or("_i")
                     .to_string();
-                let mv = meta_value(ctx.fresh_meta());
+                let param = cur
+                    .get("param")
+                    .or_else(|| cur.get("kind"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let fill = self.implicit_pi_fill(node, &param, ctx)?;
                 let body = cur.get("body").cloned().unwrap_or(Value::Null);
-                cur = subst_index(&body, &var_term(&binder), &mv);
+                cur = subst_index(&body, &var_term(&binder), &fill);
                 cur = zonk_index(&cur, ctx);
             }
             cur = match tag_of(&cur) {
@@ -4758,6 +5975,11 @@ impl NbeTypecheckEngine {
                 }
             };
         }
+        // WS-A: retry evidence obligations deferred while index metas
+        // were unsettled — the explicit arg checks may have solved
+        // them. Determined-but-unresolvable goals requeue; the
+        // end-of-module drain owns the error.
+        self.retry_pending_instances(ctx, false)?;
         Ok(zonk_index(&cur, ctx))
     }
 
@@ -5316,11 +6538,22 @@ impl NbeTypecheckEngine {
                         Some(si) => self.dep_synth_type(lang, ast, *si, ctx)?,
                         None => meta_value(ctx.fresh_meta()),
                     };
+                    // Erasure-class marker (phase-3 WS-A, ADR-0106 §11):
+                    // a former-app domain (`Eq a`) is *evidence* — the
+                    // binder is discharged by dictionary search and the
+                    // dictionary is a runtime argument (kept implicit),
+                    // unlike index binders which erase at exec. The
+                    // classification is declared data on the pi so the
+                    // exec side can read it — no ad hoc kind check.
+                    let evidence = tag_of(&param) == Some("type.family_app");
                     let mut m = Map::new();
                     m.insert("param".to_string(), param);
                     m.insert("body".to_string(), w);
                     m.insert("implicit".to_string(), Value::Bool(true));
                     m.insert("binder".to_string(), Value::String(bn.clone()));
+                    if evidence {
+                        m.insert("evidence".to_string(), Value::Bool(true));
+                    }
                     w = make_tag(ctx, "type.pi", m);
                 }
                 w
@@ -5493,6 +6726,149 @@ fn app_term(callee: Value, args: Vec<Value>) -> Value {
     m.insert("callee".to_string(), callee);
     m.insert("args".to_string(), Value::Array(args));
     Value::Object(m)
+}
+
+// ---------------------------------------------------------------------------
+// Instance-resolution helpers (phase-3 WS-A)
+// ---------------------------------------------------------------------------
+
+/// Split a constraint goal into `(head, index-args)` — a
+/// `type.family_app` or a bare `type.family` (a 0-index constraint).
+fn instance_goal_parts(v: &Value) -> Option<(String, Vec<Value>)> {
+    match tag_of(v) {
+        Some("type.family_app") => {
+            let name = v.get("name").and_then(Value::as_str)?.to_string();
+            let args = v
+                .get("args")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Some((name, args))
+        }
+        Some("type.family") => {
+            let name = v.get("name").and_then(Value::as_str)?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `v` contains an *unsolved* tagged meta leaf anywhere.
+fn has_unsolved_meta(v: &Value, ctx: &TypecheckContext) -> bool {
+    if let Some(id) = extract_meta_id(v) {
+        return ctx
+            .metas
+            .get(id as usize)
+            .and_then(|o| o.as_ref())
+            .is_none();
+    }
+    match v {
+        Value::Object(m) => m.values().any(|x| has_unsolved_meta(x, ctx)),
+        Value::Array(xs) => xs.iter().any(|x| has_unsolved_meta(x, ctx)),
+        _ => false,
+    }
+}
+
+/// Rewrite each unsolved tagged-meta leaf in `v` to a per-instance
+/// rigid `var` (`$instvar{inst}_{pos}`) — a registered instance shape
+/// must be *instantiated* per lookup, so a lookup can never solve the
+/// declaration's shared meta cell. Solved metas keep their solution.
+fn freeze_metas(v: &Value, inst: usize, pos: &mut usize) -> Value {
+    if extract_meta_id(v).is_some() {
+        *pos += 1;
+        return var_term(&format!("$instvar{inst}_{}", *pos - 1));
+    }
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| (k.clone(), freeze_metas(x, inst, pos)))
+                .collect(),
+        ),
+        Value::Array(xs) => {
+            Value::Array(xs.iter().map(|x| freeze_metas(x, inst, pos)).collect())
+        }
+        _ => v.clone(),
+    }
+}
+
+/// Guard the *goal* side of an instance lookup: wrap each rigid `var`
+/// leaf as `App{$rigid, [v]}` so `unify_index` treats it as an
+/// unforgeable atom — a rigid goal index (`Eq a` inside a polymorphic
+/// body) must not *solve* to a concrete candidate index (`Eq Nat`
+/// would bind `a := Nat` and corrupt the enclosing binder's scope).
+/// A generic candidate's own `var` holes still bind through the
+/// `var`-arm, so `instance Eq (List a)` still matches `Eq (List n)`.
+fn guard_rigid_vars(args: &[Value]) -> Vec<Value> {
+    fn go(v: &Value) -> Value {
+        if tag_of(v) == Some("var") {
+            return app_term(var_term("$rigid"), vec![v.clone()]);
+        }
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter().map(|(k, x)| (k.clone(), go(x))).collect(),
+            ),
+            Value::Array(xs) => Value::Array(xs.iter().map(go).collect()),
+            _ => v.clone(),
+        }
+    }
+    args.iter().map(go).collect()
+}
+
+/// Module-scope `Sig_m` population (phase-3 WS-A): an imported binding
+/// whose type is a `type.family_app` registers as an instance
+/// candidate under its head — the dict term is `var{name}` since the
+/// import bound the dictionary under `name` in Γ. Unchecked
+/// scope-level registration (no coherence — first-match wins); the
+/// `instance` declaration's coherence rule governs the decl path.
+fn register_imported_instance(ctx: &mut TypecheckContext, name: &str, ty: &Value) {
+    let Some((head, args)) = instance_goal_parts(ty) else {
+        return;
+    };
+    ctx.instances
+        .entry(head)
+        .or_default()
+        .push(InstanceEntry {
+            name: name.to_string(),
+            args,
+        });
+}
+
+/// Collect the `var` names in an AST subtree that bind to nothing —
+/// the instance constraint's implicit index parameters
+/// (`instance Eq (List a)` generalizes `a`). Γ/results/globals-bound
+/// and builtin type names are excluded (family heads, sorts).
+fn collect_unbound_index_vars(
+    ast: &Ast,
+    node_ref: AstRef,
+    ctx: &TypecheckContext,
+    out: &mut Vec<String>,
+) {
+    let Some(node) = ast.get(node_ref) else {
+        return;
+    };
+    if node.kind == "var" {
+        if let Some(name) = node_name(node) {
+            if !name.is_empty()
+                && !ctx.results.contains_key(&name)
+                && ctx.lookup(&name).is_none()
+                && !is_builtin_type_name(&name)
+                && !out.iter().any(|n| *n == name)
+            {
+                out.push(name);
+            }
+        }
+        return;
+    }
+    if let Some(kids) = children_of(node) {
+        for k in kids.clone() {
+            if let Some(i) = k.as_u64() {
+                collect_unbound_index_vars(ast, AstRef::new(i as usize), ctx, out);
+            }
+        }
+    }
 }
 
 impl NbeTypecheckEngine {
@@ -6038,6 +7414,14 @@ impl NbeTypecheckEngine {
     ///
     /// Unresolvable/dynamic specs degrade each binding to `type.unknown`.
     /// Returns `type.unit`.
+    ///
+    /// Phase-3 WS-A (instances ride `Sig_m`): an imported binding whose
+    /// type is a `type.family_app` is a module-scope instance
+    /// candidate — it registers in the instance table under its head so
+    /// dictionary search sees dictionaries other modules exported.
+    /// Registration is unchecked (scope-level candidates, not
+    /// declarations): the `instance` decl's coherence rule governs the
+    /// declaration path; first-match wins at search.
     pub(crate) fn synth_import_judgment(
         &self,
         lang: &Language,
@@ -6088,7 +7472,8 @@ impl NbeTypecheckEngine {
                 Some(Value::String(s)) if s != "*" => self.import_field_type(&sig, spec, s, ctx),
                 _ => sig.clone(),
             };
-            ctx.extend(a.to_string(), bound);
+            ctx.extend(a.to_string(), bound.clone());
+            register_imported_instance(ctx, a, &bound);
             return Ok(unit(ctx));
         }
 
@@ -6098,6 +7483,7 @@ impl NbeTypecheckEngine {
                 if let Some(fields) = sig.get("fields").and_then(Value::as_object) {
                     for (n, t) in fields {
                         ctx.extend(n.clone(), t.clone());
+                        register_imported_instance(ctx, n, t);
                     }
                 }
                 // Bare module-name specs (`str`) also stay usable qualified.
@@ -6107,7 +7493,8 @@ impl NbeTypecheckEngine {
             }
             Some(Value::String(s)) => {
                 let ty = self.import_field_type(&sig, spec, s, ctx);
-                ctx.extend(s.clone(), ty);
+                ctx.extend(s.clone(), ty.clone());
+                register_imported_instance(ctx, s, &ty);
             }
             Some(Value::Array(items)) => {
                 for item in items {
@@ -6126,7 +7513,8 @@ impl NbeTypecheckEngine {
                         _ => continue,
                     };
                     let ty = self.import_field_type(&sig, spec, &field, ctx);
-                    ctx.extend(bound, ty);
+                    ctx.extend(bound.clone(), ty.clone());
+                    register_imported_instance(ctx, &bound, &ty);
                 }
             }
             _ => {}

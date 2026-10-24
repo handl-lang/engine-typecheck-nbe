@@ -946,6 +946,218 @@ fn absurd_rejects_reachable_arm() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Phase-3 WS-C — split-tree coverage for indexed `match`
+// ---------------------------------------------------------------------------
+
+/// `Vec(Succ n)` needs no `VNil` arm: the scrutinee's index evaluates to
+/// `n + 1` with `n : Nat` known nonneg, so `0 ≡ n + 1` is
+/// decided-unsatisfiable and `VNil` is out of the possible set — a
+/// VCons-only match is complete *without* a catchall. Writing the arm
+/// anyway makes it decided-unreachable: `VNil: absurd` discharges it,
+/// a plain `VNil` body errors.
+#[test]
+fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let head = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VCons(x, xs): x }",
+        ],
+    );
+    let result = typecheck(&lang, head);
+    assert!(
+        !has_error(&result),
+        "VCons-only match on Vec(Succ n) should be exhaustive, got {:?}",
+        diags_of(&result)
+    );
+
+    let with_absurd = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VNil: absurd, VCons(x, xs): x }",
+        ],
+    );
+    let result = typecheck(&lang, with_absurd);
+    assert!(
+        !has_error(&result),
+        "VNil: absurd should be discharged — the arm is decided-impossible, got {:?}",
+        diags_of(&result)
+    );
+
+    // A *reachable* arm for VNil is now decided-unreachable, not merely
+    // unhandled: the unreachable-arm contract fires.
+    let stray = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VNil: true, VCons(x, xs): x }",
+        ],
+    );
+    let result = typecheck(&lang, stray);
+    assert!(
+        has_error(&result),
+        "a live VNil arm on Vec(Succ n) is decided-unreachable — must error"
+    );
+}
+
+/// `Vec(n + m)` splits: `VNil` is possible only at `n ↦ 0, m ↦ 0` and
+/// `VCons` only when `n + m ≥ 1`. The `{VNil, VCons}` match is proved
+/// exhaustive through the split tree; dropping either arm is a
+/// non-exhaustive error naming the missing ctor (with the leaf
+/// substitution that witnesses reachability).
+#[test]
+fn match_split_tree_decides_n_plus_m_coverage() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let good = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) = n ~> m ~> v ~> match v { VNil: true, VCons(x, xs): x }",
+        ],
+    );
+    let result = typecheck(&lang, good);
+    assert!(
+        !has_error(&result),
+        "{{VNil, VCons}} on Vec(n + m) should be exhaustive via the split tree, got {:?}",
+        diags_of(&result)
+    );
+
+    let missing_nil = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) = n ~> m ~> v ~> match v { VCons(x, xs): x }",
+        ],
+    );
+    let result = typecheck(&lang, missing_nil);
+    let diags = diags_of(&result);
+    assert!(
+        has_error(&result) && diags.iter().any(|d| d.contains("non-exhaustive") && d.contains("VNil")),
+        "VCons-only on Vec(n + m) must report VNil reachable under n ↦ 0, m ↦ 0, got {diags:?}"
+    );
+
+    let missing_cons = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) = n ~> m ~> v ~> match v { VNil: true }",
+        ],
+    );
+    let result = typecheck(&lang, missing_cons);
+    let diags = diags_of(&result);
+    assert!(
+        has_error(&result) && diags.iter().any(|d| d.contains("non-exhaustive") && d.contains("VCons")),
+        "VNil-only on Vec(n + m) must report VCons reachable, got {diags:?}"
+    );
+}
+
+/// Literal-index exhaustiveness: on `Vec(0)` the `VCons` index equation
+/// `?k + 1 ≡ 0` is decided-unsatisfiable because `?k` is a `Nat`
+/// metavariable (never negative) — so a VNil-only match is complete.
+#[test]
+fn match_literal_zero_index_needs_no_vcons_arm() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "v0 : Vec(0, Bool) = VNil",
+            "x : Bool = match v0 { VNil: true }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "VCons cannot occur on Vec(0) — VNil-only match is exhaustive, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Plain enum coverage comes free: a `data`-declared `Bool` scrutinee
+/// makes `match { True: … }` non-exhaustive (`False` is decided
+/// possible), while a catchall discharges it.
+#[test]
+fn match_enum_scrutinee_requires_all_ctors_or_catchall() {
+    let lang = canonical_lang();
+    let missing = parse_block(
+        &lang,
+        &[
+            "data Bool :: True | False",
+            "b : Bool = True",
+            "x : Nat = match b { True: 1 }",
+        ],
+    );
+    let result = typecheck(&lang, missing);
+    let diags = diags_of(&result);
+    assert!(
+        has_error(&result) && diags.iter().any(|d| d.contains("non-exhaustive") && d.contains("False")),
+        "True-only match on Bool should report `False` not covered, got {diags:?}"
+    );
+
+    let caught = parse_block(
+        &lang,
+        &[
+            "data Bool :: True | False",
+            "b : Bool = True",
+            "x : Nat = match b { True: 1, _: 0 }",
+        ],
+    );
+    let result = typecheck(&lang, caught);
+    assert!(
+        !has_error(&result),
+        "a catchall arm discharges False, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Undecided coverage is a warning, never a silent accept nor an
+/// error: a `Vec(f(n))` scrutinee with opaque `f` leaves every index
+/// equation stuck, so the uncovered `VCons` reports `coverage unknown`
+/// (the split bound is reached re-splitting `n`) while the check
+/// itself still passes.
+#[test]
+fn match_undecided_coverage_warns_not_errors() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Bool))) = f ~> n ~> v ~> match v { VNil: true }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    let diags = diags_of(&result);
+    assert!(
+        !has_error(&result),
+        "undecided coverage must not error, got {diags:?}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.severity == "warning"
+            && d.message.contains("coverage unknown")
+            && d.message.contains("VCons")),
+        "expected a `coverage unknown` warning naming VCons, got {diags:?}"
+    );
+}
+
 /// `handl-packages/type/dependent.hnl` — the packaged Phase-4 data — must
 /// parse statement-by-statement and typecheck without errors.
 #[test]
@@ -1148,6 +1360,143 @@ fn sig_row_polymorphism_solves_meta() {
     assert!(
         !has_error(&result),
         "sig row-metas should solve to the concrete sig, got {:?}",
+        diags_of(&result)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase-3 WS-A — instance resolution
+// ---------------------------------------------------------------------------
+
+/// `instance <C(i⃗)> := <dict>` registers a dictionary; an implicit
+/// `{eq : Eq a}` binder's former-app domain discharges by dictionary
+/// search — `f(Zero)` resolves `Eq Nat` from the declared instance
+/// once the index meta `?a` solves to `Nat` through the explicit arg.
+#[test]
+fn instance_resolves_implicit_evidence_binder() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
+            "f{a, eq : Eq(a)} : a ~> a := v ~> v",
+            "r := f(Zero)",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "Eq Nat should resolve the implicit evidence binder, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Missing instance — `f(true)` needs `Eq Bool` but only `Eq Nat` is
+/// declared: the deferred obligation drains at end-of-module as an
+/// honest `no instance for Eq(Bool)` diagnostic, never a silent meta.
+#[test]
+fn instance_missing_produces_named_error() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Bool :: True | False",
+            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
+            "f{a, eq : Eq(a)} : a ~> a := v ~> v",
+            "r := f(True)",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(has_error(&result), "Eq Bool should be a missing instance");
+    let diags = diags_of(&result);
+    assert!(
+        diags.iter().any(|d| d.contains("no instance") && d.contains("Eq")),
+        "diagnostics should name the constraint, got {:?}",
+        diags
+    );
+}
+
+/// Coherence — a second `instance` declaration for the same head whose
+/// index shape unifies with a registered one is a declaration-time
+/// error (decided policy: no overlap/priority).
+#[test]
+fn instance_overlap_is_a_coherence_error() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
+            "instance Eq(Nat) := {eq: (x, y) ~> true}",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "duplicate Eq Nat instance should be a coherence error"
+    );
+    let diags = diags_of(&result);
+    assert!(
+        diags.iter().any(|d| d.contains("overlapping instance")),
+        "diagnostics should name the overlap, got {:?}",
+        diags
+    );
+}
+
+/// Non-overlapping instances coexist: `Eq Nat` and `Eq Bool` for one
+/// head are distinct index shapes — both register and each resolves
+/// its own goal.
+#[test]
+fn distinct_instance_index_shapes_coexist() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Bool :: True | False",
+            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
+            "instance Eq(Bool) := {eq: (x, y) ~> x == y}",
+            "f{a, eq : Eq(a)} : a ~> a := v ~> v",
+            "r1 := f(Zero)",
+            "r2 := f(True)",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "Eq Nat and Eq Bool should both resolve, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Generic instance (stretch): `instance Eq (List a)` — the unbound
+/// `a` implicitly generalizes as a rigid index var, so the registered
+/// shape `Eq (List a)` matches `Eq (List Nat)` at the call site via
+/// pointwise `family_app` index unification (`a := Nat`).
+#[test]
+fn generic_indexed_instance_resolves() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data List(a : Type) :: LNil | LCons(h : a, t : List(a))",
+            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "instance Eq(List(a)) := {eq: (x, y) ~> true}",
+            "f{a, eq : Eq(List(a))} : a ~> a := v ~> v",
+            "r := f(LCons(Zero, LNil))",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "Eq (List Nat) should resolve through the generic Eq (List a) instance, got {:?}",
         diags_of(&result)
     );
 }

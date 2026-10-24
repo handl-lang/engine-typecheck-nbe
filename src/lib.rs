@@ -1877,6 +1877,16 @@ impl NbeTypecheckEngine {
                 // `type.ctor_sig` — with checker-owned strict positivity.
                 self.synth_data_judgment(lang, ast, node_ref, ctx)
             }
+            "synth_instance" => {
+                // `instance <C(i⃗)> := <dict>` (phase-3 WS-A): elaborate
+                // the constraint former application, enforce coherence,
+                // check the dict, and register `(head, args) ↦ dict` in
+                // the instance table for call-site dictionary search.
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("synth_instance: node out of bounds".to_string())
+                })?;
+                self.synth_instance_judgment(lang, ast, node, ctx)
+            }
             "synth_call" => {
                 // Curried application: ctor/function/pi chains, dependent
                 // application through `body_closure`s, family_app for
@@ -4759,6 +4769,11 @@ impl TypecheckEngine for NbeTypecheckEngine {
         let root_ref = AstRef::new(req.ast.len() - 1);
         let mut ctx = TypecheckContext::new(&self.registry_id, self.globals.clone());
         let typ = self.synth_node(lang, &req.ast, root_ref, &mut ctx)?;
+        // Final evidence-obligation drain (phase-3 WS-A): deferred
+        // instance goals whose index metas solved through the
+        // expected-type unify retry once more; still-open obligations
+        // are honest errors, never a silently unsolved dictionary meta.
+        self.retry_pending_instances(&mut ctx, true)?;
         // `Sig_m` — the module's signature record of exported names and
         // their checked types (phase-1 spec WS-B). `import m` binds
         // `m : Sig_m`; hosts seed an importer's Γ from this value.
@@ -4862,6 +4877,91 @@ struct TypecheckContext {
     /// `var{Zero}` as `0`. Declared metadata keyed by ctor sym —
     /// nothing `Succ`-shaped is hardcoded in the solver.
     ctor_proj: HashMap<String, dependent::CtorProj>,
+    /// `data`-declared family → its ctor names in declaration order
+    /// (phase-3 WS-C) — the coverage checker's per-family ctor census.
+    family_ctors: HashMap<String, Vec<String>>,
+    /// Ctor name → its `data` family (phase-3 WS-C) — the index-level
+    /// ctor-disjointness table (`App{C}` vs `App{D}`/`Const` decided).
+    ctor_family: HashMap<String, String>,
+    /// `data`-declared family → per-parameter `nat` flags (the
+    /// `n : Nat` annotation convention — same flag `DepParam::nat`
+    /// records). The `type.family` value keeps only the evaluated
+    /// sorts (`Nat` reads as `type.number`), so the Nat-vs-Int
+    /// distinction rides this side table for the splitter to know a
+    /// `type.number`-sorted index position is natural-number-bounded.
+    family_param_nat: HashMap<String, Vec<bool>>,
+    /// Rigid index `var` names currently known nonneg (a `Nat`-sorted
+    /// index variable — whether the sort reached it as a declared
+    /// `Nat`-shaped family or a `nat`-flagged builtin position).
+    /// Populated by `synth_match_*`'s scrutinee pre-pass and the split
+    /// tree's fresh vars; restored when the match returns so the
+    /// marking never escapes its scope (same name, different binder,
+    /// must not inherit the fact).
+    nonneg_index_vars: std::collections::HashSet<String>,
+    /// Metas minted for `nat`-flagged family parameters — a `Nat`
+    /// index metavariable can never solve to a negative numeral, so
+    /// `?k ≡ -1` is *decided*, not a solution. Meta ids are unique for
+    /// the whole run, so this set is sound to keep globally.
+    nonneg_metas: std::collections::HashSet<u64>,
+    /// Instance table (phase-3 WS-A, ADR-0106 §11): constraint head
+    /// name → registered dictionary entries. Populated by `instance`
+    /// declarations and by module-scope `Sig_m` lookups (an imported
+    /// `family_app`-typed binding is a candidate). An implicit
+    /// `type.pi` domain `C(i⃗)` whose head has entries here resolves
+    /// by dictionary search at `synth_call` — before the index-meta
+    /// fallback.
+    instances: HashMap<String, Vec<InstanceEntry>>,
+    /// Deferred evidence obligations — implicit-Pi domains `C(i⃗)`
+    /// whose index args still held unsolved metas when the
+    /// implicit-binder drain reached them (`sum{a, eq : Eq a}`
+    /// inserts `?a` for `a` *before* the explicit args solve it).
+    /// Retried at end-of-call and at end-of-module; still-open
+    /// obligations are honest errors, never silent `type.unknown`.
+    pending_instances: Vec<PendingInstance>,
+    /// Counter for generated dictionary-binding names
+    /// (`$instance:{head}:{n}`).
+    instance_count: usize,
+}
+
+/// A registered dictionary instance (phase-3 WS-A): the elaboration
+/// term `var{name}` stands for the dictionary value, bound in Γ *at
+/// the constraint type* (the dict's `type` link is the declared
+/// former application — ADR-0106 §11).
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceEntry {
+    /// The Γ name the dict is bound under (`$instance:{head}:{n}` —
+    /// declared) or the imported field name (module-scope lookup).
+    pub name: String,
+    /// The constraint's index arguments (the `type.family_app`'s
+    /// `args` — index terms; rigid vars generalize generic instances
+    /// like `instance Eq (List a)`).
+    pub args: Vec<Value>,
+}
+
+/// A deferred evidence obligation (phase-3 WS-A): an implicit-Pi
+/// domain `C(i⃗)` recorded when its index args held unsolved metas —
+/// `sum{a, eq : Eq a}` inserts `?a` for `a` before the explicit args
+/// solve it, so resolution must wait for the call's arg checks.
+#[derive(Debug)]
+pub(crate) struct PendingInstance {
+    /// The meta inserted for the binder — solved to `var{dict-name}`
+    /// when the obligation resolves.
+    pub meta: u64,
+    /// The goal — a `type.family_app{head, args}` (or `type.family`)
+    /// value at insertion time; re-zonked on each retry.
+    pub goal: Value,
+    /// The call node's span — the obligation's error position.
+    pub span: Option<handl_language::Span>,
+}
+
+/// A restore point for the tagged meta store + `results` (instance
+/// search backtracking, phase-3 WS-A): `unify_index` solves tagged
+/// metas and binds `results` vars — both must undo when a candidate
+/// fails. Cloning the small store is simpler and more honest than
+/// diff-tracking (instance search is rare).
+struct StoreMark {
+    metas: Vec<Option<Value>>,
+    results: HashMap<String, Value>,
 }
 
 impl TypecheckContext {
@@ -4878,7 +4978,32 @@ impl TypecheckContext {
             vcheck: checker::Checker::new(),
             exports: Vec::new(),
             ctor_proj: HashMap::new(),
+            family_ctors: HashMap::new(),
+            ctor_family: HashMap::new(),
+            family_param_nat: HashMap::new(),
+            nonneg_index_vars: std::collections::HashSet::new(),
+            nonneg_metas: std::collections::HashSet::new(),
+            instances: HashMap::new(),
+            pending_instances: Vec::new(),
+            instance_count: 0,
         }
+    }
+
+    /// Mark the tagged meta store + `results` for instance-search
+    /// backtracking (phase-3 WS-A).
+    fn store_mark(&self) -> StoreMark {
+        StoreMark {
+            metas: self.metas.clone(),
+            results: self.results.clone(),
+        }
+    }
+
+    /// Restore the tagged meta store + `results` to a prior
+    /// [`store_mark`](Self::store_mark) — undoes candidate-unification
+    /// side effects on a failed instance.
+    fn store_restore(&mut self, mark: StoreMark) {
+        self.metas = mark.metas;
+        self.results = mark.results;
     }
 
     /// Allocate a fresh metavariable, returning its id.
