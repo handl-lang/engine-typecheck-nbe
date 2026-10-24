@@ -390,6 +390,48 @@ pub fn display_type_unzonked(v: &Value) -> String {
     display_inner(v, 0)
 }
 
+/// Zonk one *reported* type value against the final meta stores — the
+/// pass applied to `TypecheckResult`'s `typ`/`node_types`/`signature`
+/// at the end of `typecheck` (`hnl lsp` v2 hover).
+///
+/// Two stores, two passes:
+///
+/// 1. [`zonk_index`] — tagged `{"__meta__": id}` leaves resolve through
+///    the tagged `ctx.metas` table.
+/// 2. A lift→quote round-trip on every *domain-encoded* subtree —
+///    `domain_quote` forces solved `Val::Flex` heads through
+///    `ctx.vcheck.metas`, covering metas that solved after the value
+///    was quoted. Tagged structure outside domain subtrees keeps its
+///    spelling (a `__tag__` value is not lifted just because a leaf
+///    is domain-encoded).
+///
+/// Unsolved metas survive unchanged in both encodings, so `?m` keeps
+/// displaying as `?m`.
+pub(crate) fn zonk_reported(v: &Value, ctx: &mut TypecheckContext) -> Value {
+    let v = zonk_index(v, ctx);
+    zonk_domain_walk(&v, ctx)
+}
+
+fn zonk_domain_walk(v: &Value, ctx: &mut TypecheckContext) -> Value {
+    if is_domain_encoded(v) {
+        let lifted = domain_lift(v, ctx);
+        return domain_quote(&lifted, ctx);
+    }
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| (k.clone(), zonk_domain_walk(x, ctx)))
+                .collect(),
+        ),
+        Value::Array(xs) => Value::Array(
+            xs.iter()
+                .map(|x| zonk_domain_walk(x, ctx))
+                .collect(),
+        ),
+        _ => v.clone(),
+    }
+}
+
 /// Recursion guard — a pathological payload (deep nesting) gets a
 /// bounded render rather than an unbounded walk.
 const DISPLAY_DEPTH: usize = 40;

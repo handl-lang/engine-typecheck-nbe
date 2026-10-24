@@ -4835,11 +4835,28 @@ impl TypecheckEngine for NbeTypecheckEngine {
         // expected-type unify retry once more; still-open obligations
         // are honest errors, never a silently unsolved dictionary meta.
         self.retry_pending_instances(&mut ctx, true)?;
+        // Zonk pass over every *reported* type — `node_types` (the
+        // LSP's hover), the module `typ`, and each `Sig_m` field
+        // (phase-3 spec / `hnl lsp` v2). A node's type is recorded
+        // when it is judged; metas it mentions may solve later in the
+        // run, so the recorded value can still read `?m` once the
+        // context is gone. Solutions are the metas' definition —
+        // resolving them here is semantics-preserving; unsolved metas
+        // keep their `?m` spelling for `display_type_unzonked`.
+        let typ = dependent::zonk_reported(&typ, &mut ctx);
+        let node_types: HashMap<usize, Value> = std::mem::take(&mut ctx.node_types)
+            .into_iter()
+            .map(|(k, v)| (k, dependent::zonk_reported(&v, &mut ctx)))
+            .collect();
+        let exports = std::mem::take(&mut ctx.exports)
+            .into_iter()
+            .map(|(n, ty)| (n, dependent::zonk_reported(&ty, &mut ctx)))
+            .collect::<Vec<_>>();
         // `Sig_m` — the module's signature record of exported names and
         // their checked types (phase-1 spec WS-B). `import m` binds
         // `m : Sig_m`; hosts seed an importer's Γ from this value.
         let mut fields = serde_json::Map::new();
-        for (name, ty) in ctx.exports {
+        for (name, ty) in exports {
             fields.insert(name, ty);
         }
         let signature = ctx
@@ -4852,7 +4869,7 @@ impl TypecheckEngine for NbeTypecheckEngine {
         Ok(TypecheckResult {
             typ,
             diagnostics: ctx.diagnostics,
-            node_types: ctx.node_types,
+            node_types,
             signature,
         })
     }
