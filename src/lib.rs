@@ -104,6 +104,8 @@ pub mod checker;
 mod dependent;
 pub mod judgments;
 
+pub use dependent::display_type_unzonked;
+
 /// Growable-stack seams (WS-H). Type-rule interpretation recurses the
 /// scheme/AST/term structures with several *large* debug frames per
 /// hop — `eval_judgment` alone is a ~2700-line `match`, and the

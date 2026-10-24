@@ -381,6 +381,15 @@ pub(crate) fn display_type(v: &Value, ctx: &TypecheckContext) -> String {
     display_inner(&zonk_index(v, ctx), 0)
 }
 
+/// Render a type value like [`display_type`], but without a
+/// [`TypecheckContext`] — unsolved metas show as `?m{id}` and solved metas
+/// are *not* zonked. For tooling hosts (the LSP's hover) that hold a
+/// `TypecheckResult`'s `node_types` after the check has finished and have
+/// no context to zonk against.
+pub fn display_type_unzonked(v: &Value) -> String {
+    display_inner(v, 0)
+}
+
 /// Recursion guard — a pathological payload (deep nesting) gets a
 /// bounded render rather than an unbounded walk.
 const DISPLAY_DEPTH: usize = 40;
