@@ -121,7 +121,20 @@ pub(crate) const STACK_RED_ZONE: usize = 4 * 1024 * 1024;
 /// (see [`STACK_RED_ZONE`]).
 pub(crate) const STACK_SEGMENT: usize = 8 * 1024 * 1024;
 mod predicate_eval;
+pub(crate) mod stats;
 mod totality_check;
+
+/// Whether `HNL_TC_STATS` instrumentation is collecting (WS-H perf
+/// probe — see [`stats`]).
+pub fn stats_enabled() -> bool {
+    stats::enabled()
+}
+
+/// The `HNL_TC_STATS`/`HNL_CONV_STATS` counter report (WS-H perf
+/// probe).
+pub fn stats_report() -> String {
+    stats::report()
+}
 
 /// The key under which a metavariable id is encoded in a type value.
 ///
@@ -323,7 +336,11 @@ impl NbeTypecheckEngine {
             ctx.node_types.insert(node_ref.index(), typ.clone());
             return Ok(typ);
         };
-        let typ = self.eval_type_scheme(lang, ast, node_ref, &rule.synth, ctx, None)?;
+        // `rule.synth` is lang-owned — the `scheme_td` cache key is
+        // stable for the ctx's lifetime, so the `Term`→`TermData`
+        // conversion runs once per kind, not once per node (WS-H).
+        let td = ctx.scheme_td(&rule.synth);
+        let typ = self.eval_type_scheme_td(lang, ast, node_ref, &td, ctx, None)?;
         ctx.node_types.insert(node_ref.index(), typ.clone());
         Ok(typ)
         })
@@ -340,6 +357,7 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        let _t = crate::stats::timer(&crate::stats::T_CHECK_NODE);
         let node = ast.get(node_ref).ok_or_else(|| {
             LangError::engine(format!(
                 "typecheck: node index {} out of bounds",
@@ -408,11 +426,12 @@ impl NbeTypecheckEngine {
             return Ok(());
         }
         if let Some(check_scheme) = &rule.check {
-            self.eval_type_scheme(
+            let td = ctx.scheme_td(check_scheme);
+            self.eval_type_scheme_td(
                 lang,
                 ast,
                 node_ref,
-                check_scheme,
+                &td,
                 ctx,
                 Some(expected.clone()),
             )?;
@@ -470,6 +489,7 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
         incoming: Option<Value>,
     ) -> Result<Value, LangError> {
+        let _t = crate::stats::timer(&crate::stats::T_EVAL_SCHEME);
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
         match scheme.tag() {
@@ -487,7 +507,7 @@ impl NbeTypecheckEngine {
                     ArrSource::Judgment => {
                         // `eval_judgment` now takes `&[TermData]`; no
                         // `Term`-enum conversion is needed at this seam.
-                        let args = scheme.get_term_list("args");
+                        let args = scheme.get_term_view_list("args");
                         self.eval_judgment(op, &args, lit, lang, ast, node_ref, ctx, incoming)
                     }
                     ArrSource::Native | ArrSource::DynamicForeign => {
@@ -508,17 +528,17 @@ impl NbeTypecheckEngine {
                 }
             }
             "Seq" => {
-                let fst = scheme.get_term("fst").ok_or_else(|| {
+                let fst = scheme.get_term_view("fst").ok_or_else(|| {
                     LangError::engine("typecheck: Seq missing 'fst' field")
                 })?;
-                let snd = scheme.get_term("snd").ok_or_else(|| {
+                let snd = scheme.get_term_view("snd").ok_or_else(|| {
                     LangError::engine("typecheck: Seq missing 'snd' field")
                 })?;
-                let fst_val = self.eval_type_scheme_td(lang, ast, node_ref, &fst, ctx, incoming)?;
-                self.eval_type_scheme_td(lang, ast, node_ref, &snd, ctx, Some(fst_val))
+                let fst_val = self.eval_type_scheme_td(lang, ast, node_ref, fst, ctx, incoming)?;
+                self.eval_type_scheme_td(lang, ast, node_ref, snd, ctx, Some(fst_val))
             }
             "First" => {
-                let inner = scheme.get_term("inner").ok_or_else(|| {
+                let inner = scheme.get_term_view("inner").ok_or_else(|| {
                     LangError::engine("typecheck: First missing 'inner' field")
                 })?;
                 let inc = incoming
@@ -533,14 +553,14 @@ impl NbeTypecheckEngine {
                 }
                 let a = pair[0].clone();
                 let b = pair[1].clone();
-                let result = self.eval_type_scheme_td(lang, ast, node_ref, &inner, ctx, Some(a))?;
+                let result = self.eval_type_scheme_td(lang, ast, node_ref, inner, ctx, Some(a))?;
                 Ok(Value::Array(vec![result, b]))
             }
             "Choice" => {
-                let l = scheme.get_term("l").ok_or_else(|| {
+                let l = scheme.get_term_view("l").ok_or_else(|| {
                     LangError::engine("typecheck: Choice missing 'l' field")
                 })?;
-                let r = scheme.get_term("r").ok_or_else(|| {
+                let r = scheme.get_term_view("r").ok_or_else(|| {
                     LangError::engine("typecheck: Choice missing 'r' field")
                 })?;
                 let inc = incoming.ok_or_else(|| {
@@ -559,8 +579,8 @@ impl NbeTypecheckEngine {
                     LangError::engine("typecheck: Choice: incoming missing value key")
                 })?;
                 match side {
-                    "left" => self.eval_type_scheme_td(lang, ast, node_ref, &l, ctx, Some(value)),
-                    "right" => self.eval_type_scheme_td(lang, ast, node_ref, &r, ctx, Some(value)),
+                    "left" => self.eval_type_scheme_td(lang, ast, node_ref, l, ctx, Some(value)),
+                    "right" => self.eval_type_scheme_td(lang, ast, node_ref, r, ctx, Some(value)),
                     other => Err(LangError::engine(format!(
                         "typecheck: Choice: unknown side '{}'",
                         other
@@ -571,10 +591,10 @@ impl NbeTypecheckEngine {
             // has the same type as `initial`. The full rule (fuel : A ~>
             // Nat, predicate : A ~> Bool, step : A ~> A) is deferred.
             "Iter" => {
-                let initial = scheme.get_term("initial").ok_or_else(|| {
+                let initial = scheme.get_term_view("initial").ok_or_else(|| {
                     LangError::engine("typecheck: Iter missing 'initial' field")
                 })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, &initial, ctx, incoming)
+                self.eval_type_scheme_td(lang, ast, node_ref, initial, ctx, incoming)
             }
             "Child" => Err(LangError::NotImplemented),
             "Loop" => Err(LangError::NotImplemented),
@@ -588,39 +608,39 @@ impl NbeTypecheckEngine {
             // ADR-0104b minimal core: conservative/identity-like type rules.
             "Const" => Ok(scheme.get("value").cloned().unwrap_or(Value::Null)),
             "Src" => {
-                let cell = scheme.get_term("cell").ok_or_else(|| {
+                let cell = scheme.get_term_view("cell").ok_or_else(|| {
                     LangError::engine("typecheck: Src missing 'cell' field")
                 })?;
-                let cell_val = self.eval_type_scheme_td(lang, ast, node_ref, &cell, ctx, incoming)?;
+                let cell_val = self.eval_type_scheme_td(lang, ast, node_ref, cell, ctx, incoming)?;
                 Ok(cell_val.get("__src__").cloned().unwrap_or(Value::Null))
             }
             "Tgt" => {
-                let cell = scheme.get_term("cell").ok_or_else(|| {
+                let cell = scheme.get_term_view("cell").ok_or_else(|| {
                     LangError::engine("typecheck: Tgt missing 'cell' field")
                 })?;
-                let cell_val = self.eval_type_scheme_td(lang, ast, node_ref, &cell, ctx, incoming)?;
+                let cell_val = self.eval_type_scheme_td(lang, ast, node_ref, cell, ctx, incoming)?;
                 Ok(cell_val.get("__tgt__").cloned().unwrap_or(Value::Null))
             }
             "RecordProj" => {
-                let record = scheme.get_term("record").ok_or_else(|| {
+                let record = scheme.get_term_view("record").ok_or_else(|| {
                     LangError::engine("typecheck: RecordProj missing 'record' field")
                 })?;
                 let field = scheme.get_str("field").unwrap_or("");
                 let record_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &record, ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, record, ctx, incoming)?;
                 Ok(record_val.get(field).cloned().unwrap_or(Value::Null))
             }
             "RecordWith" => {
-                let record = scheme.get_term("record").ok_or_else(|| {
+                let record = scheme.get_term_view("record").ok_or_else(|| {
                     LangError::engine("typecheck: RecordWith missing 'record' field")
                 })?;
                 let field = scheme.get_str("field").unwrap_or("").to_string();
-                let value = scheme.get_term("value").ok_or_else(|| {
+                let value = scheme.get_term_view("value").ok_or_else(|| {
                     LangError::engine("typecheck: RecordWith missing 'value' field")
                 })?;
                 let record_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &record, ctx, incoming.clone())?;
-                let value_val = self.eval_type_scheme_td(lang, ast, node_ref, &value, ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, record, ctx, incoming.clone())?;
+                let value_val = self.eval_type_scheme_td(lang, ast, node_ref, value, ctx, incoming)?;
                 let mut map = match record_val {
                     Value::Object(m) => m.clone(),
                     _ => serde_json::Map::new(),
@@ -630,10 +650,10 @@ impl NbeTypecheckEngine {
             }
             "Tag" => {
                 let tag = scheme.get_str("tag").unwrap_or("").to_string();
-                let value = scheme.get_term("value").ok_or_else(|| {
+                let value = scheme.get_term_view("value").ok_or_else(|| {
                     LangError::engine("typecheck: Tag missing 'value' field")
                 })?;
-                let val = self.eval_type_scheme_td(lang, ast, node_ref, &value, ctx, incoming)?;
+                let val = self.eval_type_scheme_td(lang, ast, node_ref, value, ctx, incoming)?;
                 // Mirror `handl_language::tag_value` (ADR-0055): an untagged
                 // object payload spreads and gains `__tag__`; anything else
                 // wraps under `value`. Unlike `tag_value` — which *rejects*
@@ -676,27 +696,27 @@ impl NbeTypecheckEngine {
                 self.eval_type_scheme_td(lang, ast, node_ref, &eliminated_td, ctx, incoming)
             }
             "CellId" => {
-                let arrow = scheme.get_term("arrow").ok_or_else(|| {
+                let arrow = scheme.get_term_view("arrow").ok_or_else(|| {
                     LangError::engine("typecheck: CellId missing 'arrow' field")
                 })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, &arrow, ctx, incoming)
+                self.eval_type_scheme_td(lang, ast, node_ref, arrow, ctx, incoming)
             }
             "Refine" => {
-                let sort = scheme.get_term("sort").ok_or_else(|| {
+                let sort = scheme.get_term_view("sort").ok_or_else(|| {
                     LangError::engine("typecheck: Refine missing 'sort' field")
                 })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, &sort, ctx, incoming)
+                self.eval_type_scheme_td(lang, ast, node_ref, sort, ctx, incoming)
             }
             "Cobind" => {
-                let grade = scheme.get_term("grade").ok_or_else(|| {
+                let grade = scheme.get_term_view("grade").ok_or_else(|| {
                     LangError::engine("typecheck: Cobind missing 'grade' field")
                 })?;
-                let body = scheme.get_term("body").ok_or_else(|| {
+                let body = scheme.get_term_view("body").ok_or_else(|| {
                     LangError::engine("typecheck: Cobind missing 'body' field")
                 })?;
                 let grade_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &grade, ctx, incoming.clone())?;
-                let body_val = self.eval_type_scheme_td(lang, ast, node_ref, &body, ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, grade, ctx, incoming.clone())?;
+                let body_val = self.eval_type_scheme_td(lang, ast, node_ref, body, ctx, incoming)?;
                 let grade = self.grade_string(&grade_val);
                 let mut result = match body_val {
                     Value::Object(m) => m,
@@ -713,40 +733,40 @@ impl NbeTypecheckEngine {
                 Ok(Value::Object(result))
             }
             "Univalence" => {
-                let equiv = scheme.get_term("equiv").ok_or_else(|| {
+                let equiv = scheme.get_term_view("equiv").ok_or_else(|| {
                     LangError::engine("typecheck: Univalence missing 'equiv' field")
                 })?;
-                let _ = self.eval_type_scheme_td(lang, ast, node_ref, &equiv, ctx, incoming)?;
+                let _ = self.eval_type_scheme_td(lang, ast, node_ref, equiv, ctx, incoming)?;
                 Ok(self
                     .registry
                     .construct("type.bool", &Value::Null)
                     .unwrap_or(Value::Null))
             }
             "Glue" => {
-                let family = scheme.get_term("family").ok_or_else(|| {
+                let family = scheme.get_term_view("family").ok_or_else(|| {
                     LangError::engine("typecheck: Glue missing 'family' field")
                 })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, &family, ctx, incoming)
+                self.eval_type_scheme_td(lang, ast, node_ref, family, ctx, incoming)
             }
             "Fibrant" => {
-                let base = scheme.get_term("base").ok_or_else(|| {
+                let base = scheme.get_term_view("base").ok_or_else(|| {
                     LangError::engine("typecheck: Fibrant missing 'base' field")
                 })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, &base, ctx, incoming)
+                self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)
             }
             "JElim" => {
-                let path = scheme.get_term("path").ok_or_else(|| {
+                let path = scheme.get_term_view("path").ok_or_else(|| {
                     LangError::engine("typecheck: JElim missing 'path' field")
                 })?;
-                let motive = scheme.get_term("motive").ok_or_else(|| {
+                let motive = scheme.get_term_view("motive").ok_or_else(|| {
                     LangError::engine("typecheck: JElim missing 'motive' field")
                 })?;
-                let base = scheme.get_term("base").ok_or_else(|| {
+                let base = scheme.get_term_view("base").ok_or_else(|| {
                     LangError::engine("typecheck: JElim missing 'base' field")
                 })?;
                 let path_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &path, ctx, incoming.clone())?;
-                let base_val = self.eval_type_scheme_td(lang, ast, node_ref, &base, ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, path, ctx, incoming.clone())?;
+                let base_val = self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)?;
                 if let Some(tag) = path_val.get("__tag__").and_then(Value::as_str) {
                     if tag == "Path" || tag == "Rewrite" {
                         return self.eval_type_scheme_td(
@@ -809,7 +829,7 @@ impl NbeTypecheckEngine {
     fn eval_judgment(
         &self,
         op: &str,
-        args: &[TermData],
+        args: &[&TermData],
         lit: Option<&Value>,
         lang: &Language,
         ast: &Ast,
@@ -845,7 +865,7 @@ impl NbeTypecheckEngine {
                 match try_child_ref(ast, node_ref, idx)? {
                     Some(child) => self.synth_node(lang, ast, child, ctx),
                     None => {
-                        let fallback = args.first().ok_or_else(|| {
+                        let fallback = args.first().copied().ok_or_else(|| {
                             LangError::engine(format!(
                                 "typecheck: {} requires a fallback scheme arg",
                                 op
@@ -873,7 +893,7 @@ impl NbeTypecheckEngine {
                                 lang,
                                 ast,
                                 node_ref,
-                                &args[0],
+                                args[0],
                                 ctx,
                                 incoming.clone(),
                             )?
@@ -891,7 +911,7 @@ impl NbeTypecheckEngine {
                 let expected = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let child = child_ref(ast, node_ref, idx)?;
                 self.check_node(lang, ast, child, &expected, ctx)?;
@@ -921,11 +941,11 @@ impl NbeTypecheckEngine {
                         lang,
                         ast,
                         node_ref,
-                        &args[0],
+                        args[0],
                         ctx,
                         incoming.clone(),
                     )?;
-                    let b = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                    let b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                     self.unify(&a, &b, ctx)?;
                 } else {
                     let inc = incoming.unwrap_or(Value::Null);
@@ -943,8 +963,8 @@ impl NbeTypecheckEngine {
                     return Err(LangError::engine("subtype: requires 2 args (sub, super)"));
                 }
                 let sub =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
-                let sup = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
+                let sup = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 self.check_subtype(&sub, &sup, ctx)?;
                 Ok(Value::Null)
             }
@@ -964,11 +984,11 @@ impl NbeTypecheckEngine {
                     lang,
                     ast,
                     node_ref,
-                    &args[0],
+                    args[0],
                     ctx,
                     incoming.clone(),
                 )?;
-                let b = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                let b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 let lvl = ctx.vcheck.lvl();
                 let va = checker::lift(lvl, &handl_value::TaggedValue::from(a));
                 let vb = checker::lift(lvl, &handl_value::TaggedValue::from(b));
@@ -982,11 +1002,11 @@ impl NbeTypecheckEngine {
                     lang,
                     ast,
                     node_ref,
-                    &args[0],
+                    args[0],
                     ctx,
                     incoming.clone(),
                 )?;
-                let sup = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                let sup = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 let lvl = ctx.vcheck.lvl();
                 let va = checker::lift(lvl, &handl_value::TaggedValue::from(sub));
                 let vb = checker::lift(lvl, &handl_value::TaggedValue::from(sup));
@@ -996,7 +1016,7 @@ impl NbeTypecheckEngine {
                 let v = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let lvl = ctx.vcheck.lvl();
                 let vv = checker::lift(lvl, &handl_value::TaggedValue::from(v));
@@ -1022,7 +1042,7 @@ impl NbeTypecheckEngine {
                 let ty = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let lvl = ctx.vcheck.lvl();
                 let vt = checker::lift(lvl, &handl_value::TaggedValue::from(ty));
@@ -1058,7 +1078,7 @@ impl NbeTypecheckEngine {
                 // `TermData` → `Term` → `hnl_engine::nbe::eval` under
                 // `JudgmentOps` over `ctx.vcheck` (moved out for the
                 // `&dyn OpHandler` call and moved back).
-                let td = args.first().ok_or_else(|| {
+                let td = args.first().copied().ok_or_else(|| {
                     LangError::engine("typecheck: veval: requires a scheme arg")
                 })?;
                 let term = td.to_term().map_err(|e| {
@@ -1118,7 +1138,7 @@ impl NbeTypecheckEngine {
                     }
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 ctx.extend(name, ty);
                 Ok(incoming.unwrap_or(Value::Null))
@@ -1254,7 +1274,7 @@ impl NbeTypecheckEngine {
                         lang,
                         ast,
                         node_ref,
-                        &args[0],
+                        args[0],
                         ctx,
                         incoming.clone(),
                     )?;
@@ -1263,7 +1283,7 @@ impl NbeTypecheckEngine {
                     })?
                 };
                 let val = if args.len() >= 2 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?
                 } else {
                     incoming.unwrap_or(Value::Null)
                 };
@@ -1274,7 +1294,7 @@ impl NbeTypecheckEngine {
                 if args.is_empty() {
                     Ok(incoming.unwrap_or(Value::Null))
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming)
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming)
                 }
             }
             "construct" => {
@@ -1282,7 +1302,7 @@ impl NbeTypecheckEngine {
                     LangError::engine("typecheck: construct requires a string lit (tag name)")
                 })?;
                 let mut payload = serde_json::Map::new();
-                for arg in args {
+                for &arg in args {
                     let val =
                         self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?;
                     if let Value::Object(map) = val {
@@ -1315,8 +1335,8 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let value =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
-                let cases = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
+                let cases = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 Ok(ctx
                     .registry
                     .match_type(&value, &cases)
@@ -1391,7 +1411,7 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let mut m = serde_json::Map::new();
                 m.insert(field_name.to_string(), val);
                 Ok(Value::Object(m))
@@ -1404,7 +1424,7 @@ impl NbeTypecheckEngine {
                 // signatures (ADR-0074 follow-up #3). Each arg is a sub-scheme
                 // producing one element.
                 let mut out = Vec::with_capacity(args.len());
-                for arg in args {
+                for &arg in args {
                     let val =
                         self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?;
                     out.push(val);
@@ -1429,7 +1449,7 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let type_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 Ok(type_val.get(field_name).cloned().unwrap_or(Value::Null))
             }
             "synth_last_child" => {
@@ -1592,7 +1612,7 @@ impl NbeTypecheckEngine {
                 // type.null). The expected type is in `incoming` (threaded by
                 // the `check` scheme) or `args[0]`. Returns `Null` on success,
                 // errors on mismatch (ADR-0054 directed checking for `value`).
-                let expected = if let Some(arg) = args.first() {
+                let expected = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -1628,7 +1648,7 @@ impl NbeTypecheckEngine {
                 // type (incoming or args[0]). Supports directed checking for
                 // `block` nodes: the block's type is the type of its last
                 // statement (ADR-0054).
-                let expected = if let Some(arg) = args.first() {
+                let expected = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -1664,7 +1684,7 @@ impl NbeTypecheckEngine {
                 // assign children in Γ (same as `synth_block`), then checks
                 // the last child against the expected type. An empty block
                 // is vacuously well-typed.
-                let expected = if let Some(arg) = args.first() {
+                let expected = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -1721,7 +1741,7 @@ impl NbeTypecheckEngine {
                 // uniform element type). The expected type comes from
                 // `incoming` (threaded by the `check` scheme) or `args[0]`
                 // (ADR-0054 — Term lacks iteration, so this is a judgment op).
-                let expected = if let Some(arg) = args.first() {
+                let expected = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -2494,7 +2514,7 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let container_type =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 // Detect whether the type tag is `type.array` by inspecting
                 // the `__tag__` key that the canonical registry adds.
                 if container_type.get("__tag__").and_then(|t| t.as_str()) == Some("type.array")
@@ -2605,7 +2625,7 @@ impl NbeTypecheckEngine {
                 // Extract the element type from a `type.array` value. The
                 // array type value comes from `args[0]` (a sub-scheme) or
                 // `incoming` (when no args are provided).
-                let array_type = if let Some(arg) = args.first() {
+                let array_type = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -2795,7 +2815,7 @@ impl NbeTypecheckEngine {
                 // `rest` is absent (closed record), every entry must have a
                 // matching field in the expected record (the original
                 // behavior).
-                let expected = if let Some(arg) = args.first() {
+                let expected = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -2923,7 +2943,7 @@ impl NbeTypecheckEngine {
                 let param = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let body_child = child_ref(ast, node_ref, 1)?;
                 let body_child_idx = body_child.index();
@@ -2949,7 +2969,7 @@ impl NbeTypecheckEngine {
                 let param = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let body_child = child_ref(ast, node_ref, 1)?;
                 let body_child_idx = body_child.index();
@@ -2983,9 +3003,9 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let pi_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let arg_type = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
                 };
@@ -3005,8 +3025,8 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let pi_a =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
-                let pi_b = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
+                let pi_b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 // Unify param fields.
                 let param_a = pi_a.get("param").unwrap_or(&Value::Null);
                 let param_b = pi_b.get("param").unwrap_or(&Value::Null);
@@ -3035,7 +3055,7 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let pi_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let param_type = pi_val.get("param").cloned().unwrap_or(Value::Null);
                 // Extract closure info to get the variable name.
                 let body_closure = pi_val.get("body_closure").ok_or_else(|| {
@@ -3076,7 +3096,7 @@ impl NbeTypecheckEngine {
                 let kind = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let body_child = child_ref(ast, node_ref, 1)?;
                 let body_child_idx = body_child.index();
@@ -3111,9 +3131,9 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let forall_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let arg_type = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
                 };
@@ -3133,8 +3153,8 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let fa_a =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
-                let fa_b = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
+                let fa_b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 // Unify kind fields.
                 let kind_a = fa_a.get("kind").unwrap_or(&Value::Null);
                 let kind_b = fa_b.get("kind").unwrap_or(&Value::Null);
@@ -3162,7 +3182,7 @@ impl NbeTypecheckEngine {
                 let param = if args.is_empty() {
                     incoming.clone().unwrap_or(Value::Null)
                 } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                 };
                 let body_child = child_ref(ast, node_ref, 1)?;
                 let body_child_idx = body_child.index();
@@ -3197,9 +3217,9 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let vau_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let arg_type = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
                 };
@@ -3219,8 +3239,8 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let vau_a =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
-                let vau_b = self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
+                let vau_b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
                 // Unify param fields.
                 let param_a = vau_a.get("param").unwrap_or(&Value::Null);
                 let param_b = vau_b.get("param").unwrap_or(&Value::Null);
@@ -3253,9 +3273,9 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let left =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let right =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?;
                 let payload = serde_json::json!({"left": left, "right": right});
                 ctx.registry
                     .construct("type.eq", &payload)
@@ -3273,7 +3293,7 @@ impl NbeTypecheckEngine {
                 // check succeeds iff the two sides are equal. The expected
                 // type comes from `incoming` (threaded by the `check` scheme)
                 // or `args[0]` (ADR-0054).
-                let expected = if let Some(arg) = args.first() {
+                let expected = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -3307,7 +3327,7 @@ impl NbeTypecheckEngine {
                 // (the inhabited case); otherwise returns `type.empty`
                 // (ADR-0054). The Eq type value comes from `args[0]` or
                 // `incoming`.
-                let eq_val = if let Some(arg) = args.first() {
+                let eq_val = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -3346,7 +3366,7 @@ impl NbeTypecheckEngine {
                     lit_val.as_u64().ok_or_else(|| {
                         LangError::engine("construct_universe: lit must be a u64 level")
                     })? as u32
-                } else if let Some(arg) = args.first() {
+                } else if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                         .as_u64()
                         .ok_or_else(|| {
@@ -3371,7 +3391,7 @@ impl NbeTypecheckEngine {
                 // type values (base types like `type.number`), returns 0
                 // (base types live in `Type_0`). The type value comes from
                 // `args[0]` (a sub-scheme) or `incoming`.
-                let type_val = if let Some(arg) = args.first() {
+                let type_val = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -3396,11 +3416,11 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let level_a = self
-                    .eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?
+                    .eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
                     .as_u64()
                     .ok_or_else(|| LangError::engine("universe_max: arg 0 is not a u64"))?;
                 let level_b = self
-                    .eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming)?
+                    .eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?
                     .as_u64()
                     .ok_or_else(|| LangError::engine("universe_max: arg 1 is not a u64"))?;
                 Ok(Value::from(level_a.max(level_b)))
@@ -3426,9 +3446,9 @@ impl NbeTypecheckEngine {
                     ));
                 }
                 let value =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[0], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
                 let collection =
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming.clone())?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?;
                 let payload = serde_json::json!({"value": value, "collection": collection});
                 ctx.registry
                     .construct("type.membership", &payload)
@@ -3441,13 +3461,13 @@ impl NbeTypecheckEngine {
                 // collection type sub-scheme (or `lit` is the collection tag
                 // string). Returns `type.is_evidence` if membership holds,
                 // `type.empty` otherwise.
-                let value = if let Some(arg) = args.first() {
+                let value = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
                 };
                 let collection = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, &args[1], ctx, incoming.clone())?
+                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
                 } else if let Some(lit_val) = lit {
                     // lit is the collection tag string.
                     ctx.registry
@@ -3502,7 +3522,7 @@ impl NbeTypecheckEngine {
                 // `type.is_evidence` (if membership holds) or `type.empty`
                 // (if not). `args[0]` or `incoming` is the membership type
                 // value.
-                let membership_val = if let Some(arg) = args.first() {
+                let membership_val = if let Some(arg) = args.first().copied() {
                     self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
@@ -3673,6 +3693,7 @@ impl NbeTypecheckEngine {
     /// any cycle (e.g. from mutually-solved metas `m0 := m1, m1 := m0`) by
     /// leaving the revisited meta as-is, preventing infinite recursion.
     fn zonk(&self, v: &Value, ctx: &TypecheckContext) -> Value {
+        let _t = crate::stats::timer(&crate::stats::T_ZONK);
         let mut visited = std::collections::HashSet::new();
         self.zonk_inner(v, ctx, &mut visited)
     }
@@ -4623,6 +4644,8 @@ impl NbeTypecheckEngine {
     fn unify(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> Result<(), LangError> {
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
+        let _t = crate::stats::timer(&crate::stats::T_UNIFY);
+        crate::stats::unify(a, b);
         if a == b {
             return Ok(());
         }
@@ -4959,6 +4982,14 @@ struct TypecheckContext {
     /// Counter for generated dictionary-binding names
     /// (`$instance:{head}:{n}`).
     instance_count: usize,
+    /// `Term`→`TermData` conversion cache for the *lang-owned* type-rule
+    /// schemes (WS-H perf): `TermData::from_term` serializes the whole
+    /// scheme tree — keying by the `&Term` address runs the conversion
+    /// once per rule instead of once per node eval. Sound only for
+    /// pointers owned by `lang.types`, which outlive the ctx; ephemeral
+    /// `Term`s must take the direct `TermData::from_term` path
+    /// ([`NbeTypecheckEngine::eval_type_scheme`]).
+    scheme_td: HashMap<*const Term, Rc<TermData>>,
 }
 
 /// A registered dictionary instance (phase-3 WS-A): the elaboration
@@ -5024,6 +5055,7 @@ impl TypecheckContext {
             instances: HashMap::new(),
             pending_instances: Vec::new(),
             instance_count: 0,
+            scheme_td: HashMap::new(),
         }
     }
 
@@ -5100,6 +5132,16 @@ impl TypecheckContext {
     /// Look up a binding by index in Γ (0 = outermost).
     fn lookup_index(&self, idx: usize) -> Option<&Value> {
         self.gamma.get(idx).map(|(_, v)| v)
+    }
+
+    /// The `TermData` form of a lang-owned rule `Term`, converting once
+    /// per scheme (see the `scheme_td` field doc for the soundness
+    /// contract — lang-owned pointers only).
+    fn scheme_td(&mut self, term: &Term) -> Rc<TermData> {
+        self.scheme_td
+            .entry(term as *const Term)
+            .or_insert_with(|| Rc::new(TermData::from_term(term)))
+            .clone()
     }
 
     /// Mark the current length of Γ for later restoration (scoped closure

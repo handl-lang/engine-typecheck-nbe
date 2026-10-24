@@ -1615,3 +1615,14 @@ fn unannotated_ctor_result_index_is_decided_mismatch() {
         "VCons(0, true, VNil) : Vec(5, Bool) must not check"
     );
 }
+
+/// WS-H stats probe — sorts last (`zzz_`), so with `--test-threads=1`
+/// it prints the accumulated `HNL_TC_STATS`/`HNL_CONV_STATS` counters
+/// for the whole file. With the env vars unset it prints zeros and is
+/// a no-op.
+#[test]
+fn zzz_tc_stats_dump() {
+    if hnl_engine_typecheck_nbe::stats_enabled() {
+        eprintln!("{}", hnl_engine_typecheck_nbe::stats_report());
+    }
+}

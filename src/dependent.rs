@@ -667,6 +667,8 @@ fn proj_instantiate(template: &Value, args: &[Value]) -> Value {
 /// registered `C`), fold closed `Bin`/`Un` arithmetic, canonicalize the
 /// rest.
 pub(crate) fn eval_index(v: &Value, ctx: &TypecheckContext) -> Value {
+    let _t = crate::stats::timer(&crate::stats::T_EVAL_INDEX);
+    crate::stats::eval_index();
     eval_index_fuel(v, ctx, 64)
 }
 
@@ -1398,6 +1400,8 @@ static INDEX_SOLVER: BuiltinIndexSolver = BuiltinIndexSolver;
 /// `results`, closed terms compare, open `Bin`s go through the bounded
 /// [`IndexSolver`]. Returns `(ok, decided_failure)`.
 fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool) {
+    let _t = crate::stats::timer(&crate::stats::T_UNIFY_INDEX);
+    crate::stats::unify_index(a, b);
     let ea = eval_index(a, ctx);
     let eb = eval_index(b, ctx);
     if ea == eb {
@@ -2125,6 +2129,8 @@ impl NbeTypecheckEngine {
         idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        let _t = crate::stats::timer(&crate::stats::T_DEP_SYNTH_TYPE);
+        crate::stats::dep_synth_type(idx);
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
@@ -2945,6 +2951,8 @@ impl NbeTypecheckEngine {
         idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        let _t = crate::stats::timer(&crate::stats::T_NODE_INDEX_OR_TYPE);
+        crate::stats::node_index_or_type(idx);
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
         let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
@@ -3091,6 +3099,7 @@ impl NbeTypecheckEngine {
         node_ref: AstRef,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        crate::stats::synth_data(node_ref.index());
         let node = ast.get(node_ref).ok_or_else(|| {
             LangError::engine("synth_data: node out of bounds".to_string())
         })?;
@@ -3467,6 +3476,13 @@ impl NbeTypecheckEngine {
         spec: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        let _t = crate::stats::timer(&crate::stats::T_INSTANTIATE_CTOR);
+        crate::stats::instantiate_ctor(
+            spec.get("ctor")
+                .or_else(|| spec.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
         let mark = ctx.mark();
         let old_results = ctx.results.clone();
         let params: Vec<Value> = spec
@@ -4358,6 +4374,8 @@ impl NbeTypecheckEngine {
         } else {
             b
         };
+        let _t = crate::stats::timer(&crate::stats::T_DEP_UNIFY);
+        crate::stats::dep_unify(a, b);
         if a == b {
             return Ok(());
         }
