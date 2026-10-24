@@ -60,6 +60,27 @@ fn var_term(name: &str) -> Value {
     Value::Object(m)
 }
 
+/// Internal binding name for a `data` family's declared parameter while
+/// a `type.ctor_sig` telescope elaborates (`n` → `__fam_n`). The
+/// `__fam_` prefix is a namespace users cannot write into, so the
+/// ctor's fresh index metas never shadow — or get shadowed by — a
+/// same-named rigid `var` from an enclosing annotated signature
+/// (`f{n, a}` against `data Vec(n : Nat, a : Type)`).
+fn fam_binding_name(name: &str) -> String {
+    format!("__fam_{name}")
+}
+
+/// Resolve a source-level name through the ctor-telescope rename scope:
+/// during `instantiate_ctor_full` a family parameter's occurrences
+/// elaborate as its `__fam_<name>` binding; anything else (ctor args,
+/// user binders, outer rigids) passes through unchanged.
+fn fam_scoped(name: &str, ctx: &TypecheckContext) -> String {
+    ctx.fam_scope
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
 fn bin_term(op: &str, l: Value, r: Value) -> Value {
     let mut m = Map::new();
     m.insert("__tag__".to_string(), Value::String("Bin".to_string()));
@@ -2439,6 +2460,11 @@ impl NbeTypecheckEngine {
         let name_owned = node_name(node)
             .ok_or_else(|| LangError::engine("dep_synth_type: var payload is not a string"))?;
         let name = name_owned.as_str();
+        // Ctor-telescope scope: a family parameter's own occurrences
+        // resolve to the `__fam_<name>` binding, never the user's
+        // same-named rigid (instantiate_ctor_full).
+        let scoped = fam_scoped(name, ctx);
+        let name = scoped.as_str();
         // Γ bindings — source-level declarations (`data`, `type` aliases,
         // `assign`s, pattern binders) — legitimately shadow builtin names:
         // `data Bool :: …` must rebind `Bool` away from `type.bool`.
@@ -2689,6 +2715,10 @@ impl NbeTypecheckEngine {
                 // A declared family's application: `Vec(i⃗)` →
                 // `type.family_app{name, args}` — index arguments
                 // evaluate (1+1 → 2), rigid vars stay `var{n}`.
+                // Inside a ctor telescope a family-param callee means
+                // its `__fam_<name>` binding.
+                let scoped = fam_scoped(name, ctx);
+                let name = scoped.as_str();
         if let Some(bound) = ctx.lookup(name).cloned() {
                     match tag_of(&bound) {
                         Some("type.alias") => {
@@ -3023,6 +3053,10 @@ impl NbeTypecheckEngine {
                 .filter(|n| n.kind == "var")
                 .and_then(node_name);
             if let Some(cname) = callee_name {
+                // Ctor-telescope scope: a family-param callee means its
+                // `__fam_<name>` binding — and must never hit an outer
+                // ctor_sig of the same name.
+                let cname = fam_scoped(&cname, ctx);
                 if ctx
                     .lookup(&cname)
                     .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
@@ -3047,6 +3081,7 @@ impl NbeTypecheckEngine {
         // is not an index term.
         if node.kind == "var" {
             if let Some(cname) = node_name(node) {
+                let cname = fam_scoped(&cname, ctx);
                 if ctx
                     .lookup(&cname)
                     .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
@@ -3096,7 +3131,16 @@ impl NbeTypecheckEngine {
             return bin_term(&node.kind, l, r);
         }
         match node.kind.as_str() {
-            "var" => var_term(node.payload.as_str().unwrap_or("")),
+            // A `var` leaf mints the rigid index atom — inside a ctor
+            // telescope the family params mint their `__fam_<name>`
+            // atoms so the meta bindings, not the user's rigids, solve.
+            "var" => var_term(
+                &node
+                    .payload
+                    .as_str()
+                    .map(|n| fam_scoped(n, ctx))
+                    .unwrap_or_default(),
+            ),
             "paren" => child_at(ast, node, 0)
                 .and_then(|i| ast.get(i))
                 .map(|n| self.node_to_index_term(lang, ast, n, ctx))
@@ -3111,6 +3155,7 @@ impl NbeTypecheckEngine {
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
                     .and_then(node_name)
+                    .map(|c| fam_scoped(&c, ctx))
                     .unwrap_or_default();
                 let args: Vec<Value> = kids
                     .iter()
@@ -3464,10 +3509,12 @@ impl NbeTypecheckEngine {
 
     /// Instantiate a `type.ctor_sig` spec into a fresh `type.function`
     /// chain ending in `type.family_app` — one index metavariable per
-    /// family parameter (bound in Γ *and* `results`, so `xs : Vec(n, a)`
-    /// elaborates `n ↦ ?n` and the result index `n + 1` solves through
-    /// the same meta). Constructor argument names self-bind to
-    /// `var{name}` terms so later domains may mention them.
+    /// family parameter (bound in Γ *and* `results` under the internal
+    /// `__fam_<name>` spelling, so `xs : Vec(n, a)` elaborates
+    /// `__fam_n ↦ ?n` and the result index `n + 1` solves through the
+    /// same meta while a user's rigid `var{n}` stays untouched).
+    /// Constructor argument names self-bind to `var{name}` terms so
+    /// later domains may mention them.
     pub(crate) fn instantiate_ctor(&self, spec: &Value, ctx: &mut TypecheckContext) -> Value {
         let mark = ctx.mark();
         let old_results = ctx.results.clone();
@@ -3485,8 +3532,11 @@ impl NbeTypecheckEngine {
             }
             let mv = meta_value(id);
             if !pname.is_empty() {
-                ctx.extend(pname.to_string(), mv.clone());
-                ctx.bind_result(pname.to_string(), mv.clone());
+                // `__fam_<name>` — family param names are internal to
+                // the telescope, never a user's same-named rigid.
+                let bname = fam_binding_name(pname);
+                ctx.extend(bname.clone(), mv.clone());
+                ctx.bind_result(bname, mv.clone());
             }
             metas.push(mv);
         }
@@ -3498,6 +3548,7 @@ impl NbeTypecheckEngine {
         for a in &args {
             let aname = a.get("name").and_then(Value::as_str).unwrap_or("");
             if !aname.is_empty() {
+                ctx.extend(aname.to_string(), var_term(aname));
                 ctx.bind_result(aname.to_string(), var_term(aname));
             }
         }
@@ -3527,6 +3578,7 @@ impl NbeTypecheckEngine {
         );
         let mark = ctx.mark();
         let old_results = ctx.results.clone();
+        let old_fam_scope = ctx.fam_scope.clone();
         let params: Vec<Value> = spec
             .get("params")
             .and_then(Value::as_array)
@@ -3541,8 +3593,17 @@ impl NbeTypecheckEngine {
             }
             let mv = meta_value(id);
             if !pname.is_empty() {
-                ctx.extend(pname.clone(), mv.clone());
-                ctx.bind_result(pname, mv.clone());
+                // The family's parameter names bind under `__fam_<name>`
+                // — internal names no user binder can collide with — and
+                // `fam_scope` redirects the telescope's own `var{name}`
+                // occurrences to them. Binding `n`/`a` directly rewrote
+                // the user's same-named rigid vars through `results`
+                // (the annotated-arm `VCons(x, xs)` reconstruction bug:
+                // `Vec(n+1, ?k+1)` vs `Vec(?k+1, a)`).
+                let bname = fam_binding_name(&pname);
+                ctx.extend(bname.clone(), mv.clone());
+                ctx.bind_result(bname.clone(), mv.clone());
+                ctx.fam_scope.insert(pname, bname);
             }
             metas.push(mv);
         }
@@ -3554,9 +3615,20 @@ impl NbeTypecheckEngine {
         for a in &args {
             let aname = a.get("name").and_then(Value::as_str).unwrap_or("");
             if !aname.is_empty() {
+                // Arg names self-bind in Γ *and* `results` as the rigid
+                // `var{name}` index atom. The Γ entry is what stops a
+                // same-named outer binding — e.g. a match-arm pattern
+                // field `k : Nat` — from shadowing the telescope's
+                // `var{k}` so `xs : Vec(k, a)` resolves to `Number`.
+                ctx.extend(aname.to_string(), var_term(aname));
                 ctx.bind_result(aname.to_string(), var_term(aname));
             }
         }
+        // The fallible telescope elaboration runs under a scope guard so
+        // `fam_scope`/`results`/Γ restore on every exit — a failed
+        // instantiation must not leak the internal `__fam_` bindings
+        // into the caller's scope.
+        let out = (|ctx: &mut TypecheckContext| -> Result<Value, LangError> {
         let mut domains = Vec::with_capacity(args.len());
         for a in &args {
             let ty = match a.get("node").and_then(Value::as_u64) {
@@ -3646,9 +3718,12 @@ impl NbeTypecheckEngine {
             );
             ty = make_tag(ctx, "type.function", m);
         }
+        Ok(ty)
+        })(ctx);
         ctx.restore(mark);
         ctx.results = old_results;
-        Ok(ty)
+        ctx.fam_scope = old_fam_scope;
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -4925,8 +5000,11 @@ impl NbeTypecheckEngine {
     /// indices rewrite through `results` + an `eq_<name>` `Path`
     /// witness), binds the pattern fields to the instantiated domains,
     /// and checks the body — against the motive applied at the refined
-    /// indices when a `return … with` clause is present. `absurd` arms
-    /// discharge decided-impossible index equations.
+    /// indices when a `return … with` clause is present. A decided
+    /// index-unsatisfiable arm is *auto-discharged*: coverage doesn't
+    /// require it, its body is unchecked but allowed, and `absurd`
+    /// stays legal purely as explicit documentation of the dead
+    /// branch. `absurd` on a *reachable* arm remains an error.
     #[allow(clippy::too_many_arguments)]
     /// How the per-arm expected type of a dependent `match` is produced:
     /// an explicit `return … with` AST motive, or an *inferred* motive
@@ -5086,7 +5164,14 @@ impl NbeTypecheckEngine {
             }
 
             // Refine: scrutinee family_app indices vs ctor result.
+            // `impossible` = the ctor cannot produce this scrutinee;
+            // `index_decided` = proven so by *index* unification (the
+            // auto-discharge case — see below). A ctor result naming a
+            // different family is nominally impossible too, but that
+            // names a foreign family rather than a dead branch of this
+            // one, so it stays an error.
             let mut impossible = false;
+            let mut index_decided = false;
             let mut idx_args: Vec<Value> = Vec::new();
             if tag_of(&ctor_result) == Some("type.family_app")
                 && tag_of(scrutinee_type) == Some("type.family_app")
@@ -5144,16 +5229,12 @@ impl NbeTypecheckEngine {
                                 if decided
                                     || (num_val(&ea).is_some() && num_val(&eb).is_some())
                                 {
+                                    // Decided-unsatisfiable index
+                                    // equation: the arm can never fire.
+                                    // No diagnostic — the arm is
+                                    // auto-discharged below.
                                     impossible = true;
-                                    if !is_absurd {
-                                        ctx.diagnostics.push(TypecheckDiagnostic {
-                                            severity: "error".to_string(),
-                                            message: "match arm: constructor cannot produce \
-                                                      the scrutinee's index — unreachable branch"
-                                                .to_string(),
-                                            span: None,
-                                        });
-                                    }
+                                    index_decided = true;
                                 }
                             }
                             idx_args.push(eb);
@@ -5195,8 +5276,20 @@ impl NbeTypecheckEngine {
                     ctx.metas[id] = None;
                 }
                 ctx.results = old_results;
+                if index_decided {
+                    // Auto-discharge: the ctor's index unification is
+                    // decided-unsatisfiable, so the arm can never fire —
+                    // coverage doesn't require it and `absurd` isn't
+                    // needed (it stays legal purely as documentation).
+                    // The body is unchecked but allowed: it contributes
+                    // no arm type and binds no fields.
+                    continue;
+                }
+                // A ctor that builds a *different* family is impossible
+                // nominally, not by index unification — almost always a
+                // typo, so it keeps its error.
                 return Err(LangError::engine(
-                    "match: unreachable constructor arm (decided index mismatch)".to_string(),
+                    "match: unreachable constructor arm (foreign family)".to_string(),
                 ));
             }
 

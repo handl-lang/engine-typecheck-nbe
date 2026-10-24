@@ -1775,9 +1775,10 @@ impl NbeTypecheckEngine {
                 // Dependent elimination (ADR-0152 §3 — WS-C rewrite):
                 // ctor-pattern arms instantiate `type.ctor_sig`s and refine
                 // the scrutinee's family indices (rigid `var` rewrites +
-                // `eq_<name>` `Path` witnesses); `absurd` arms discharge
-                // decided-impossible index equations; the motive, when
-                // present, is applied per arm at the refined indices.
+                // `eq_<name>` `Path` witnesses); decided-impossible arms
+                // auto-discharge (`absurd` remains legal documentation);
+                // the motive, when present, is applied per arm at the
+                // refined indices.
                 let node = ast.get(node_ref).ok_or_else(|| {
                     LangError::engine(format!(
                         "synth_match_arms: node {} out of bounds",
@@ -4976,6 +4977,16 @@ struct TypecheckContext {
     /// marking never escapes its scope (same name, different binder,
     /// must not inherit the fact).
     nonneg_index_vars: std::collections::HashSet<String>,
+    /// Scoped rename map for constructor-telescope elaboration
+    /// (phase-3 annotated-arm fix): while `instantiate_ctor_full`
+    /// elaborates a `type.ctor_sig`'s domains/result, the family's
+    /// declared parameter names map to `__fam_<name>` internal
+    /// bindings, so a user's same-named rigid vars (`f{n, a}` against
+    /// `data Vec(n : Nat, a : Type)`) are never shadowed by the ctor's
+    /// fresh index metas. Consulted wherever a source name becomes a
+    /// `var{name}` index atom or a Γ/`results` lookup inside the
+    /// telescope window; restored when instantiation returns.
+    fam_scope: HashMap<String, String>,
     /// Metas minted for `nat`-flagged family parameters — a `Nat`
     /// index metavariable can never solve to a negative numeral, so
     /// `?k ≡ -1` is *decided*, not a solution. Meta ids are unique for
@@ -5068,6 +5079,7 @@ impl TypecheckContext {
             ctor_family: HashMap::new(),
             family_param_nat: HashMap::new(),
             nonneg_index_vars: std::collections::HashSet::new(),
+            fam_scope: HashMap::new(),
             nonneg_metas: std::collections::HashSet::new(),
             instances: HashMap::new(),
             pending_instances: Vec::new(),

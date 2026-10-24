@@ -15,7 +15,7 @@
 //! family index — metavariable indices solve (linearly), rigid `var`
 //! indices are rewritten through the branch-local `results` environment
 //! with a `Path` witness bound as `eq_<name>`, and a decided literal
-//! mismatch rejects the arm as unreachable.
+//! mismatch auto-discharges the arm (body unchecked but allowed).
 
 use handl_kit_data_prelude::language_from_yaml;
 use handl_language::{Ast, AstNode, AstRef, Language};
@@ -486,15 +486,16 @@ fn match_refinement_solves_linear_index() {
 }
 
 /// A constructor whose result index *cannot* equal the scrutinee's is
-/// an unreachable arm: `VNil : Vec(0, ?a)` can never produce a
-/// `Vec(2, Bool)` scrutinee, so the arm is rejected (and its body is
-/// not typechecked). Likewise, under `xs : Vec(1, Bool)` (refined from
-/// `?k + 1 ≡ 2`), an inner `VNil` arm is impossible — that rejection is
-/// only reachable because the outer arm solved `?k := 1`; without
-/// refinement `xs`'s index is an unsolved metavariable and the inner
-/// `VNil` arm passes.
+/// *auto-discharged*: `VNil : Vec(0, ?a)` can never produce a
+/// `Vec(2, Bool)` scrutinee, so the arm is skipped — coverage doesn't
+/// require it, `absurd` isn't needed, and its body is unchecked but
+/// allowed (here `VNil`, which would fail the arm-type join against
+/// `Bool` if it were ever checked). Under `xs : Vec(1, Bool)` (refined
+/// from `?k + 1 ≡ 2`) an inner `VNil` arm discharges the same way.
+/// Contrast: the same ill-typed body *is* checked where the arm is
+/// reachable.
 #[test]
-fn match_rejects_unreachable_constructor_arm() {
+fn match_auto_discharges_decided_impossible_arm() {
     let lang = canonical_lang();
     let decl = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
 
@@ -503,13 +504,15 @@ fn match_rejects_unreachable_constructor_arm() {
         &[
             decl,
             "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "bad : Bool = match v { VNil: false, VCons(x, xs): x }",
+            "ok : Bool = match v { VNil: VNil, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, direct);
     assert!(
-        has_error(&result),
-        "a VNil arm on a Vec(2, Bool) scrutinee is unreachable and should be rejected"
+        !has_error(&result),
+        "a VNil arm on a Vec(2, Bool) scrutinee is decided-impossible — \
+         auto-discharged with an unchecked body, got {:?}",
+        diags_of(&result)
     );
 
     let nested = parse_block(
@@ -517,13 +520,31 @@ fn match_rejects_unreachable_constructor_arm() {
         &[
             decl,
             "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "bad : Bool = match v { VCons(x, xs): match xs { VNil: false, VCons(y, ys): y } }",
+            "ok : Bool = match v { VCons(x, xs): match xs { VNil: VNil, VCons(y, ys): y } }",
         ],
     );
     let result = typecheck(&lang, nested);
     assert!(
+        !has_error(&result),
+        "under xs : Vec(1, Bool) the inner VNil arm is decided-impossible — \
+         auto-discharged, got {:?}",
+        diags_of(&result)
+    );
+
+    // Contrast: on a `Vec(1, Bool)` scrutinee the `VCons` arm is
+    // reachable — the ill-typed body is checked and fails.
+    let live = parse_block(
+        &lang,
+        &[
+            decl,
+            "v : Vec(1, Bool) = VCons(true, VNil)",
+            "bad : Bool = match v { VCons(x, xs): VNil, VNil: true }",
+        ],
+    );
+    let result = typecheck(&lang, live);
+    assert!(
         has_error(&result),
-        "under xs : Vec(1, Bool) the inner VNil arm is unreachable and should be rejected"
+        "a reachable arm's body is checked — `VCons(x, xs): VNil` cannot join Bool"
     );
 }
 
@@ -993,20 +1014,56 @@ fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
         diags_of(&result)
     );
 
-    // A *reachable* arm for VNil is now decided-unreachable, not merely
-    // unhandled: the unreachable-arm contract fires.
+    // A written `VNil` arm is decided-impossible → *auto-discharged*:
+    // allowed without `absurd`, its body unchecked (here `VNil`, which
+    // would fail against the `Bool` motive if checked).
     let stray = parse_block(
         &lang,
         &[
             decls[0],
             decls[1],
-            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VNil: true, VCons(x, xs): x }",
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VNil: VNil, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, stray);
     assert!(
-        has_error(&result),
-        "a live VNil arm on Vec(Succ n) is decided-unreachable — must error"
+        !has_error(&result),
+        "a live VNil arm on Vec(Succ n) is decided-impossible — auto-discharged, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The `zipWith` shape: `match v { VNil: _, VCons(x, xs): match ys {…} }`
+/// over two `Vec{n}` arguments. The outer `VCons` arm refines
+/// `n ↦ ?k + 1` (`?k` a `Nat`-sorted meta), so the inner match's `VNil`
+/// arm is decided-impossible (`0 ≡ ?k + 1` by the nonnegativity gap) and
+/// auto-discharges — coverage needs only the `VCons` arm, no `absurd`
+/// anywhere. The dead `VNil` bodies stay ill-typed on purpose: they pin
+/// the unchecked-but-allowed half of the contract.
+#[test]
+fn match_auto_discharge_zipwith_shape() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let zip = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            // `n + 0` spellings keep `n` a rigid index var (a bare `n`
+            // resolves to the `Nat` sort — see collections.hnl's gap
+            // log); the VCons arm's `n ↦ ?k + 1` rewrite then reaches
+            // the inner match's scrutinee.
+            "zw : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Pi(Vec(n + 0, Bool), w ~> Bool))) = n ~> v ~> w ~> match v { VNil: true, VCons(x, xs): match w { VNil: VNil, VCons(y, ys): y } }",
+        ],
+    );
+    let result = typecheck(&lang, zip);
+    assert!(
+        !has_error(&result),
+        "inner VNil arm under n ↦ ?k + 1 should auto-discharge, got {:?}",
+        diags_of(&result)
     );
 }
 
@@ -1591,6 +1648,54 @@ fn family_rec_resolves_eliminator_type() {
     assert!(
         !has_error(&result),
         "Vec.rec should resolve its eliminator type, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Annotated-arm `VCons` reconstruction (dogfood gap): inside
+/// `push{n, a} : a ~> Vec{n, a} ~> Vec{n + 1, a}` the arm's own `n`/`a`
+/// rigid vars collide with the ctor telescope's family params of the
+/// same name. The params bind internally as `__fam_<name>` so
+/// `v : Vec{n, a}` refines `n ≡ k + 1` (not `?k + 1`) and
+/// `VCons(k + 1, x, v)` reconstructs at `Vec{n + 1, a}` — previously
+/// the instantiation bound `n`/`a` in `results` directly and the
+/// scrutinee's rigids rewrote to the fresh metas.
+#[test]
+fn annotated_arm_family_params_dont_shadow_rigids() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(k : Nat, x : a, xs : Vec(k, a)) : Vec(k + 1, a)",
+            "push{n, a} : a ~> Vec{n, a} ~> Vec{n + 1, a} = x ~> v ~> match v { VNil: VCons(0, x, VNil), VCons(k, x2, xs): VCons(k + 1, x2, v) }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "annotated-arm VCons reconstruction should typecheck — __fam_ params must not shadow the user's rigids, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Same collision through the *element* parameter only: `dup{n, a}`
+/// matches on `Vec{n, a}` and rebuilds each ctor — `var{n}`/`var{a}`
+/// refine per arm while the telescope's `n`/`a` stay internal.
+#[test]
+fn annotated_arm_elem_param_scopes_cleanly() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(k : Nat, x : a, xs : Vec(k, a)) : Vec(k + 1, a)",
+            "dup{n, a} : Vec{n, a} ~> Vec{n, a} = v ~> match v { VNil: VNil, VCons(k, x, xs): VCons(k, x, xs) }",
+            "bump{n} : Vec{n, Bool} ~> Vec{n + 1, Bool} = v ~> match v { VNil: VCons(0, true, VNil), VCons(k, x, xs): VCons(k + 1, x, v) }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "same-named rigid params inside annotated match arms should check, got {:?}",
         diags_of(&result)
     );
 }
