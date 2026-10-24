@@ -1520,3 +1520,98 @@ fn io_bare_name_sig_checks_coverage() {
         diags_of(&result)
     );
 }
+
+/// The dogfood `append` equation (F5): inside the `VCons` arm the
+/// expected index `?k + 1 + m` must unify with the produced
+/// `m + ?k + 1` — commuted sums mixing rigid `var`s and unsolved
+/// metas canonicalize to one atom order (metas are honest ring atoms).
+#[test]
+fn commuted_sum_index_unifies_through_metas() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "append{n, m, a} : Vec{n, a} ~> Vec{m, a} ~> Vec{n + m, a} = xs ~> ys ~> match xs { VNil: ys, VCons(x, t): VCons(x, append(t)(ys)) }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "append should typecheck — ?k+1+m ≡ m+?k+1 canonicalizes, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Implicit index binders scope into body annotations (F3): the
+/// `{n, a}` names are rigid index vars inside the body, so
+/// `(v : Vec(n, a))` — the annotation the runtime's `match` desugar
+/// needs — unifies with `v`'s stored `Vec{n, a}` domain instead of
+/// reading `n`/`a` as unsolved sort metas.
+#[test]
+fn implicit_binder_names_scope_into_body_annotation() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "f{n, a} : Vec{n, a} ~> Vec{n, a} = v ~> (v : Vec(n, a))",
+            "g{n, a} : Vec{n + 1, a} ~> Vec{n + 1, a} = v ~> match (v : Vec(n + 1, a)) { VCons(x, xs): xs }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "implicit binder names should resolve as rigid index vars in body annotations, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// `F.rec` is visible to the checker (F4-adjacent): `field_access` on
+/// a `data` family resolves the family's eliminator binding — the
+/// `__splice__` block's `F.rec` — as a nested `type.function`, so
+/// `Vec.rec(motive, c0..)(indices.., v)` checks its case arguments
+/// against the ctors' instantiated domains.
+#[test]
+fn family_rec_resolves_eliminator_type() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "v1 : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
+            "step : Bool ~> Vec(1, Bool) ~> Number ~> Number = x ~> xs ~> ih ~> ih + 1",
+            "len : Number = Vec.rec(null, 0, step)(2, Bool, v1)",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "Vec.rec should resolve its eliminator type, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The F1 soundness hole stays closed: an un-annotated ctor result
+/// index mints the unrecoverable `lit null`, so `VCons(Zero, true,
+/// VNil) : Vec(5, Bool)` is a decided mismatch, not a free meta.
+#[test]
+fn unannotated_ctor_result_index_is_decided_mismatch() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "data Nat :: Zero | Succ(pred : Nat)",
+            "data Vec(n : Nat, a : Type) :: VNil | VCons(k : Nat, x : a, xs : Vec(k, a))",
+            "v : Vec(5, Bool) = VCons(Zero, true, VNil)",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "VCons(0, true, VNil) : Vec(5, Bool) must not check"
+    );
+}

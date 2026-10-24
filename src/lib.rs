@@ -367,6 +367,20 @@ impl NbeTypecheckEngine {
             ctx.node_types.insert(node_ref.index(), ty);
             return Ok(());
         }
+        // `x : Type` — a *type expression* is a term inhabiting
+        // `type.universe` (types are values, ADR-0032): `Bool`,
+        // `Vec(2, Bool)`, `Nat` as second-round index arguments of an
+        // `F.rec` call read as their type values. Fall through to the
+        // ordinary path when the node isn't a type expression at all.
+        if expected.get("__tag__").and_then(|t| t.as_str()) == Some("type.universe") {
+            if self
+                .dep_synth_type(lang, ast, node_ref.index(), ctx)
+                .is_ok()
+            {
+                ctx.node_types.insert(node_ref.index(), expected.clone());
+                return Ok(());
+            }
+        }
         // An unsolved metavariable carries no structure to check
         // against — synthesize and let unification solve it. (The
         // `check` schemes are directed: `type_field` of a meta yields
@@ -2547,6 +2561,27 @@ impl NbeTypecheckEngine {
                         field_name
                     )));
                 }
+                // A `data`-declared family is not a record — but `F.rec`
+                // (and any other `<F>.<name>` scope binding `synth_data`
+                // registers) resolves through Γ: the eliminator lives in
+                // the family's scope (the desugared `__splice__` binds a
+                // var literally named `F.rec`), not as a record field.
+                if container_type.get("__tag__").and_then(|t| t.as_str())
+                    == Some("type.family")
+                {
+                    let fname = container_type
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    if let Some(bound) =
+                        ctx.lookup(&format!("{fname}.{field_name}")).cloned()
+                    {
+                        return Ok(bound);
+                    }
+                    return Err(LangError::engine(format!(
+                        "record_field_type: family '{fname}' has no scope binding '{field_name}'"
+                    )));
+                }
                 let fields = container_type
                     .get("fields")
                     .and_then(|f| f.as_object())
@@ -4624,10 +4659,11 @@ impl NbeTypecheckEngine {
             if ctx.vcheck.conv(&va, &vb) {
                 return Ok(());
             }
-            // A `Hom(m, ·, ·)` at `m ≥ 3` sits beyond the checked
-            // fragment (ADR-0153 §2 — `~[3]~>` coherence terms are
-            // stored, not checked): the mismatch is stuck, not a
-            // decided failure. Restore the domain store so a failed
+            // A `Hom(m, ·, ·)` at `m ≥ 3` keeps the stuck escape:
+            // higher-cell unification is deliberately under-decided
+            // (the boundary law itself checks at every `m` since
+            // phase-3 WS-B — this is the conversion contract, not a
+            // checking cap). Restore the domain store so a failed
             // conversion leaves no partial solutions behind.
             if dependent::beyond_checked_dim(&va) || dependent::beyond_checked_dim(&vb) {
                 ctx.vcheck.store_restore(mark);

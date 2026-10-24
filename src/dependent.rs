@@ -931,6 +931,12 @@ fn poly_of(t: &Value, depth: u32) -> Option<IndexPoly> {
             ..Default::default()
         });
     }
+    // An unsolved meta is an honest atom — `{"__meta__": id}` carries no
+    // `__tag__`, so the `tag_of` gate below would drop it from the
+    // polynomial entirely and `m + ?k ≡ ?k + m` never normalized.
+    if extract_meta_id(t).is_some() {
+        return Some(poly_atom(t));
+    }
     let tag = tag_of(t)?;
     if tag == "Bin" {
         let op = t.get("op").and_then(Value::as_str).unwrap_or("");
@@ -3153,7 +3159,7 @@ impl NbeTypecheckEngine {
         if !name.is_empty() {
             let mut m = Map::new();
             m.insert("name".to_string(), Value::String(name.clone()));
-            m.insert("base".to_string(), base);
+            m.insert("base".to_string(), base.clone());
             ctx.extend(name.clone(), make_tag(ctx, "type.family", m));
         }
         // Ctor signatures — the `type.ctor_sig` spec re-elaborated per
@@ -3197,6 +3203,127 @@ impl NbeTypecheckEngine {
             if !c.name.is_empty() {
                 ctx.ctor_family.insert(c.name.clone(), name.clone());
             }
+        }
+        // `F.rec` — the family's dependent eliminator (ADR-0152). The
+        // desugar binds a var literally named `F.rec` in the `__splice__`
+        // block's scope; the checker mirrors it as a Γ binding so
+        // `field_access(F, "rec")` resolves (see `record_field_type`'s
+        // `type.family` arm). The eliminator's type is a nested
+        // `type.function` — `motive ~> c0 ~> … ~> cN ~> i0 ~> … ~> iP
+        // ~> F(?u) ~> ?mo`. Each case is the ctor's instantiated domain
+        // chain, then one `?mo` per *recursive* (self-family) argument
+        // for the induction hypothesis, then `?mo` — `c_VCons :
+        // a ~> Vec(?k, a) ~> ?mo ~> ?mo`. `?mm` stays a plain meta (the
+        // fold machine's `null`-motive call is legitimate); `?mo` is
+        // shared across cases and the final body — the non-dependent
+        // fold contract that every case and every `ih` agrees on one
+        // result type.
+        {
+            let mo = meta_value(ctx.fresh_meta());
+            let mut case_tys = Vec::with_capacity(ctors.len());
+            for c in &ctors {
+                if c.name.is_empty() {
+                    continue;
+                }
+                let spec = serde_json::json!({
+                    "__tag__": "type.ctor_sig",
+                    "__registry__": ctx.registry.registry_id(),
+                    "ctor": true,
+                    "family": name,
+                    "params": params.iter().map(|p| {
+                        serde_json::json!({"name": p.name, "node": p.node, "nat": p.nat})
+                    }).collect::<Vec<_>>(),
+                    "args": c.args.iter().map(|(n, t)| {
+                        serde_json::json!({"name": n, "node": t})
+                    }).collect::<Vec<_>>(),
+                    "result": c.result,
+                    "bare": c.bare,
+                });
+                let inst = self.instantiate_ctor_full(lang, ast, &spec, ctx)?;
+                // Unfold `dom0 ~> … ~> domk ~> result`: the domains are
+                // the case's leading params; each domain that is the
+                // family itself contributes one `?mo` hypothesis arg.
+                let mut domains = Vec::new();
+                let mut cur = inst;
+                while tag_of(&cur) == Some("type.function") {
+                    domains.push(cur.get("param").cloned().unwrap_or(Value::Null));
+                    cur = cur.get("body").cloned().unwrap_or(Value::Null);
+                }
+                let n_rec = domains
+                    .iter()
+                    .filter(|d| {
+                        tag_of(d) == Some("type.family_app")
+                            && d.get("name").and_then(Value::as_str) == Some(name.as_str())
+                    })
+                    .count();
+                let mut case = mo.clone();
+                for _ in 0..n_rec {
+                    let mut m = Map::new();
+                    m.insert("param".to_string(), mo.clone());
+                    m.insert("body".to_string(), case);
+                    case = make_tag(ctx, "type.function", m);
+                }
+                for d in domains.into_iter().rev() {
+                    let mut m = Map::new();
+                    m.insert("param".to_string(), d);
+                    m.insert("body".to_string(), case);
+                    case = make_tag(ctx, "type.function", m);
+                }
+                case_tys.push(case);
+            }
+            // The second-round call takes the family's index arguments
+            // then the scrutinee `F(?u)`; the result is `?mo`. A
+            // `nat`-flagged parameter's sort is the arithmetic
+            // `type.number` sort — `Nat` in `data …(n : Nat)` names the
+            // index sort, and once `data Nat` itself is declared the
+            // bare name resolves to *that* family instead.
+            let elems: Vec<Value> = base
+                .get("elements")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let sorts: Vec<Value> = params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if p.nat {
+                        let mut m = Map::new();
+                        make_tag(ctx, "type.number", std::mem::take(&mut m))
+                    } else {
+                        elems.get(i).cloned().unwrap_or(Value::Null)
+                    }
+                })
+                .collect();
+            let scrut_args: Vec<Value> = (0..sorts.len())
+                .map(|_| meta_value(ctx.fresh_meta()))
+                .collect();
+            let mut sm = Map::new();
+            sm.insert("name".to_string(), Value::String(name.clone()));
+            sm.insert("args".to_string(), Value::Array(scrut_args));
+            let scrut = make_tag(ctx, "type.family_app", sm);
+            let mut ty = {
+                let mut m = Map::new();
+                m.insert("param".to_string(), scrut);
+                m.insert("body".to_string(), mo.clone());
+                make_tag(ctx, "type.function", m)
+            };
+            for s in sorts.iter().rev() {
+                let mut m = Map::new();
+                m.insert("param".to_string(), s.clone());
+                m.insert("body".to_string(), ty);
+                ty = make_tag(ctx, "type.function", m);
+            }
+            for c in case_tys.into_iter().rev() {
+                let mut m = Map::new();
+                m.insert("param".to_string(), c);
+                m.insert("body".to_string(), ty);
+                ty = make_tag(ctx, "type.function", m);
+            }
+            let mut m = Map::new();
+            m.insert("param".to_string(), meta_value(ctx.fresh_meta()));
+            m.insert("body".to_string(), ty);
+            ty = make_tag(ctx, "type.function", m);
+            ctx.extend(format!("{name}.rec"), ty);
         }
         // Index projections (phase-3 WS-D): a unary ctor `S(arg : F)`
         // building `F` declares successor arithmetic — index-level
@@ -4605,7 +4732,22 @@ impl NbeTypecheckEngine {
         let param = expected.get("param").cloned().unwrap_or(Value::Null);
         let mark = ctx.mark();
         let old_results = ctx.results.clone();
-        ctx.extend(binder.clone(), param);
+        // The binder scopes into the body as a *rigid index variable* —
+        // the same `var{b}` in Γ and `results` (the `synth_assign`
+        // convention), so a name used inside a body annotation —
+        // `(v : Vec(n, a))` under `f{n, a}` — resolves to the index
+        // atom, not the binder's sort. Binding the `param` sort in Γ
+        // made `{n, a}`-style binders read as their unsolved sort meta
+        // (`Vec(n, a)` ≡ `Vec(?m1, ?m0)`) — and even a declared
+        // `{n : Nat}` sort is not `n`, it is `n`'s type. Only an
+        // *evidence* binder (`{ev : Eq(a)}`, `evidence: true` on the
+        // pi) keeps its former-app type in Γ — `ev` is a runtime
+        // dictionary its eliminations match on, not an index atom.
+        let evidence = expected.get("evidence") == Some(&Value::Bool(true));
+        ctx.extend(
+            binder.clone(),
+            if evidence { param } else { var_term(&binder) },
+        );
         ctx.bind_result(binder.clone(), var_term(&binder));
         let body = expected.get("body").cloned().unwrap_or(Value::Null);
         let r = self.check_node(lang, ast, node_ref, &body, ctx);
