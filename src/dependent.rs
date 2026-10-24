@@ -225,10 +225,12 @@ fn hom_dim_lit(v: &Val) -> Option<u64> {
     None
 }
 
-/// Whether a lifted value is a `Hom(m, ·, ·)` cell at dimension `m ≥ 3`
-/// — beyond the checked fragment (ADR-0153 §2 honest bound: `~[n]~>`
-/// terms at `n ≥ 3` parse and store but are *not* checked). Unifying
-/// one is stuck, never a decided failure.
+/// Whether a lifted value is a `Hom(m, ·, ·)` cell at dimension `m ≥ 3`.
+/// The boundary *law* is checked at every literal `m` since phase-3
+/// WS-B (the `n ≤ 3`/`n ≥ 4` caps are gone); this marker keeps the
+/// *unification* escape: a conversion failure between higher-cell
+/// types is stuck, never a decided failure — higher-cell *terms* are
+/// proof-relevant data the law deliberately under-decides.
 pub(crate) fn beyond_checked_dim(v: &Val) -> bool {
     hom_dim_lit(v).is_some_and(|m| m >= 3)
 }
@@ -1054,6 +1056,25 @@ fn ring_canon(v: Value) -> Value {
 /// The closed numeric value of a term, if it evaluates to a numeral.
 fn closed_num(v: &Value, ctx: &TypecheckContext) -> Option<f64> {
     num_val(&eval_index(v, ctx))
+}
+
+/// Whether the `{"__meta__": id}` term `needle` occurs anywhere in `v`
+/// (guards `instantiate_ctor_full`'s unrecoverable-index check: an
+/// argument domain mentioning `?i` pins the family index to it).
+fn meta_value_occurs(needle: &Value, v: &Value) -> bool {
+    let Some(id) = extract_meta_id(needle) else {
+        return false;
+    };
+    if extract_meta_id(v) == Some(id) {
+        return true;
+    }
+    if let Value::Array(xs) = v {
+        return xs.iter().any(|x| meta_value_occurs(needle, x));
+    }
+    if let Value::Object(m) = v {
+        return m.values().any(|x| meta_value_occurs(needle, x));
+    }
+    false
 }
 
 /// Whether `name` occurs in term `v` (guards the `var` rewrite against
@@ -3380,7 +3401,40 @@ impl NbeTypecheckEngine {
                     }
                     m.insert("args".to_string(), Value::Array(idx_args));
                 } else {
-                    m.insert("args".to_string(), Value::Array(metas.clone()));
+                    // Result-less ctor (`VCons(k : Nat, x : a,
+                    // xs : Vec(k, a))` — no `: F(i⃗)` annotation): an
+                    // index meta an argument domain can pin stays a
+                    // meta (`?a` solves through `x : a` /
+                    // `xs : Vec(k, a)`); a `nat` index parameter no
+                    // domain mentions is *unrecoverable* — the ctor
+                    // cannot compute it — so it mints the rigid
+                    // `var{name}` atom instead of a solvable meta.
+                    // `VCons(0, true, VNil) : Vec(5, Bool)` then
+                    // *fails* (`var{n} ≢ 5`) instead of letting
+                    // `?n := 5` — the F1 soundness hole.
+                    let idx_args: Vec<Value> = params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            let is_nat =
+                                p.get("nat").and_then(Value::as_bool).unwrap_or(false);
+                            let recoverable = domains
+                                .iter()
+                                .any(|d| meta_value_occurs(&metas[i], d));
+                            if is_nat && !recoverable {
+                                // `lit null` — the desugar's
+                                // unrecoverable-index convention: a
+                                // `nat` index the ctor cannot compute
+                                // never unifies with a numeral
+                                // (`null ≢ 5`), so the result index is
+                                // honestly absent, not a lie.
+                                Value::Null
+                            } else {
+                                metas[i].clone()
+                            }
+                        })
+                        .collect();
+                    m.insert("args".to_string(), Value::Array(idx_args));
                 }
                 m.insert("name".to_string(), Value::String(family.clone()));
                 make_tag(ctx, "type.family_app", m)
@@ -5914,7 +5968,38 @@ impl NbeTypecheckEngine {
                         }
                         _ => {
                             self.check_node(lang, ast, arg_ref, &param, ctx)?;
-                            cur.get("body").cloned().unwrap_or(Value::Null)
+                            let body = cur.get("body").cloned().unwrap_or(Value::Null);
+                            // Dependent application (the model's
+                            // `subst_term_` rule): a `param_name`-
+                            // carrying `type.function` — a ctor
+                            // telescope layer (`VCons(k : Nat, x : a,
+                            // xs : Vec(k, a))`) — substitutes the
+                            // argument's index term for the bound name
+                            // in the codomain, so `xs`'s domain
+                            // `Vec(k, a)` sees the applied index and a
+                            // declared result `Vec(k + 1, a)` computes
+                            // rather than minting a fresh meta.
+                            match cur.get("param_name").and_then(Value::as_str) {
+                                Some(pname) if !pname.is_empty() => {
+                                    let arg_node = ast.get(arg_ref).ok_or_else(|| {
+                                        LangError::engine(
+                                            "call: arg node out of bounds".to_string(),
+                                        )
+                                    })?;
+                                    let term =
+                                        self.node_to_index_term(lang, ast, arg_node, ctx);
+                                    if term.is_null() {
+                                        body
+                                    } else {
+                                        subst_index(
+                                            &body,
+                                            &var_term(pname),
+                                            &eval_index(&term, ctx),
+                                        )
+                                    }
+                                }
+                                _ => body,
+                            }
                         }
                     }
                 }
