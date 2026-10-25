@@ -6164,6 +6164,193 @@ impl NbeTypecheckEngine {
         self.comp_axis_typed(&Val::Const(TaggedValue::Int(axis)), &a_ty, &b_ty, ctx)
     }
 
+    /// Whether `node` (a `call`/`index_app`/`dimension`) invokes the
+    /// `perform` op-emission builtin: the callee is `var("perform")`, or
+    /// a `field-access` selecting `.perform` off `var("io")`
+    /// (`io.perform`). A Γ/results binding for `perform` shadows the
+    /// builtin — the same source-level-shadows-builtin convention
+    /// `dep_synth_var_type` applies (injected `type.unknown` wire
+    /// placeholders do not shadow: `hnl typecheck`'s prelude seeds the
+    /// `io`/`perform` module wires as placeholders, which is exactly
+    /// what lets the builtin name reach `synth_call` unannotated).
+    fn is_perform_call(&self, ast: &Ast, node: &AstNode, ctx: &TypecheckContext) -> bool {
+        let Some(kids) = children_of(node) else {
+            return false;
+        };
+        let Some(callee) = kids
+            .first()
+            .and_then(Value::as_u64)
+            .and_then(|i| ast.get(AstRef::new(i as usize)))
+        else {
+            return false;
+        };
+        let is_perform = match callee.kind.as_str() {
+            "var" => node_name(callee).as_deref() == Some("perform"),
+            "field-access" => {
+                // `io.perform` — the receiver must be the module wire
+                // `var("io")`; the field is child 1 (`payload.field` as
+                // the fallback for hand-built nodes).
+                let receiver_is_io = children_of(callee)
+                    .and_then(|k| k.first())
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .is_some_and(|r| r.kind == "var" && node_name(r).as_deref() == Some("io"))
+                    && ctx.lookup_gamma("io").is_none();
+                let field_is_perform = children_of(callee)
+                    .and_then(|k| k.get(1))
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(|n| node_name(n))
+                    .or_else(|| {
+                        callee
+                            .payload
+                            .get("field")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("perform");
+                receiver_is_io && field_is_perform
+            }
+            _ => false,
+        };
+        is_perform
+            && ctx.lookup_gamma("perform").is_none()
+            && !ctx.results.contains_key("perform")
+    }
+
+    /// `perform(op, arg)` — synthesize `IO{op: T}` (ADR-0153 §4). `op` is
+    /// a *named* op: a `var` reads as the op *name* (at runtime an
+    /// unbound var evaluates to its name string; `puts` is deliberately
+    /// never checked as a value), a string literal reads directly, and
+    /// `sym("name")`/`sym.seeded("name")` reads its seed. `T` is `arg`'s
+    /// synthesized type (`type.unit` when the arg is omitted). The
+    /// result is canonical `Former{type.io}` data — the same spelling
+    /// `dep_synth_call_type`'s `IO(sig)` arm emits — so `handle`'s
+    /// `handle_sig_check` and sig record-width subtyping read it
+    /// unchanged.
+    fn synth_perform(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        _node: &AstNode,
+        kids: &[Value],
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let op_idx = kids
+            .get(1)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LangError::engine("perform: expected perform(op, arg)".to_string())
+            })? as usize;
+        let op_node = ast.get(AstRef::new(op_idx)).ok_or_else(|| {
+            LangError::engine("perform: op operand out of bounds".to_string())
+        })?;
+        let string_payload = |n: &AstNode| {
+            n.payload
+                .get("value")
+                .and_then(Value::as_str)
+                .or_else(|| n.payload.as_str())
+                .map(str::to_string)
+        };
+        let op_name = match op_node.kind.as_str() {
+            "var" => node_name(op_node),
+            "value" | "lit" => string_payload(op_node),
+            "call" => {
+                // `sym("puts")` / `sym.seeded("puts")` — the op name is
+                // the sym's seed string.
+                let ck = children_of(op_node);
+                let cname = ck
+                    .and_then(|k| k.first())
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(|c| {
+                        if c.kind == "var" {
+                            node_name(c)
+                        } else {
+                            children_of(c)
+                                .and_then(|k| k.get(1))
+                                .and_then(Value::as_u64)
+                                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                                .and_then(|f| node_name(f))
+                        }
+                    });
+                match cname.as_deref() {
+                    Some("sym") | Some("seeded") => ck
+                        .and_then(|k| k.get(1))
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(|a| string_payload(a)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(op_name) = op_name else {
+            return Err(LangError::engine(
+                "perform: op operand must name an op — a bare identifier, \
+                 a string literal, or sym(\"name\")"
+                    .to_string(),
+            ));
+        };
+        let arg_ty = match kids.get(2).and_then(Value::as_u64) {
+            Some(i) => self.synth_node(lang, ast, AstRef::new(i as usize), ctx)?,
+            None => {
+                let mut m = Map::new();
+                make_tag(ctx, "type.unit", std::mem::take(&mut m))
+            }
+        };
+        let mut sig = Map::new();
+        sig.insert(op_name, arg_ty);
+        let vs = domain_lift(&Value::Object(sig), ctx);
+        Ok(domain_quote(
+            &Val::Former {
+                head: checker::type_sym("type.io"),
+                args: vec![vs],
+            },
+            ctx,
+        ))
+    }
+
+    /// `check_call` — the directed `call` check (the `type.call` `check`
+    /// scheme, lifted to a judgment so `perform` can intercept). For a
+    /// `perform(op, arg)` call the generic scheme cannot see that `op`
+    /// is a *name* — checking it as a value reports an unbound `puts` —
+    /// so the call is synthesized (`synth_call`'s `synth_perform` branch
+    /// mints `IO{op: T}`) and unified against the expected type — record
+    /// -width sig subtyping included (`IO{puts: Str}` accepts an
+    /// `IO{puts, fs}` expectation). Every other call reproduces the
+    /// former scheme verbatim: synth the callee, check the first
+    /// argument against its `param`, yield `body`.
+    pub(crate) fn check_call_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        node: &AstNode,
+        incoming: Option<Value>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        if self.is_perform_call(ast, node, ctx) {
+            let expected = incoming.unwrap_or(Value::Null);
+            let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+            self.dep_unify(&ty, &expected, ctx)?;
+            return Ok(ty);
+        }
+        let kids = children_of(node)
+            .ok_or_else(|| LangError::engine("check_call: no children".to_string()))?;
+        let callee_idx = kids.first().and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine("check_call: callee index not a u64".to_string())
+        })? as usize;
+        let funtype = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
+        let arg_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine("check_call: arg index not a u64".to_string())
+        })? as usize;
+        let param = funtype.get("param").cloned().unwrap_or(Value::Null);
+        self.check_node(lang, ast, AstRef::new(arg_idx), &param, ctx)?;
+        Ok(funtype.get("body").cloned().unwrap_or(Value::Null))
+    }
+
     /// `call` typing — curried application: the callee synthesizes a
     /// `type.function`/`type.pi`/`ctor_sig` chain; each argument child is
     /// checked against the current domain, producing the codomain for the
@@ -6183,6 +6370,15 @@ impl NbeTypecheckEngine {
         let callee_idx = kids[0].as_u64().ok_or_else(|| {
             LangError::engine("call: callee index not a u64".to_string())
         })? as usize;
+        // `perform` — the `IO<sig>` op-emission builtin (ADR-0153 §4):
+        // `perform(op, arg)` synthesizes `IO{op: T}` — `op` is a *named*
+        // op (a name operand, not a checked value) and `T` the arg's
+        // type. The name-keyed callee dispatch mirrors
+        // `dep_synth_call_type`'s `IO`/`Pi`/`Family` table — the scheme
+        // vocabulary cannot compute a sig record from an op name.
+        if self.is_perform_call(ast, node, ctx) {
+            return self.synth_perform(lang, ast, node, kids, ctx);
+        }
         let mut cur = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
         // `<>` index application — `f<i, …>` (`dimension` post-migration,
         // `index_app` for pre-desugar/hand-built trees): each argument

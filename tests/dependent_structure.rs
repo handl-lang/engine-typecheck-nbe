@@ -1397,6 +1397,135 @@ fn handle_arrow_codomain_checked() {
     );
 }
 
+/// `perform(op, arg)` — the `IO<sig>` op-emission builtin (ADR-0153 §4):
+/// it mints `IO{op: T}` from the op *name* and the arg's type — the
+/// checked-side inverse of the runtime's `io.perform` mint.
+/// `synth_perform` reads the `puts` operand as a name (a bare identifier
+/// is deliberately never env-resolved or checked as a value).
+#[test]
+fn perform_mints_io_sig_from_op_name() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "x : IO<{ puts: Str }> = perform(puts, \"hi\")",
+            "y : IO<{ puts: Str }> = io.perform(puts, \"hi\")",
+            "z : IO<{ fs: Str }> = perform(\"fs\", \"path\")",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "perform should mint IO{{op: T}}, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// A wrong sig-entry type is a decided mismatch — `perform(puts, "hi")`
+/// is `IO{puts: Str}`, never `IO{puts: Nat}`.
+#[test]
+fn perform_wrong_sig_entry_errors() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &["x : IO<{ puts: Nat }> = perform(puts, \"hi\")"],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "IO{{puts: Str}} checked against IO{{puts: Nat}} should error"
+    );
+}
+
+/// `handle` on a `perform`ed op runs the same `handle_sig_check`
+/// coverage logic as a declared effect — the covered entry takes the
+/// impl's declared return type.
+#[test]
+fn perform_through_handle_checks_sig_coverage() {
+    let lang = canonical_lang();
+    // Positive: the covered entry takes the impl's declared return type.
+    let ok = parse_block(
+        &lang,
+        &[
+            "puts_impl : Str ~> Str = s ~> s",
+            "x : IO<{ puts: Str }> = handle perform(puts, \"hi\") with {puts: puts_impl}",
+        ],
+    );
+    let result = typecheck(&lang, ok);
+    assert!(
+        !has_error(&result),
+        "handled perform should check, got {:?}",
+        diags_of(&result)
+    );
+    // A handler declaring ops the performed sig never names is the
+    // WS-F spurious-impl diagnostic; an empty handler covering none of
+    // the performed ops is the guaranteed-no-op diagnostic.
+    let spurious = parse_block(
+        &lang,
+        &[
+            "puts_impl : Str ~> Str = s ~> s",
+            "z := handle perform(puts, \"hi\") with {fs: puts_impl}",
+        ],
+    );
+    let result = typecheck(&lang, spurious);
+    assert!(
+        diags_of(&result)
+            .iter()
+            .any(|d| d.contains("never names")),
+        "spurious impl should diagnose, got {:?}",
+        diags_of(&result)
+    );
+    let none = parse_block(
+        &lang,
+        &["z := handle perform(puts, \"hi\") with {}"],
+    );
+    let result = typecheck(&lang, none);
+    assert!(
+        diags_of(&result)
+            .iter()
+            .any(|d| d.contains("none of the body's declared ops")),
+        "empty handler should diagnose, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// `perform` is a *named* op emission — a non-name operand (a computed
+/// expression) is a decided error.
+#[test]
+fn perform_computed_op_operand_errors() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &["x := perform(1 + 2, \"hi\")"],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "perform(1 + 2, …) should error — the op operand must be a name"
+    );
+}
+
+/// A user `perform` binding shadows the builtin — `perform(puts, "hi")`
+/// then checks as an ordinary call (which errors on the still-unbound
+/// `puts` arg here, proving the builtin's name-read did not run).
+#[test]
+fn perform_is_shadowable() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "perform : Str ~> Str ~> Str = a ~> b ~> a",
+            "x : Str = perform(\"a\", \"b\")",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "a source-level perform binding should shadow the builtin, got {:?}",
+        diags_of(&result)
+    );
+}
+
 /// Effect-row polymorphism: `IO(s)` with `s` a `{…}`-bound sig var — the
 /// implicit `type.pi` binder inserts a fresh meta at application and the
 /// record-width sig unification solves it to the concrete sig object.
