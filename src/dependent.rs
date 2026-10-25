@@ -2373,28 +2373,36 @@ impl NbeTypecheckEngine {
             "call" | "index_app" | "dimension" => {
                 self.dep_synth_call_type(lang, ast, node, ctx)
             }
-            // `forall b, T` — parse-level `Pi` alias (phase-2 WS-C sugar):
-            // the binder child is `type-annot(var, A)` or a bare `var`
-            // (unsorted — a fresh meta domain), the body child the type
-            // expression. Mints the *same* `type.pi{param, body_closure}`
-            // `Pi(A, b ~> T)` produces — no new semantics.
-            "forall" => {
+            // `forall b, T` / `exists b, T` — parse-level `Pi`/`Sigma`
+            // aliases (phase-2 WS-C sugar; `exists` is the existential
+            // twin). The binder child is `type-annot(var, A)` or a bare
+            // `var` (unsorted — a fresh meta domain), the body child the
+            // type expression. Mints the *same* `type.pi{param,
+            // body_closure}` `Pi(A, b ~> T)` / `type.sigma{param,
+            // body_closure}` `Sigma(A, b ~> T)` produces — no new
+            // semantics.
+            kind @ ("forall" | "exists") => {
+                let (tag, kw) = if kind == "exists" {
+                    ("type.sigma", "exists")
+                } else {
+                    ("type.pi", "forall")
+                };
                 let kids = children_of(node).ok_or_else(|| {
-                    LangError::engine("dep_synth_type: forall has no children")
+                    LangError::engine(format!("dep_synth_type: {kw} has no children"))
                 })?;
                 if kids.len() < 2 {
-                    return Err(LangError::engine(
-                        "dep_synth_type: forall needs [binder, body]".to_string(),
-                    ));
+                    return Err(LangError::engine(format!(
+                        "dep_synth_type: {kw} needs [binder, body]"
+                    )));
                 }
                 let binder_idx = kids[0].as_u64().ok_or_else(|| {
-                    LangError::engine("dep_synth_type: forall binder idx")
+                    LangError::engine(format!("dep_synth_type: {kw} binder idx"))
                 })? as usize;
                 let body_idx = kids[1].as_u64().ok_or_else(|| {
-                    LangError::engine("dep_synth_type: forall body idx")
+                    LangError::engine(format!("dep_synth_type: {kw} body idx"))
                 })? as usize;
                 let bnode = ast.get(AstRef::new(binder_idx)).ok_or_else(|| {
-                    LangError::engine("dep_synth_type: forall binder out of bounds")
+                    LangError::engine(format!("dep_synth_type: {kw} binder out of bounds"))
                 })?;
                 let (var_name, param) = if bnode.kind == "type-annot"
                     || role_child_ref(lang, bnode, "annot").is_some()
@@ -2416,18 +2424,24 @@ impl NbeTypecheckEngine {
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
                         .and_then(node_name)
                         .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: forall binder is not a name")
+                            LangError::engine(format!(
+                                "dep_synth_type: {kw} binder is not a name"
+                            ))
                         })?;
                     let ty_idx = bk
                         .get(annot)
                         .and_then(Value::as_u64)
                         .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: forall binder missing sort")
+                            LangError::engine(format!(
+                                "dep_synth_type: {kw} binder missing sort"
+                            ))
                         })? as usize;
                     (vn, self.dep_synth_type(lang, ast, ty_idx, ctx)?)
                 } else {
                     let vn = node_name(bnode).ok_or_else(|| {
-                        LangError::engine("dep_synth_type: forall binder is not a name")
+                        LangError::engine(format!(
+                            "dep_synth_type: {kw} binder is not a name"
+                        ))
                     })?;
                     (vn, meta_value(ctx.fresh_meta()))
                 };
@@ -2437,7 +2451,7 @@ impl NbeTypecheckEngine {
                     "body_closure".to_string(),
                     serde_json::json!({"var_name": var_name, "body_child_idx": body_idx, "dep": true}),
                 );
-                Ok(make_tag(ctx, "type.pi", m))
+                Ok(make_tag(ctx, tag, m))
             }
             "dim_arrow" => {
                 // `A ~[k]~> B` in annotation position — `Hom(k, A, B)`
@@ -6797,6 +6811,12 @@ impl NbeTypecheckEngine {
             .ok_or_else(|| LangError::engine("handle: missing impl child".to_string()))?;
         let t_body = self.synth_node(lang, ast, target_idx, ctx)?;
         let t_impl = self.synth_node(lang, ast, impl_idx, ctx)?;
+        // ADR-0158 `acc` clause: `handle f with h acc s0` — the optional
+        // trailing child is the accumulator seed; synthesize it (for
+        // validation) — the coverage rules are unchanged by `acc`.
+        if let Some(acc_idx) = role_child_ref(lang, node, "acc") {
+            let _t_acc = self.synth_node(lang, ast, acc_idx, ctx)?;
+        }
         self.handle_result_type(&t_body, &t_impl, ctx)
     }
 
@@ -6859,7 +6879,18 @@ impl NbeTypecheckEngine {
         // The handler's declared op set — `type.record{fields}`.
         let ti = self.zonk(t_impl, ctx);
         let fields = if tag_of(&ti) == Some("type.record") {
-            ti.get("fields").and_then(Value::as_object).cloned()
+            // ADR-0158: `return` is the handler's unit clause and
+            // `__*__` keys are reserved slots (`__acc__`, …) — neither
+            // is an op impl, so both drop out of coverage/spurious
+            // accounting.
+            ti.get("fields")
+                .and_then(Value::as_object)
+                .cloned()
+                .map(|f| {
+                    f.into_iter()
+                        .filter(|(k, _)| k != "return" && !k.starts_with("__"))
+                        .collect::<Map<String, Value>>()
+                })
         } else {
             None
         };
