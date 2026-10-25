@@ -849,25 +849,25 @@ fn io_signature_subtyping() {
     let good = parse_block(
         &lang,
         &[
-            "narrow : IO({puts: Str ~> Unit}) ~> IO({puts: Str ~> Unit, gets: Unit ~> Str}) = x ~> x",
-            "top : IO({puts: Str ~> Unit}) ~> IO = x ~> x",
+            "narrow : IO<{ puts: Str ~> Unit }> ~> IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> = x ~> x",
+            "top : IO<{ puts: Str ~> Unit }> ~> IO = x ~> x",
         ],
     );
     let result = typecheck(&lang, good);
     assert!(
         !has_error(&result),
-        "IO({{puts}}) should check against IO({{puts,gets}}) and bare IO, got {:?}",
+        "IO<{{puts}}> should check against IO<{{puts,gets}}> and bare IO, got {:?}",
         diags_of(&result)
     );
 
     let bad = parse_block(
         &lang,
-        &["widen : IO({puts: Str ~> Unit, gets: Unit ~> Str}) ~> IO({puts: Str ~> Unit}) = x ~> x"],
+        &["widen : IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> ~> IO<{ puts: Str ~> Unit }> = x ~> x"],
     );
     let result = typecheck(&lang, bad);
     assert!(
         has_error(&result),
-        "IO({{puts,gets}}) must not check against IO({{puts}}) — extra op not allowed"
+        "IO<{{puts,gets}}> must not check against IO<{{puts}}> — extra op not allowed"
     );
 }
 
@@ -1034,7 +1034,7 @@ fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
 }
 
 /// The `zipWith` shape: `match v { VNil: _, VCons(x, xs): match ys {…} }`
-/// over two `Vec{n}` arguments. The outer `VCons` arm refines
+/// over two `Vec<n>` arguments. The outer `VCons` arm refines
 /// `n ↦ ?k + 1` (`?k` a `Nat`-sorted meta), so the inner match's `VNil`
 /// arm is decided-impossible (`0 ≡ ?k + 1` by the nonnegativity gap) and
 /// auto-discharges — coverage needs only the `VCons` arm, no `absurd`
@@ -1296,16 +1296,16 @@ fn ordered_call_annotation_checks_equality() {
 /// A covering impl's declared return replaces the op's sig entry — the
 /// interpret-in-place semantics of the runtime's `interpret_io_former`
 /// (`handle print("x") with {puts: puts_impl}` produces
-/// `IO({puts: Unit})`).
+/// `IO<{ puts: Unit }>`).
 #[test]
 fn handle_covered_op_returns_impl_result() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO({puts: String ~> Unit}) = s ~> print(s)",
+            "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
             "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
-            "x : IO({puts: Unit}) = handle print(\"x\") with {puts: puts_impl}",
+            "x : IO<{ puts: Unit }> = handle print(\"x\") with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1323,7 +1323,7 @@ fn handle_covered_op_returns_impl_result() {
 fn handle_missing_required_op_errors() {
     let lang = canonical_lang();
     let decls = [
-        "print : String ~> IO({puts: String ~> Unit}) = s ~> print(s)",
+        "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
         "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
     ];
     let spurious = parse_block(
@@ -1358,13 +1358,13 @@ fn handle_uncovered_op_passes_through_as_io() {
     let ast = parse_block(
         &lang,
         &[
-            "send : String ~> IO({puts: String ~> Unit, gets: String ~> Unit}) = s ~> send(s)",
+            "send : String ~> IO<{ puts: String ~> Unit, gets: String ~> Unit }> = s ~> send(s)",
             "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
             // `gets` uncovered → stays an op in the residual;
             // `puts` covered → its entry is replaced by the impl's
             // `Unit` return (annotating `puts: Unit` proves the
             // replacement — a stale `String ~> Unit` would fail conv).
-            "x : IO({puts: Unit, gets: String ~> Unit}) = handle send(\"x\") with {puts: puts_impl}",
+            "x : IO<{ puts: Unit, gets: String ~> Unit }> = handle send(\"x\") with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1384,9 +1384,9 @@ fn handle_arrow_codomain_checked() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO({puts: String ~> Unit}) = s ~> print(s)",
+            "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
             "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
-            "handled_print : String ~> IO({puts: Unit}) = handle print with {puts: puts_impl}",
+            "handled_print : String ~> IO<{ puts: Unit }> = handle print with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1406,11 +1406,11 @@ fn sig_row_polymorphism_solves_meta() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO({puts: String ~> Unit}) = s ~> print(s)",
-            "id_io{s} : (String ~> IO(s)) ~> String ~> IO(s) = f ~> x ~> f(x)",
-            "y : IO({puts: String ~> Unit}) = id_io(print)(\"x\")",
-            "id_sig{s : Sig} : (String ~> IO(s)) ~> String ~> IO(s) = f ~> x ~> f(x)",
-            "z : IO({puts: String ~> Unit}) = id_sig(print)(\"x\")",
+            "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
+            "id_io<s> : (String ~> IO(s)) ~> String ~> IO(s) = f ~> x ~> f(x)",
+            "y : IO<{ puts: String ~> Unit }> = id_io(print)(\"x\")",
+            "id_sig<s : Sig> : (String ~> IO(s)) ~> String ~> IO(s) = f ~> x ~> f(x)",
+            "z : IO<{ puts: String ~> Unit }> = id_sig(print)(\"x\")",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1426,7 +1426,7 @@ fn sig_row_polymorphism_solves_meta() {
 // ---------------------------------------------------------------------------
 
 /// `instance <C(i⃗)> := <dict>` registers a dictionary; an implicit
-/// `{eq : Eq a}` binder's former-app domain discharges by dictionary
+/// `<eq : Eq a>` binder's former-app domain discharges by dictionary
 /// search — `f(Zero)` resolves `Eq Nat` from the declared instance
 /// once the index meta `?a` solves to `Nat` through the explicit arg.
 #[test]
@@ -1438,7 +1438,7 @@ fn instance_resolves_implicit_evidence_binder() {
             "data Nat :: Zero | Succ(pred : Nat)",
             "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
-            "f{a, eq : Eq(a)} : a ~> a := v ~> v",
+            "f<a, eq : Eq(a)> : a ~> a := v ~> v",
             "r := f(Zero)",
         ],
     );
@@ -1463,7 +1463,7 @@ fn instance_missing_produces_named_error() {
             "data Bool :: True | False",
             "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
-            "f{a, eq : Eq(a)} : a ~> a := v ~> v",
+            "f<a, eq : Eq(a)> : a ~> a := v ~> v",
             "r := f(True)",
         ],
     );
@@ -1519,7 +1519,7 @@ fn distinct_instance_index_shapes_coexist() {
             "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
             "instance Eq(Bool) := {eq: (x, y) ~> x == y}",
-            "f{a, eq : Eq(a)} : a ~> a := v ~> v",
+            "f<a, eq : Eq(a)> : a ~> a := v ~> v",
             "r1 := f(Zero)",
             "r2 := f(True)",
         ],
@@ -1546,7 +1546,7 @@ fn generic_indexed_instance_resolves() {
             "data List(a : Type) :: LNil | LCons(h : a, t : List(a))",
             "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
             "instance Eq(List(a)) := {eq: (x, y) ~> true}",
-            "f{a, eq : Eq(List(a))} : a ~> a := v ~> v",
+            "f<a, eq : Eq(List(a))> : a ~> a := v ~> v",
             "r := f(LCons(Zero, LNil))",
         ],
     );
@@ -1558,7 +1558,7 @@ fn generic_indexed_instance_resolves() {
     );
 }
 
-/// The bare-name sig shorthand: `IO({puts})` declares op `puts` with an
+/// The bare-name sig shorthand: `IO<{ puts }>` declares op `puts` with an
 /// unstated request — handler typing still checks coverage.
 #[test]
 fn io_bare_name_sig_checks_coverage() {
@@ -1566,8 +1566,8 @@ fn io_bare_name_sig_checks_coverage() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO({puts}) = s ~> print(s)",
-            "x : IO({puts}) = handle print(\"x\") with {puts: (s) ~> s}",
+            "print : String ~> IO<{ puts }> = s ~> print(s)",
+            "x : IO<{ puts }> = handle print(\"x\") with {puts: (s) ~> s}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1590,7 +1590,7 @@ fn commuted_sum_index_unifies_through_metas() {
         &[
             "data Nat :: Zero | Succ(pred : Nat)",
             "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
-            "append{n, m, a} : Vec{n, a} ~> Vec{m, a} ~> Vec{n + m, a} = xs ~> ys ~> match xs { VNil: ys, VCons(x, t): VCons(x, append(t)(ys)) }",
+            "append<n, m, a> : Vec<n, a> ~> Vec<m, a> ~> Vec<n + m, a> = xs ~> ys ~> match xs { VNil: ys, VCons(x, t): VCons(x, append(t)(ys)) }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1602,9 +1602,9 @@ fn commuted_sum_index_unifies_through_metas() {
 }
 
 /// Implicit index binders scope into body annotations (F3): the
-/// `{n, a}` names are rigid index vars inside the body, so
+/// `<n, a>` names are rigid index vars inside the body, so
 /// `(v : Vec(n, a))` — the annotation the runtime's `match` desugar
-/// needs — unifies with `v`'s stored `Vec{n, a}` domain instead of
+/// needs — unifies with `v`'s stored `Vec<n, a>` domain instead of
 /// reading `n`/`a` as unsolved sort metas.
 #[test]
 fn implicit_binder_names_scope_into_body_annotation() {
@@ -1614,8 +1614,8 @@ fn implicit_binder_names_scope_into_body_annotation() {
         &[
             "data Nat :: Zero | Succ(pred : Nat)",
             "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
-            "f{n, a} : Vec{n, a} ~> Vec{n, a} = v ~> (v : Vec(n, a))",
-            "g{n, a} : Vec{n + 1, a} ~> Vec{n + 1, a} = v ~> match (v : Vec(n + 1, a)) { VCons(x, xs): xs }",
+            "f<n, a> : Vec<n, a> ~> Vec<n, a> = v ~> (v : Vec(n, a))",
+            "g<n, a> : Vec<n + 1, a> ~> Vec<n + 1, a> = v ~> match (v : Vec(n + 1, a)) { VCons(x, xs): xs }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1653,11 +1653,11 @@ fn family_rec_resolves_eliminator_type() {
 }
 
 /// Annotated-arm `VCons` reconstruction (dogfood gap): inside
-/// `push{n, a} : a ~> Vec{n, a} ~> Vec{n + 1, a}` the arm's own `n`/`a`
+/// `push<n, a> : a ~> Vec<n, a> ~> Vec<n + 1, a>` the arm's own `n`/`a`
 /// rigid vars collide with the ctor telescope's family params of the
 /// same name. The params bind internally as `__fam_<name>` so
-/// `v : Vec{n, a}` refines `n ≡ k + 1` (not `?k + 1`) and
-/// `VCons(k + 1, x, v)` reconstructs at `Vec{n + 1, a}` — previously
+/// `v : Vec<n, a>` refines `n ≡ k + 1` (not `?k + 1`) and
+/// `VCons(k + 1, x, v)` reconstructs at `Vec<n + 1, a>` — previously
 /// the instantiation bound `n`/`a` in `results` directly and the
 /// scrutinee's rigids rewrote to the fresh metas.
 #[test]
@@ -1667,7 +1667,7 @@ fn annotated_arm_family_params_dont_shadow_rigids() {
         &lang,
         &[
             "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(k : Nat, x : a, xs : Vec(k, a)) : Vec(k + 1, a)",
-            "push{n, a} : a ~> Vec{n, a} ~> Vec{n + 1, a} = x ~> v ~> match v { VNil: VCons(0, x, VNil), VCons(k, x2, xs): VCons(k + 1, x2, v) }",
+            "push<n, a> : a ~> Vec<n, a> ~> Vec<n + 1, a> = x ~> v ~> match v { VNil: VCons(0, x, VNil), VCons(k, x2, xs): VCons(k + 1, x2, v) }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1678,8 +1678,8 @@ fn annotated_arm_family_params_dont_shadow_rigids() {
     );
 }
 
-/// Same collision through the *element* parameter only: `dup{n, a}`
-/// matches on `Vec{n, a}` and rebuilds each ctor — `var{n}`/`var{a}`
+/// Same collision through the *element* parameter only: `dup<n, a>`
+/// matches on `Vec<n, a>` and rebuilds each ctor — `var{n}`/`var{a}`
 /// refine per arm while the telescope's `n`/`a` stay internal.
 #[test]
 fn annotated_arm_elem_param_scopes_cleanly() {
@@ -1688,8 +1688,8 @@ fn annotated_arm_elem_param_scopes_cleanly() {
         &lang,
         &[
             "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(k : Nat, x : a, xs : Vec(k, a)) : Vec(k + 1, a)",
-            "dup{n, a} : Vec{n, a} ~> Vec{n, a} = v ~> match v { VNil: VNil, VCons(k, x, xs): VCons(k, x, xs) }",
-            "bump{n} : Vec{n, Bool} ~> Vec{n + 1, Bool} = v ~> match v { VNil: VCons(0, true, VNil), VCons(k, x, xs): VCons(k + 1, x, v) }",
+            "dup<n, a> : Vec<n, a> ~> Vec<n, a> = v ~> match v { VNil: VNil, VCons(k, x, xs): VCons(k, x, xs) }",
+            "bump<n> : Vec<n, Bool> ~> Vec<n + 1, Bool> = v ~> match v { VNil: VCons(0, true, VNil), VCons(k, x, xs): VCons(k + 1, x, v) }",
         ],
     );
     let result = typecheck(&lang, ast);

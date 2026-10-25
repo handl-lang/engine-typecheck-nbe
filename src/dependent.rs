@@ -65,7 +65,7 @@ fn var_term(name: &str) -> Value {
 /// `__fam_` prefix is a namespace users cannot write into, so the
 /// ctor's fresh index metas never shadow — or get shadowed by — a
 /// same-named rigid `var` from an enclosing annotated signature
-/// (`f{n, a}` against `data Vec(n : Nat, a : Type)`).
+/// (`f<n, a>` against `data Vec(n : Nat, a : Type)`).
 fn fam_binding_name(name: &str) -> String {
     format!("__fam_{name}")
 }
@@ -1958,7 +1958,10 @@ fn parse_family_head(
 ) -> Option<(String, Vec<DepParam>)> {
     match node.kind.as_str() {
         "var" => Some((node.payload.as_str()?.to_string(), Vec::new())),
-        "call" | "index_app" => {
+        // `dimension` shares the `[target, args…]` layout (index-position
+        // `<>` — a dimension IS an index): `data Vec<n, a>` parameterizes
+        // the family head exactly like the retired `Vec{n, a}` brace form.
+        "call" | "index_app" | "dimension" => {
             let kids = children_of(node)?;
             let callee = ast.get(AstRef::new(kids.first()?.as_u64()? as usize))?;
             let name = callee.payload.as_str()?.to_string();
@@ -2292,7 +2295,12 @@ impl NbeTypecheckEngine {
                 m.insert("body".to_string(), cod);
                 Ok(make_tag(ctx, "type.function", m))
             }
-            "call" | "index_app" => self.dep_synth_call_type(lang, ast, node, ctx),
+            // `dimension` (`F<i⃗>`, the `<>` index-application spelling)
+            // elaborates through the same call-type path: `Vec<n, a>` is
+            // the former application `Vec{n, a}` used to spell.
+            "call" | "index_app" | "dimension" => {
+                self.dep_synth_call_type(lang, ast, node, ctx)
+            }
             // `forall b, T` — parse-level `Pi` alias (phase-2 WS-C sugar):
             // the binder child is `type-annot(var, A)` or a bare `var`
             // (unsorted — a fresh meta domain), the body child the type
@@ -2568,7 +2576,7 @@ impl NbeTypecheckEngine {
             }
             "Type" | "Universe" | "Type0" => "type.universe",
             // `Sig` — the `IO(sig)` signature-record sort (a row
-            // binder's declared sort in `f{s : Sig} : … IO(s)`): an
+            // binder's declared sort in `f<s : Sig> : … IO(s)`): an
             // op-name → signature record, i.e. the `Obj` nominal.
             "Sig" => "type.obj",
             "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
@@ -2914,7 +2922,7 @@ impl NbeTypecheckEngine {
                     else {
                         continue;
                     };
-                    // `IO({puts})` — a bare-name child declares the op
+                    // `IO<{ puts }>` — a bare-name child declares the op
                     // with an unstated request (`type.unknown`).
                     if en.kind == "var" {
                         if let Some(k) = node_name(en) {
@@ -3036,15 +3044,15 @@ impl NbeTypecheckEngine {
         {
             return Ok(self.node_to_index_term(lang, ast, node, ctx));
         }
-        // `C(i⃗)`/`C{i⃗}` where `C` is a *term-level* constructor (a
+        // `C(i⃗)`/`C<i⃗>` where `C` is a *term-level* constructor (a
         // `type.ctor_sig` Γ binding, e.g. `Succ`) is an index *term*
-        // (`App{var C, i⃗}`), not an instantiated type — `Vec{Succ n, a}`
+        // (`App{var C, i⃗}`), not an instantiated type — `Vec<Succ n, a>`
         // carries `Succ n` as the index it refines against. Family
         // callees (`Vec`, `Pi`, …) still synthesize types. The ctor's
         // arguments elaborate through `node_to_index_term` — the index
         // reading: a `var` arg is the rigid index atom `var{n}`, not the
         // sort `Nat` a bare var resolves to in type position.
-        if matches!(node.kind.as_str(), "call" | "index_app") {
+        if matches!(node.kind.as_str(), "call" | "index_app" | "dimension") {
             let kids = children_of(node).cloned().unwrap_or_default();
             let callee_name = kids
                 .first()
@@ -3146,9 +3154,9 @@ impl NbeTypecheckEngine {
                 .map(|n| self.node_to_index_term(lang, ast, n, ctx))
                 .unwrap_or(Value::Null),
             "value" | "lit" => node.payload.clone(),
-            // `f(i⃗)`/`f{i⃗}` as an index term — an opaque `App` on the
+            // `f(i⃗)`/`f<i⃗>` as an index term — an opaque `App` on the
             // callee's `var` (constructor or results-bound function).
-            "call" | "index_app" => {
+            "call" | "index_app" | "dimension" => {
                 let kids = children_of(node).cloned().unwrap_or_default();
                 let callee = kids
                     .first()
@@ -4659,7 +4667,7 @@ impl NbeTypecheckEngine {
                 if tag == "type.pi"
                     && expected.get("implicit") == Some(&Value::Bool(true))
                 {
-                    // Implicit index binder (phase-2 WS-C `f{a, …}`): the
+                    // Implicit index binder (phase-2 WS-C `f<a, …}`): the
                     // binder does NOT consume a lambda — bind its name
                     // rigidly (Γ + results) and check the same node
                     // against the already-elaborated `body`.
@@ -4855,7 +4863,7 @@ impl NbeTypecheckEngine {
 
     /// `[a, b]` checked against `type.sigma` — componentwise: `a` against
     /// `param`, `b` against the closure applied at `a`'s *term*.
-    /// Any node checked against an *implicit* `type.pi` — the `f{a, …}`
+    /// Any node checked against an *implicit* `type.pi` — the `f<a, …>`
     /// implicit index binder (phase-2 WS-C). The binder never consumes a
     /// lambda: it is bound rigidly (`var{b}` in `results`, the declared
     /// `param` sort in Γ) and the *same* node is checked against `body`.
@@ -4879,12 +4887,12 @@ impl NbeTypecheckEngine {
         // The binder scopes into the body as a *rigid index variable* —
         // the same `var{b}` in Γ and `results` (the `synth_assign`
         // convention), so a name used inside a body annotation —
-        // `(v : Vec(n, a))` under `f{n, a}` — resolves to the index
+        // `v : Vec(n, a)` under `f<n, a>` — resolves to the index
         // atom, not the binder's sort. Binding the `param` sort in Γ
-        // made `{n, a}`-style binders read as their unsolved sort meta
+        // made `<n, a>`-style binders read as their unsolved sort meta
         // (`Vec(n, a)` ≡ `Vec(?m1, ?m0)`) — and even a declared
         // `{n : Nat}` sort is not `n`, it is `n`'s type. Only an
-        // *evidence* binder (`{ev : Eq(a)}`, `evidence: true` on the
+        // *evidence* binder (`<ev : Eq(a)>`, `evidence: true` on the
         // pi) keeps its former-app type in Γ — `ev` is a runtime
         // dictionary its eliminations match on, not an index atom.
         let evidence = expected.get("evidence") == Some(&Value::Bool(true));
@@ -5427,8 +5435,8 @@ impl NbeTypecheckEngine {
     /// motive. When both the scrutinee and the expected type are
     /// applications of the *same* family, the scrutinee's rigid index
     /// `var`s that occur in the expected args become motive binders
-    /// (`Vec{var n, …}` scrutinee vs `Vec{var n, b}` expected ⇒ motive
-    /// `(i₀) ~> Vec{i₀, b}`); otherwise the motive is the constant
+    /// (`Vec<var n, …>` scrutinee vs `Vec<var n, b>` expected ⇒ motive
+    /// `(i₀) ~> Vec<i₀, b>`); otherwise the motive is the constant
     /// expected type. Returns `None` when the match carries an explicit
     /// motive (the existing synth path handles it) — the caller keeps the
     /// default synth-then-unify path in that case.
@@ -6176,19 +6184,22 @@ impl NbeTypecheckEngine {
             LangError::engine("call: callee index not a u64".to_string())
         })? as usize;
         let mut cur = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
-        let is_index_app = node.kind == "index_app";
+        // `<>` index application — `f<i, …>` (`dimension` post-migration,
+        // `index_app` for pre-desugar/hand-built trees): each argument
+        // fills the next implicit `type.pi` as an index term.
+        let is_index_app = matches!(node.kind.as_str(), "index_app" | "dimension");
         for cv in kids.iter().skip(1) {
             let arg_idx = cv.as_u64().ok_or_else(|| {
                 LangError::engine("call: arg index not a u64".to_string())
             })? as usize;
             let arg_ref = AstRef::new(arg_idx);
             cur = zonk_index(&cur, ctx);
-            // `f{i, …}` index application (phase-2 WS-C): each argument
+            // `f<i, …>` index application (phase-2 WS-C): each argument
             // *fills* the next implicit `type.pi` as an index term —
-            // `head{2, Bool}` supplies `n := 2`, `a := Bool` — where a
+            // `head<2, Bool>` supplies `n := 2`, `a := Bool` — where a
             // bare `f(…)` call would have inserted a fresh meta instead.
             // Once the implicit pis are exhausted the argument falls
-            // through to the ordinary domain check (e.g. `Vec{2, Bool}`
+            // through to the ordinary domain check (e.g. `Vec<2, Bool>`
             // on a `type.family` accumulates index terms the same way
             // `Vec(2, Bool)` does).
             if is_index_app
@@ -6206,7 +6217,7 @@ impl NbeTypecheckEngine {
                 cur = subst_index(&body, &var_term(&binder), &mv);
                 continue;
             }
-            // Implicit index binders (phase-2 WS-C `f{a, …}`): fill each
+            // Implicit index binders (phase-2 WS-C `f<a, …}`): fill each
             // implicit `type.pi` before consuming an explicit argument.
             // Phase-3 WS-A: a domain `C(i⃗)` whose head has registered
             // instances is *evidence* — dictionary search runs first
@@ -6529,7 +6540,7 @@ impl NbeTypecheckEngine {
                         // the impl — its domain must accept the declared
                         // sig entry.
                         if tag_of(req) == Some("type.unknown") {
-                            // `IO({puts})`-style unstated requests: skip
+                            // `IO<{ puts }>`-style unstated requests: skip
                             // the domain check, and an unsolved return
                             // meta defaults to the request (a shared
                             // `?m` inside the sig object can't solve in
@@ -6590,7 +6601,7 @@ impl NbeTypecheckEngine {
     /// `construct type.unit`, so a last-position annotated assign was
     /// never checked — this op is the fix (ADR-0120 dependent structure
     /// depends on top-level `x : T = v` statements checking `v`).
-    /// `name{b, …}` on an `assign`/`type-annot` subject — implicit index
+    /// `name<b, …>` on an `assign`/`type-annot` subject — implicit index
     /// binders (phase-2 WS-C) — or `name<N, …>` — generic dimension
     /// parameters (ADR-0106 §12: `f<N> := body` means `f := N ~> body`;
     /// the `dimension` node's `args` scope over the bound value, same
@@ -6832,7 +6843,7 @@ impl NbeTypecheckEngine {
                     ));
                 }
             } else {
-                // A bare `name{b, …}`/`name<N>` lhs (`dedupe<N> := v`)
+                // A bare `name<b, …>`/`name<N>` lhs (`dedupe<N> := v`)
                 // declares generic binders — extract the head the same
                 // way the annotated subject arms do, so the binders
                 // scope over the initializer below.
@@ -6872,7 +6883,7 @@ impl NbeTypecheckEngine {
             // the refined scrutinee type. Pre-synthesizing would check
             // the arms under an unsolved-meta scrutinee, where `results`
             // stays empty and `transport`/`j`/`absurd` cannot resolve.
-            // Implicit index binders scope (phase-2 WS-C `name{b, …}`):
+            // Implicit index binders scope (phase-2 WS-C `name<b, …>`):
             // each binder is bound rigidly — `var{b}` in `results` and Γ —
             // so occurrences inside the annotation elaborate as the rigid
             // index variable they name (shadowing any outer `b`).
@@ -6915,7 +6926,7 @@ impl NbeTypecheckEngine {
                 }
             };
             // Wrap the elaborated annotation in one implicit `type.pi`
-            // per `name{b, …}` binder — the binder name rides in
+            // per `name<b, …>` binder — the binder name rides in
             // `binder`, `implicit` marks it non-lambda-consuming, and the
             // sort is the declared one or a fresh meta.
             let ann = if implicit_binders.is_empty() {
@@ -7009,7 +7020,7 @@ impl NbeTypecheckEngine {
             }
             ann
         } else {
-            // A `name{b,…}`/`name<N>` head on a bare assign scopes its
+            // A `name<b,…>`/`name<N>` head on a bare assign scopes its
             // generic binders over the initializer (ADR-0106 §12 —
             // `f<N> := body` means `f := N ~> body`; the bootstrap
             // scope pass's `dim_param_names`/`implicit_binder_names`
@@ -7286,7 +7297,10 @@ impl NbeTypecheckEngine {
             }),
             "var" => Some(var_term(&node_name(node)?)),
             "paren" => self.node_to_ann_term(lang, ast, at(0)?),
-            "call" => {
+            // `dimension`/`index_app` share `call`'s `[callee, args…]`
+            // layout — `inc<4>` in an ordered-value annotation evaluates
+            // exactly like `inc(4)`.
+            "call" | "index_app" | "dimension" => {
                 let callee_role = lang
                     .child_role_index(&node.kind, "callee")
                     .ok()
