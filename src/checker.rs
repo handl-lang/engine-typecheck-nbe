@@ -348,9 +348,29 @@ impl Checker {
         self.meta_val(m)
     }
 
+    /// Whether `v`'s forced head is `type.unknown` — the dynamic top.
+    /// `Nominal` and `Former` spellings both count (a `Former` head
+    /// can arise when an `unknown` value reifies with payload fields).
+    fn head_is_unknown(&self, v: &Val) -> bool {
+        let unknown = type_sym("type.unknown").handle();
+        match self.metas.force_head_rc(v).as_val() {
+            Val::Nominal(s) => s.handle() == unknown,
+            Val::Former { head, .. } => head.handle() == unknown,
+            _ => false,
+        }
+    }
+
     /// `conv` at the ambient level — nominal heads, structural bodies,
     /// meta solving (kernel `conv`).
+    ///
+    /// `type.unknown` is the dynamic top (the gradual-typing wildcard
+    /// `types.yaml` promises): `unknown ≡ T` succeeds for every `T` on
+    /// either side — the same acceptance the tagged `unify`/`dep_unify`
+    /// boundary layer performs on `{"__tag__": "type.unknown"}`.
     pub fn conv(&mut self, a: &Val, b: &Val) -> bool {
+        if self.head_is_unknown(a) || self.head_is_unknown(b) {
+            return true;
+        }
         let lvl = self.lvl();
         nbe::conv(&mut self.metas, lvl, a, b)
     }

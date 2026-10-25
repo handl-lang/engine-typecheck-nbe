@@ -212,6 +212,37 @@ fn io_headed(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `v` is `type.unknown` — the dynamic top — in any boundary
+/// spelling: the tagged `{"__tag__": "type.unknown"}` value, the
+/// `__sym__` reification `quote` emits for `Nominal{type.unknown}`, or
+/// a `__former__` application headed by the `type.unknown` sym. The
+/// handle compare is authoritative (mirroring `io_headed`); the name
+/// check is a fallback for spellings that drop the handle.
+pub(crate) fn is_unknown_ty(v: &Value) -> bool {
+    if tag_of(v) == Some("type.unknown") {
+        return true;
+    }
+    fn sym_matches(s: &Value) -> bool {
+        let inner = s.get("__sym__").unwrap_or(s);
+        if let Some(h) = inner.get("handle").and_then(Value::as_u64) {
+            return h == checker::type_sym("type.unknown").handle();
+        }
+        matches!(
+            inner.get("name").and_then(Value::as_str),
+            Some("type.unknown" | "unknown")
+        )
+    }
+    // The bare-sym spelling only counts when `v` actually reifies a
+    // sym (`{"__sym__": {…}}`); a tagged record whose `name` field
+    // happens to read "unknown" is not the dynamic top.
+    if v.get("__sym__").is_some() && sym_matches(v) {
+        return true;
+    }
+    v.get("__former__")
+        .map(|f| sym_matches(f) || f.get("sym").is_some_and(sym_matches))
+        .unwrap_or(false)
+}
+
 /// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
 /// as boundary JSON (the `__former__` encoding).
 fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
@@ -751,6 +782,19 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
             // A `var{n} ↦ var{n}` self-binding is the rigid fixed point.
             if bound == v {
                 return v.clone();
+            }
+            // `var{n} ↦ t` where `var{n}` occurs inside `t` — a
+            // dependent rewrite (`n ↦ var{n} + 1` minted when a
+            // `body_closure`'s `var_name` collides with the bound
+            // name in the witness term). The inner `var{n}` is the
+            // *pre-binding* atom: resolve it opaquely, never re-apply
+            // the rewrite — otherwise every `eval` iteration wraps a
+            // fresh `+1` (`var{n} + 64` at the fuel bound).
+            if var_occurs(name, bound) {
+                let opaque = var_term(&format!("__bound_{name}"));
+                let shifted = subst_index(bound, &var_term(name), &opaque);
+                let evaluated = eval_index_fuel(&shifted, ctx, fuel - 1);
+                return subst_index(&evaluated, &opaque, &var_term(name));
             }
             return eval_index_fuel(bound, ctx, fuel - 1);
         }
@@ -1572,6 +1616,34 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
             }
         }
         return (true, false);
+    }
+    // Same-op `Bin` congruence: `?k + 1 ≡ var{m} + 1` — the Sigma
+    // destructure's repack (`VCons(x, ys)` at `Vec(var{m} + 1, a)`
+    // against `Vec(?k + 1, a)`) — solves pointwise: `?k := var{m}`,
+    // `1 ≡ 1`. The operand walk is *speculative*: it commits a
+    // unifier, not the only one (`?x + 1 ≡ var{n} + 2` has solutions
+    // the pointwise split misses), so it runs under a store mark and
+    // rolls back on any failed pair, falling through to the solver.
+    if tag_of(&ea) == Some("Bin") && tag_of(&eb) == Some("Bin") {
+        let same_op = ea.get("op") == eb.get("op");
+        let op = ea.get("op").and_then(Value::as_str).unwrap_or("");
+        if same_op && matches!(op, "binary.add" | "binary.sub" | "binary.mul") {
+            let la = ea.get("l").cloned().unwrap_or(Value::Null);
+            let ra = ea.get("r").cloned().unwrap_or(Value::Null);
+            let lb = eb.get("l").cloned().unwrap_or(Value::Null);
+            let rb = eb.get("r").cloned().unwrap_or(Value::Null);
+            let mark = ctx.store_mark();
+            let (okl, _) = unify_index(&la, &lb, ctx);
+            let (okr, _) = if okl {
+                unify_index(&ra, &rb, ctx)
+            } else {
+                (false, false)
+            };
+            if okl && okr {
+                return (true, false);
+            }
+            ctx.store_restore(mark);
+        }
     }
     match INDEX_SOLVER.prove(&ea, &eb, ctx) {
         IndexVerdict::Proven => (true, false),
@@ -2473,6 +2545,38 @@ impl NbeTypecheckEngine {
         // same-named rigid (instantiate_ctor_full).
         let scoped = fam_scoped(name, ctx);
         let name = scoped.as_str();
+        // `results` bindings (index vars, ctor args, alias params,
+        // assign-bound terms — all lexically inner) shadow Γ and
+        // injected globals alike: a `results`-bound name is the nearest
+        // scope, so `m` bound `var{m}` by a Sigma destructure or a
+        // match refinement reads as the index atom in `Vec(m, a)`,
+        // never the `Nat` sort Γ would hand back for a bare name.
+        if ctx.results.contains_key(name) {
+            // …unless Γ carries a *type declaration* for the name —
+            // `type.alias`/`type.ctor_sig`/`type.family`, the bindings
+            // `dep_bound_var_type` interprets structurally. Every
+            // `assign` also records the bound *term* in `results`
+            // (ADR-0103's bound-value env — `type.Score := Nat` leaves
+            // `Score ↦ var{Nat}`), and that term is for *value*
+            // position only: `s : Score` must expand the alias, not
+            // evaluate `var{Nat}` as an index atom.
+            let declared = ctx.lookup_gamma(name).is_some_and(|bound| {
+                matches!(
+                    tag_of(bound),
+                    Some("type.alias" | "type.ctor_sig" | "type.family")
+                )
+            });
+            if declared {
+                let bound = ctx.lookup_gamma(name).cloned().unwrap();
+                if let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
+                    return Ok(ty);
+                }
+                // `type.family` naming a *different* family — the
+                // decl does not claim `name`; the results binding
+                // stands.
+            }
+            return Ok(eval_index(&var_term(name), ctx));
+        }
         // Γ bindings — source-level declarations (`data`, `type` aliases,
         // `assign`s, pattern binders) — legitimately shadow builtin names:
         // `data Bool :: …` must rebind `Bool` away from `type.bool`.
@@ -2480,12 +2584,6 @@ impl NbeTypecheckEngine {
             if let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
                 return Ok(ty);
             }
-        }
-        // `results` bindings (index vars, ctor args, alias params,
-        // assign-bound terms — all lexically inner) shadow builtins and
-        // injected globals alike.
-        if ctx.results.contains_key(name) {
-            return Ok(eval_index(&var_term(name), ctx));
         }
         // Builtin type names resolve before *injected* globals: `hnl
         // typecheck` seeds the whole wire-prelude name set as
@@ -4507,6 +4605,15 @@ impl NbeTypecheckEngine {
         if extract_meta_id(a).is_some() || extract_meta_id(b).is_some() {
             return self.unify(a, b, ctx);
         }
+        // `type.unknown` is the dynamic top (see `unify`): consistent
+        // with every type on either side, in both the tagged and the
+        // domain-encoded spellings. Checked here — before the tag match
+        // — because the `io_headed` signature-subtyping arm below would
+        // otherwise reject `IO` vs `unknown` before `self.unify`'s
+        // accept could fire.
+        if is_unknown_ty(a) || is_unknown_ty(b) {
+            return Ok(());
+        }
         match (tag_of(a), tag_of(b)) {
             (Some("type.family_app"), Some("type.family_app")) => {
                 let na = a.get("name").and_then(Value::as_str).unwrap_or("");
@@ -4963,6 +5070,47 @@ impl NbeTypecheckEngine {
         self.dep_synth_type(lang, ast, body_idx, ctx)
     }
 
+    /// The eliminator half of a `type.sigma` pair pattern
+    /// `[witness, payload]`: the witness binds *rigidly* — `var{name}`
+    /// in both Γ and `results`, the same convention as implicit index
+    /// binders ([`Self::dep_intro_implicit`]) — so a destructure `m`
+    /// used as a family index elaborates to `var{m}` rather than the
+    /// `Nat` sort Γ would otherwise hand back for a bare name. The
+    /// payload binds against the sigma's `body_closure` instantiated
+    /// at that atom, which is what lets `Vec(m, a)` and the repack
+    /// `Vec(m + 1, a)` unify.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_sigma_destructure(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        witness_node: &AstNode,
+        witness_ref: AstRef,
+        payload_ref: AstRef,
+        scrutinee_type: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let param = scrutinee_type.get("param").cloned().unwrap_or(Value::Null);
+        let wname = node_name(witness_node).unwrap_or_default();
+        let witness_term = if !wname.is_empty() && wname != "_" {
+            // Γ keeps the declared `param` sort for *term* positions
+            // (`Succ(m)` checks `m` against `Nat`); `results` carries
+            // `var{m}` so the name reads as a rigid index atom in
+            // `dep_synth_var_type` — the implicit-binder convention.
+            ctx.extend(wname.clone(), param);
+            ctx.bind_result(wname.clone(), var_term(&wname));
+            var_term(&wname)
+        } else {
+            // A non-`var` witness pattern (literal/compound) binds
+            // normally and applies the closure at its own index term.
+            self.bind_pattern_vars(lang, ast, witness_ref, &param, ctx)?;
+            self.node_to_index_term(lang, ast, witness_node, ctx)
+        };
+        let payload_ty =
+            self.dep_closure_apply_term(lang, ast, scrutinee_type, &witness_term, ctx)?;
+        self.bind_pattern_vars(lang, ast, payload_ref, &payload_ty, ctx)
+    }
+
     /// Apply a `body_closure` at an index *term* (Sigma/pi value
     /// instantiation) — `var_name ↦ term` in `results`.
     fn dep_closure_apply_term(
@@ -4986,14 +5134,37 @@ impl NbeTypecheckEngine {
             .and_then(Value::as_u64)
             .ok_or_else(|| LangError::engine("dep_closure_apply: no body idx".to_string()))?
             as usize;
-        let old = ctx.results.get(&var_name).cloned();
-        ctx.bind_result(var_name.clone(), eval_index(term, ctx));
+        let bound = eval_index(term, ctx);
+        // Occurs guard: `var_name` occurring inside its own binding
+        // term (`Sigma(Nat, m ~> Vec(m, a))` applied at `var{m}+1` —
+        // the user's `m` and the closure's `m` collide). Binding under
+        // `var_name` directly mints a self-referential `results` entry
+        // (`eval_index(var{m})` re-applies the rewrite — `var{m} + 64`
+        // at the fuel bound) *and* poisons outer-scope `var{m}` atoms
+        // (`ys`'s `Vec(var{m}, a)`). Alpha-rename the *binding key*
+        // through `fam_scope` instead — the body's `var{m}` resolves
+        // `__bound_m` → `var{m} + 1` while the outer `var{m}` atom
+        // stays untouched (`__bound_m` then unifies with `var{m}` at
+        // comparison time — a rigid-var rewrite, the `n ↦ ?k + 1`
+        // convention).
+        let scoped_key = if var_occurs(&var_name, &bound) {
+            let internal = format!("__bound_{var_name}");
+            ctx.fam_scope.insert(var_name.clone(), internal.clone());
+            internal
+        } else {
+            var_name.clone()
+        };
+        let old = ctx.results.get(&scoped_key).cloned();
+        ctx.bind_result(scoped_key.clone(), bound);
         let r = self.dep_synth_type(lang, ast, body_idx, ctx);
         match old {
-            Some(v) => ctx.bind_result(var_name, v),
+            Some(v) => ctx.bind_result(scoped_key.clone(), v),
             None => {
-                ctx.results.remove(&var_name);
+                ctx.results.remove(&scoped_key);
             }
+        }
+        if scoped_key != var_name {
+            ctx.fam_scope.remove(&var_name);
         }
         r
     }
@@ -7156,6 +7327,22 @@ impl NbeTypecheckEngine {
             };
             ctx.restore(binder_mark);
             ctx.results = binder_results;
+            // An explicit `x : type.unknown = v` annotation opts the
+            // binding into the dynamic lane. It typechecks (top accepts
+            // everything), but the silence is worth a warning — unlike
+            // *inferred* `unknown` (host calls, `resolve` imports —
+            // warning there would flag every dynamic value in the
+            // program), the user wrote the annotation and should know
+            // it erases the binding's static type.
+            if is_unknown_ty(&ann) {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "assign: '{name}' is annotated `type.unknown` — the dynamic top accepts any value and erases the binding's static type"
+                    ),
+                    span: node.span,
+                });
+            }
             // Self-recursion: the bound name is visible inside its own
             // initializer at the annotation's type — the bootstrap
             // scope pass's "a block binding's name is visible to

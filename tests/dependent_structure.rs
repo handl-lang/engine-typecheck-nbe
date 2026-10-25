@@ -1067,6 +1067,199 @@ fn match_auto_discharge_zipwith_shape() {
     );
 }
 
+/// The same nested-match shape with an explicit `absurd` in the
+/// decided-impossible inner arm (rather than relying on
+/// auto-discharge): `absurd` checks under the `n ↦ ?k + 1` refinement
+/// because the arm's scrutinee equation is decided-unsatisfiable.
+#[test]
+fn nested_absurd_inner_match_checks() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "zw : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Pi(Vec(n + 0, Bool), w ~> Bool))) = n ~> v ~> w ~> match v { VNil: true, VCons(x, xs): match w { VNil: absurd, VCons(y, ys): y } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "absurd in the decided-impossible inner VNil arm should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// `export f<n, …>` — implicit index binders on an exported assign:
+/// `<n>` binds `var{n}` rigidly over the `Vec<n, …>` signature, and
+/// the inner `absurd` arm discharges under `n ↦ ?k + 1` the same way
+/// the `Pi`-annotated spelling does.
+#[test]
+fn export_implicit_binders_abstract_index() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export zw<n> : Vec<n, Bool> ~> Vec<n, Bool> ~> Bool = xs ~> ys ~> match xs { VNil: true, VCons(x, t): match ys { VNil: absurd, VCons(y, u): false } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "export zw<n> with absurd should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The full `zipWith`: `export zw<n, a, b, c>` — three rigid index /
+/// element binders, the inner decided-impossible arm, and a recursive
+/// `zw(f)(t)(u)` call inside `VCons`. The tail of each recursive arm
+/// reuses `t`/`u` at the refined index `?k`.
+#[test]
+fn export_zipwith_recursive_body_checks() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export zw<n, a, b, c> : (a ~> b ~> c) ~> Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> = f ~> xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): VCons(f(x)(y), zw(f)(t)(u)) } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "recursive zipWith body should check, got {:?}",
+        diags_of(&result)
+    );
+
+    // Same shape without the function argument — `VCons(y, t)` rebuilds
+    // at the arm's refined index.
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export zw<n, a, b, c> : Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> = xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): VCons(y, t) } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "no-fn zipWith shape should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// A `zipWith` arm returning the wrong type (`false` at `Vec<n, c>`)
+/// is a decided mismatch, not a silent pass.
+#[test]
+fn export_zipwith_wrong_result_errors() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export zw<n, a, b, c> : (a ~> b ~> c) ~> Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> = f ~> xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): false } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "Bool in a Vec<n, c> arm should be a decided mismatch"
+    );
+}
+
+/// `Sigma(Nat, m ~> Vec(m, a))` destructure: `match s { [m, ys]: … }`
+/// binds `m` rigidly (`var{m}`) and `ys` at `Vec(var{m}, a)`. The
+/// repack `[Succ(m), VCons(x, ys)]` checks `VCons(x, ys) :
+/// Vec(var{m} + 1, a)` against the payload `Vec(m + 1, a)` — the
+/// rigid-var-vs-meta index equation `?k + 1 ≡ m + 1` solves
+/// `?k := var{m}` through `unify_index`'s same-op `Bin` congruence.
+#[test]
+fn sigma_destructure_repack_index() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export filter2<n, a> : (a ~> Bool) ~> Vec<n, a> ~> Sigma(Nat, m ~> Vec(m, a)) = f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter2(f)(xs) { [m, ys]: [Succ(m), VCons(x, ys)] } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "sigma repack should solve ?k := var{{m}}, got {:?}",
+        diags_of(&result)
+    );
+
+    // Same repack under an `if` on the predicate — both branches build
+    // a Sigma pair, only the witness differs.
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export filter3<n, a> : (a ~> Bool) ~> Vec<n, a> ~> Sigma(Nat, m ~> Vec(m, a)) = f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter3(f)(xs) { [m, ys]: if f(x) { [Succ(m), VCons(x, ys)] } else { [m, ys] } } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "sigma repack under if should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// `Vec(m + 1, ?a)` vs `Vec(?k + 1, ?a)`: a decided mismatch on a
+/// *genuinely wrong* repack still reports — `VCons(Zero, VNil)` is
+/// `Vec(1, Nat)`, never `Vec(m + 1, a)` for rigid `m`, `a`.
+#[test]
+fn sigma_destructure_wrong_payload_errors() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export bump<a> : Sigma(Nat, m ~> Vec(m, a)) ~> Sigma(Nat, k ~> Vec(k, a)) = s ~> match s { [m, ys]: [Succ(m), VCons(Zero, VNil)] }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "VCons(Zero, VNil) : Vec(1, Nat) against Vec(m + 1, a) should error"
+    );
+}
+
 /// `Vec(n + m)` splits: `VNil` is possible only at `n ↦ 0, m ↦ 0` and
 /// `VCons` only when `n + m ≥ 1`. The `{VNil, VCons}` match is proved
 /// exhaustive through the split tree; dropping either arm is a

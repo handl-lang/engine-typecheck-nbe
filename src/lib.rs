@@ -445,6 +445,21 @@ impl NbeTypecheckEngine {
             ctx.node_types.insert(node_ref.index(), ty);
             return Ok(());
         }
+        // `type.unknown` as the expected type is the dynamic TOP: every
+        // node is accepted (`unify`/`dep_unify`/`conv`/`subtype` all
+        // accept `unknown` on either side). Unlike LOOSE_TOP the node is
+        // *strictly* synthesized — internal errors still report and the
+        // real type is recorded — so annotations like
+        // `x : type.unknown = v` keep their meaning and `eval_ann_node`'s
+        // error-driven fallbacks still see real failures. This is the
+        // directed-check half of the top rule: without it, `check`
+        // schemes that read the expected tag (e.g. `check_json_value`)
+        // reject `unknown` where conv would accept.
+        if dependent::is_unknown_ty(expected) {
+            let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+            ctx.node_types.insert(node_ref.index(), ty);
+            return Ok(());
+        }
         if let Some(check_scheme) = &rule.check {
             let td = ctx.scheme_td(check_scheme);
             self.eval_type_scheme_td(
@@ -5467,6 +5482,13 @@ impl NbeTypecheckEngine {
             }
             return Ok(());
         }
+        // `type.unknown` is the dynamic *top*: every `T <: unknown`.
+        // Only the super side accepts — `unknown <: T` for a concrete
+        // `T` is not a subtype step (top is not bottom; `unknown`'s
+        // consistent-equality lives in `unify`/`conv`, not here).
+        if dependent::is_unknown_ty(sup) {
+            return Ok(());
+        }
         // Universe cumulativity: Type_n ⊆ Type_m if n ≤ m.
         if let (Some(tag_sub), Some(tag_sup)) =
             (ctx.registry.as_type_tag(sub), ctx.registry.as_type_tag(sup))
@@ -5531,6 +5553,19 @@ impl NbeTypecheckEngine {
                 )));
             }
             ctx.solve_meta(id, a.clone());
+            return Ok(());
+        }
+        // `type.unknown` is the dynamic type — *consistent* with every
+        // type (the gradual-typing wildcard the `types.yaml` docs have
+        // always claimed: "`type.unknown` … unifies with whatever the
+        // surrounding branches produce"). A `while` step body, a
+        // `resolve` import, or a host call yields `unknown`; joining or
+        // checking it against a concrete type keeps the known side
+        // rather than erroring. Genuine structural mismatches between
+        // two *known* types still fail below. `is_unknown_ty` covers
+        // both the tagged `__tag__` spelling and the domain `__sym__`/
+        // `__former__` reification a round-tripped `unknown` arrives in.
+        if dependent::is_unknown_ty(a) || dependent::is_unknown_ty(b) {
             return Ok(());
         }
         // Domain-encoded operands (`__former__`/`__sym__`/`__neutral__`/
