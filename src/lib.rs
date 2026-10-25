@@ -425,6 +425,26 @@ impl NbeTypecheckEngine {
             ctx.node_types.insert(node_ref.index(), ty);
             return Ok(());
         }
+        // `LOOSE_TOP` as the expected type — an *internal* sentinel
+        // (`{"__tag__": "type.__loose_top__"}`) minted only by
+        // `synth_while` for loop bodies: the node is accepted, but not
+        // silently — it is loose-synthesized so internal errors (unbound
+        // vars, arity, `if` conditions, match coverage) still report
+        // while cross-branch joins are suspended. This is what lets
+        // `while` step bodies typecheck: the loop-step protocol's
+        // `{state: …}`/`{out: …}` records legitimately differ per
+        // control-flow path and can never unify. Deliberately NOT
+        // `type.unknown`: annotations like `x : Unknown = v` keep their
+        // strict semantics, and annotation evaluation's error-driven
+        // fallbacks (`eval_ann_node`) still see real failures.
+        if expected.get("__tag__").and_then(|t| t.as_str()) == Some(LOOSE_TOP_TAG) {
+            ctx.loose += 1;
+            let ty = self.loose_synth_node(lang, ast, node_ref, ctx);
+            ctx.loose -= 1;
+            let ty = ty?;
+            ctx.node_types.insert(node_ref.index(), ty);
+            return Ok(());
+        }
         if let Some(check_scheme) = &rule.check {
             let td = ctx.scheme_td(check_scheme);
             self.eval_type_scheme_td(
@@ -1933,6 +1953,17 @@ impl NbeTypecheckEngine {
                 })?;
                 self.synth_call_judgment(lang, ast, node, ctx)
             }
+            "check_call" => {
+                // The directed `call` check (`type.call`'s `check`):
+                // `perform(op, arg)` intercepts (its op operand is a
+                // name, not a checkable value); every other call runs
+                // the former scheme verbatim — synth the callee, check
+                // the first argument against its `param`, yield `body`.
+                let node = ast.get(node_ref).ok_or_else(|| {
+                    LangError::engine("check_call: node out of bounds".to_string())
+                })?;
+                self.check_call_judgment(lang, ast, node_ref, node, incoming, ctx)
+            }
             "synth_import" => {
                 // `stmt.import` binds `m : Sig_m` (the signature record),
                 // named projections, `* as m` (the record), or `*`
@@ -2020,6 +2051,33 @@ impl NbeTypecheckEngine {
                 // result is the type of the last child (or a `return` child's
                 // value). Termination is NOT checked at the type level.
                 self.synth_rec_judgment(lang, ast, node_ref, ctx)
+            }
+            "synth_while" => {
+                // Typecheck a `while` node (ADR-0074 A.1/A.5). The checker
+                // sees the *pre-desugar* AST, so both surface protocols
+                // arrive here:
+                //   * `while <state> { <step-closure> }` — the state-passing
+                //     `loop_step` form (child 1 declares a `params` role —
+                //     the same discriminator `transform.desugar.while.state`
+                //     uses, expressed role-wise): the state child synthesizes,
+                //     the closure's params bind to the state's record fields
+                //     (a single non-pattern param receives the whole state,
+                //     matching `build_loop_step_args`), and the body checks
+                //     against `type.unknown` — internals report, but the
+                //     `{state: …}`/`{out: …}` protocol records on different
+                //     control-flow paths never have to join. Result:
+                //     `type.unknown` (the `{ out: v }` payload type is not
+                //     statically recoverable).
+                //   * `while <cond> { <stmts…> }` — the pre-test form that
+                //     desugars to `rec`: the condition synthesizes and
+                //     unifies with `type.bool` (mirroring `type.if`), and
+                //     the body statements check in a Γ scope that pops on
+                //     exit (matching `eval_block`'s `env_push`/`env_pop` —
+                //     body-local binds do not escape; rebinding an outer
+                //     name shadows in Γ for the body's extent — rebinding
+                //     discipline across iterations is intentionally not
+                //     modeled). Result: `type.unit`.
+                self.synth_while_judgment(lang, ast, node_ref, ctx)
             }
             // ADR-0079: `synth_let` removed (let keyword deleted, graph blocks
             // replace it). The `synth_block` handler handles assign children.
@@ -2540,6 +2598,14 @@ impl NbeTypecheckEngine {
                 {
                     return Ok(container_type.clone());
                 }
+                // Suspended-join scope (`ctx.loose`, e.g. `while` step
+                // bodies): projecting a field off an unsolved meta yields
+                // a fresh meta rather than "no fields object" — the
+                // meta's record shape is unknowable here and the body is
+                // already in the permissive dynamic lane.
+                if ctx.loose > 0 && extract_meta_id(&container_type).is_some() {
+                    return Ok(meta_value(ctx.fresh_meta()));
+                }
                 // `type.module_sig` — an *open* signature record: a field
                 // absent from `fields` is probed as `<module>.<name>`
                 // through the module chain (declared signature first,
@@ -2631,6 +2697,21 @@ impl NbeTypecheckEngine {
                 } else {
                     incoming.clone().unwrap_or(Value::Null)
                 };
+                // `type.unknown` indexes to `type.unknown` — the same
+                // dynamic-opacity rule `record_field_type` applies to
+                // field projection: `xs[i]` on an unknown container
+                // stays unknown rather than erroring.
+                if array_type.get("__tag__").and_then(|t| t.as_str())
+                    == Some("type.unknown")
+                {
+                    return Ok(array_type.clone());
+                }
+                // Suspended-join scope (`ctx.loose`, e.g. `while` step
+                // bodies): indexing into an unsolved meta yields a
+                // fresh meta rather than erroring.
+                if ctx.loose > 0 && extract_meta_id(&array_type).is_some() {
+                    return Ok(meta_value(ctx.fresh_meta()));
+                }
                 let element_type = array_type.get("element").ok_or_else(|| {
                     LangError::engine(format!(
                         "array_element_type: type value has no 'element' field: {:?}",
@@ -3777,15 +3858,62 @@ impl NbeTypecheckEngine {
                 Ok(())
             }
             Some("sequence") => {
-                let element_type = scrutinee_type
-                    .get("element")
-                    .cloned()
-                    .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
                 let start = lang
                     .child_role_index(&pattern.kind, "elements")
                     .ok()
                     .flatten()
                     .unwrap_or(0);
+                // `type.sigma` pair pattern `[witness, payload]`: a
+                // dependent destructure — the witness binds rigidly
+                // (`var{w}` in Γ and `results`) so a repack
+                // `Vec(m + 1, a)` unifies; the payload binds against the
+                // sigma's instantiated closure. Exactly 2 element
+                // positions (no `rest`) qualify — anything else keeps
+                // the generic element reading.
+                if scrutinee_type.get("__tag__").and_then(Value::as_str)
+                    == Some("type.sigma")
+                {
+                    if let Some(children) =
+                        pattern.payload.get("children").and_then(|c| c.as_array())
+                    {
+                        let elem_refs: Vec<AstRef> = children
+                            .iter()
+                            .skip(start)
+                            .filter_map(|e| e.as_u64().map(|i| AstRef::new(i as usize)))
+                            .collect();
+                        let elem_kinds: Vec<&str> = elem_refs
+                            .iter()
+                            .filter_map(|r| ast.get(*r))
+                            .map(|n| {
+                                lang.ast
+                                    .get_by_identity(&n.kind)
+                                    .and_then(|s| s.pattern_role.as_deref())
+                                    .unwrap_or("")
+                            })
+                            .collect();
+                        if elem_refs.len() == 2 && !elem_kinds.iter().any(|r| *r == "rest") {
+                            let witness_node = ast.get(elem_refs[0]).ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "bind_pattern_vars: sigma witness node {} out of bounds",
+                                    elem_refs[0].index()
+                                ))
+                            })?;
+                            return self.bind_sigma_destructure(
+                                lang,
+                                ast,
+                                witness_node,
+                                elem_refs[0],
+                                elem_refs[1],
+                                scrutinee_type,
+                                ctx,
+                            );
+                        }
+                    }
+                }
+                let element_type = scrutinee_type
+                    .get("element")
+                    .cloned()
+                    .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
                 if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array()) {
                     for child_entry in children.iter().skip(start) {
                         let child_idx = child_entry.as_u64().ok_or_else(|| {
@@ -4240,6 +4368,741 @@ impl NbeTypecheckEngine {
         };
         ctx.restore(mark);
         Ok(result_type)
+    }
+
+    /// Synthesize the type of a `while` node (see the `synth_while`
+    /// op's comment for the two-form rule).
+    fn synth_while_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(node_ref).ok_or_else(|| {
+            LangError::engine(format!(
+                "typecheck: synth_while: node {} out of bounds",
+                node_ref.index()
+            ))
+        })?;
+        let children = node
+            .payload
+            .get("children")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| {
+                LangError::engine_node("typecheck: synth_while: node has no children array", node)
+            })?;
+        if children.is_empty() {
+            return Err(LangError::engine_node(
+                "typecheck: synth_while: while needs at least a head child",
+                node,
+            ));
+        }
+        let head_idx = children[0].as_u64().ok_or_else(|| {
+            LangError::engine_node("typecheck: synth_while: head index is not a u64", node)
+        })? as usize;
+        let head_ref = AstRef::new(head_idx);
+        // The state-passing `loop_step` form keeps an *arrow literal* as
+        // the first body child — detected by the `params` child role
+        // (the data-driven equivalent of the desugar's
+        // `KindAt{index:1, kind:function}`).
+        let step_is_arrow = children
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .and_then(|i| ast.get(AstRef::new(i as usize)))
+            .map(|n| role_declared(lang, &n.kind, "params"))
+            .unwrap_or(false);
+        if step_is_arrow {
+            let step_idx = children[1].as_u64().unwrap() as usize;
+            let step_ref = AstRef::new(step_idx);
+            let step_node = ast.get(step_ref).ok_or_else(|| {
+                LangError::engine(format!(
+                    "typecheck: synth_while: step node {} out of bounds",
+                    step_idx
+                ))
+            })?;
+            let step_children = step_node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array());
+            let params_ref = role_child_ref(lang, step_node, "params").or_else(|| {
+                step_children
+                    .and_then(|c| c.first())
+                    .and_then(|v| v.as_u64())
+                    .map(|i| AstRef::new(i as usize))
+            });
+            let body_ref = role_child_ref(lang, step_node, "body").or_else(|| {
+                step_children
+                    .and_then(|c| c.get(1))
+                    .and_then(|v| v.as_u64())
+                    .map(|i| AstRef::new(i as usize))
+            });
+            let (params_ref, body_ref) = match (params_ref, body_ref) {
+                (Some(p), Some(b)) => (p, b),
+                _ => {
+                    return Err(LangError::engine_node(
+                        "typecheck: synth_while: step closure needs params and body children",
+                        step_node,
+                    ))
+                }
+            };
+            let params_node = ast.get(params_ref).ok_or_else(|| {
+                LangError::engine(format!(
+                    "typecheck: synth_while: params node {} out of bounds",
+                    params_ref.index()
+                ))
+            })?;
+            let (param_names, rest_name) = lang
+                .param_names(ast, params_node)
+                .map_err(|e| LangError::engine_node(e.to_string(), step_node))?;
+            let array_pattern = lang.is_array_pattern(params_node);
+            // The initial state synthesizes first — its record fields are
+            // the step params' types (params destructure the state object
+            // by name, per `build_loop_step_args`). The surface
+            // `{ k: v, … }` state parses as a *block of type-annot
+            // children* in this position, so the head gets entry-aware
+            // synthesis rather than a plain block check.
+            let state_ty = self.synth_while_state(lang, ast, head_ref, ctx)?;
+            let state_ty = self.zonk(&state_ty, ctx);
+            let state_fields = if state_ty.get("__tag__").and_then(|t| t.as_str())
+                == Some("type.record")
+            {
+                state_ty.get("fields").and_then(|f| f.as_object())
+            } else {
+                None
+            };
+            let mark = ctx.mark();
+            ctx.loose += 1;
+            let checked = (|| -> Result<(), LangError> {
+                // Bind the step params. `build_loop_step_args` semantics:
+                //   * single non-pattern param → the whole state value;
+                //   * object state → each param binds the same-named field;
+                //   * non-object state → only the first param receives it
+                //     (later params are unbound/null at runtime — metas
+                //     here keep the body permissive);
+                //   * a `...rest` param takes the field/array tail.
+                if !array_pattern && param_names.len() == 1 && rest_name.is_none() {
+                    ctx.extend(param_names[0].clone(), state_ty.clone());
+                } else if let Some(fields) = state_fields {
+                    for name in &param_names {
+                        let ty = fields
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
+                        ctx.extend(name.clone(), ty);
+                    }
+                    if let Some(rest) = &rest_name {
+                        let elem = meta_value(ctx.fresh_meta());
+                        let rest_ty = ctx
+                            .registry
+                            .construct("type.array", &serde_json::json!({"element": elem}))
+                            .ok_or_else(|| {
+                                LangError::engine(
+                                    "typecheck: synth_while: construct failed for type.array",
+                                )
+                            })?;
+                        ctx.extend(rest.clone(), rest_ty);
+                    }
+                } else {
+                    for (i, name) in param_names.iter().enumerate() {
+                        let ty = if i == 0 {
+                            state_ty.clone()
+                        } else {
+                            meta_value(ctx.fresh_meta())
+                        };
+                        ctx.extend(name.clone(), ty);
+                    }
+                    if let Some(rest) = &rest_name {
+                        let elem = meta_value(ctx.fresh_meta());
+                        let rest_ty = ctx
+                            .registry
+                            .construct("type.array", &serde_json::json!({"element": elem}))
+                            .ok_or_else(|| {
+                                LangError::engine(
+                                    "typecheck: synth_while: construct failed for type.array",
+                                )
+                            })?;
+                        ctx.extend(rest.clone(), rest_ty);
+                    }
+                }
+                // The step body checks against `type.unknown`: everything
+                // inside reports, but distinct `{state: …}`/`{out: …}`
+                // result records on different paths are never joined.
+                // The step body checks against the internal loose-top
+                // sentinel: everything inside reports, but distinct
+                // `{state: …}`/`{out: …}` result records on different
+                // paths are never joined.
+                let expected = loose_top();
+                self.check_node(lang, ast, body_ref, &expected, ctx)?;
+                // Trailing delimited elements past the closure are dead
+                // at eval (`loop_step` only projects child 1); check them
+                // for effect anyway — dead code still reports.
+                for entry in children.iter().skip(2) {
+                    let idx = entry.as_u64().ok_or_else(|| {
+                        LangError::engine_node(
+                            "typecheck: synth_while: child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    let _ = self.loose_synth_node(lang, ast, AstRef::new(idx), ctx)?;
+                }
+                Ok(())
+            })();
+            ctx.loose -= 1;
+            ctx.restore(mark);
+            checked?;
+            ctx.registry
+                .construct("type.unknown", &Value::Null)
+                .ok_or_else(|| {
+                    LangError::engine("typecheck: synth_while: construct failed for type.unknown")
+                })
+        } else {
+            // `while cond { stmts… }` — pre-test loop (desugars to `rec`
+            // at eval). The condition must be `Bool` (mirroring the
+            // `type.if` rule even though eval is truthiness-based), and
+            // the body statements check in a scope that pops.
+            let cond_ty = self.synth_node(lang, ast, head_ref, ctx)?;
+            let bool_ty = ctx
+                .registry
+                .construct("type.bool", &Value::Null)
+                .ok_or_else(|| {
+                    LangError::engine("typecheck: synth_while: construct failed for type.bool")
+                })?;
+            self.unify(&cond_ty, &bool_ty, ctx)?;
+            let mark = ctx.mark();
+            ctx.loose += 1;
+            let checked = (|| -> Result<(), LangError> {
+                for entry in children.iter().skip(1) {
+                    let idx = entry.as_u64().ok_or_else(|| {
+                        LangError::engine_node(
+                            "typecheck: synth_while: body index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    let _ = self.loose_synth_node(lang, ast, AstRef::new(idx), ctx)?;
+                }
+                Ok(())
+            })();
+            ctx.loose -= 1;
+            ctx.restore(mark);
+            checked?;
+            ctx.registry
+                .construct("type.unit", &Value::Null)
+                .ok_or_else(|| {
+                    LangError::engine_node(
+                        "typecheck: synth_while: construct failed for type.unit",
+                        node,
+                    )
+                })
+        }
+    }
+
+    /// Synthesize the `while` state child's type. A `block` head in this
+    /// position is the state object's *entry list* — `{ k: v, … }` parses
+    /// each `k: v` as a `type-annot`/`entry` child, and eval turns them
+    /// into the record the step params destructure — so each entry's key
+    /// names a field and its `annot`/`value` child carries the field's
+    /// value expression. Non-entry children (bare statements) are
+    /// loose-checked for effect and contribute no field.
+    fn synth_while_state(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        head_ref: AstRef,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(head_ref).ok_or_else(|| {
+            LangError::engine(format!(
+                "typecheck: synth_while: state node {} out of bounds",
+                head_ref.index()
+            ))
+        })?;
+        if !is_block_node(lang, node) {
+            return self.synth_node(lang, ast, head_ref, ctx);
+        }
+        let kids = node
+            .payload
+            .get("children")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .ok_or_else(|| {
+                LangError::engine_node("typecheck: synth_while: state block has no children", node)
+            })?;
+        let mut fields = serde_json::Map::new();
+        for entry in &kids {
+            let Some(cidx) = entry.as_u64() else { continue };
+            let child_ref = AstRef::new(cidx as usize);
+            let Some(cnode) = ast.get(child_ref) else { continue };
+            if let Some((key, vref)) = self.entry_key_value(lang, ast, cnode) {
+                let vt = self.loose_synth_node(lang, ast, vref, ctx)?;
+                fields.insert(key, vt);
+                continue;
+            }
+            // Non-entry child: check for effect.
+            let _ = self.loose_synth_node(lang, ast, child_ref, ctx)?;
+        }
+        ctx.registry
+            .construct(
+                "type.record",
+                &serde_json::json!({"fields": Value::Object(fields)}),
+            )
+            .ok_or_else(|| {
+                LangError::engine_node(
+                    "typecheck: synth_while: construct failed for type.record",
+                    node,
+                )
+            })
+    }
+
+    /// Resolve a record-entry child to `(key, value_ref)`: either the
+    /// `type-annot` form (`subject`/`annot` roles; key from the `name`
+    /// payload or the subject's string) or the `entry` form
+    /// (`key`/`value` roles; key from the key child's string payload).
+    fn entry_key_value(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &handl_language::AstNode,
+    ) -> Option<(String, AstRef)> {
+        let ckids = node.payload.get("children").and_then(|c| c.as_array());
+        if role_declared(lang, &node.kind, "annot") {
+            let key = node
+                .payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    role_child_ref(lang, node, "subject")
+                        .and_then(|r| ast.get(r))
+                        .and_then(|s| s.payload.as_str().map(str::to_string))
+                })?;
+            let vref = role_child_ref(lang, node, "annot").or_else(|| {
+                ckids.and_then(|c| c.get(1)).and_then(Value::as_u64).map(|i| AstRef::new(i as usize))
+            })?;
+            return Some((key, vref));
+        }
+        if role_declared(lang, &node.kind, "key") && role_declared(lang, &node.kind, "value") {
+            let kref = role_child_ref(lang, node, "key")?;
+            let vref = role_child_ref(lang, node, "value")?;
+            let key = ast
+                .get(kref)
+                .and_then(|kn| kn.payload.as_str().map(str::to_string))?;
+            return Some((key, vref));
+        }
+        None
+    }
+
+    /// Whether every child of `node` resolves as a record entry — the
+    /// object-literal-in-block-position shape (`{ k: v, … }`, the
+    /// `loop_step` `{state}`/`{out}` records included).
+    fn loose_entry_record(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &handl_language::AstNode,
+        kids: &[Value],
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<Value>, LangError> {
+        if kids.is_empty() {
+            return Ok(None);
+        }
+        let mut entries: Vec<(String, AstRef)> = Vec::with_capacity(kids.len());
+        for entry in kids {
+            let Some(cidx) = entry.as_u64() else { return Ok(None) };
+            let Some(cnode) = ast.get(AstRef::new(cidx as usize)) else {
+                return Ok(None);
+            };
+            match self.entry_key_value(lang, ast, cnode) {
+                Some((key, vref)) => entries.push((key, vref)),
+                None => return Ok(None),
+            }
+        }
+        let mut fields = serde_json::Map::new();
+        for (key, vref) in entries {
+            let vt = self.loose_synth_node(lang, ast, vref, ctx)?;
+            fields.insert(key, vt);
+        }
+        let ty = ctx
+            .registry
+            .construct(
+                "type.record",
+                &serde_json::json!({"fields": Value::Object(fields)}),
+            )
+            .ok_or_else(|| {
+                LangError::engine("typecheck: loose: construct failed for type.record")
+            })?;
+        Ok(Some(ty))
+    }
+
+    /// Suspended-join synthesis (the `ctx.loose` mode): check a node while
+    /// *not* requiring sibling control-flow paths to agree on a type.
+    ///
+    /// Dispatch is by `AstShapeDef` child roles (ADR-0081), never kind
+    /// strings:
+    ///   - `condition`/`then`/`else` shapes (`if`, `ternary`): the
+    ///     condition checks against `type.bool`; each branch is
+    ///     loose-synthesized independently.
+    ///   - `scrutinee`/`block` shapes (`match`): routed through the
+    ///     dependent match machinery with the constant `type.unknown`
+    ///     motive — pattern binders still bind, coverage still runs, and
+    ///     each arm body checks against `type.unknown` (recursively
+    ///     loose via `check_node`'s dynamic-top accept).
+    ///   - `statements` shapes (`block`/`do`): assigns bind (plain
+    ///     `name = value` binds loose; annotated/complex targets stay on
+    ///     the strict `synth_assign` path), other statements loose-synth
+    ///     for effect, the last child's loose type is the block's.
+    ///     Bindings pop with the block scope (matching `eval_block`).
+    ///   - `params`/`body` shapes (`function`): params bind fresh metas
+    ///     and the body loose-synthesizes — a nested closure's own
+    ///     branches don't join either.
+    ///   - `target`/`value` shapes (`assign`): plain `name = value`
+    ///     binds the loose-synthesized value type; annotated targets
+    ///     stay strict.
+    ///   - `entries` shapes (object literals): each entry value is
+    ///     loose-synthesized into a `type.record`.
+    ///   - `value` shapes without `target` (`return`): the value
+    ///     loose-synthesizes.
+    ///   - everything else: ordinary `synth_node` (strict).
+    ///
+    /// The result is the node's type where one is still meaningful
+    /// (`type.record` for objects, `type.function` for arrows, the
+    /// bound type for assigns) and `type.unknown` at join points.
+    fn loose_synth_node(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(node_ref).ok_or_else(|| {
+            LangError::engine(format!(
+                "typecheck: loose: node {} out of bounds",
+                node_ref.index()
+            ))
+        })?;
+        let unknown = |ctx: &mut TypecheckContext| -> Result<Value, LangError> {
+            ctx.registry
+                .construct("type.unknown", &Value::Null)
+                .ok_or_else(|| {
+                    LangError::engine("typecheck: loose: construct failed for type.unknown")
+                })
+        };
+        // `if`/`ternary`-like: condition + then (+ optional else).
+        if role_declared(lang, &node.kind, "condition") && role_declared(lang, &node.kind, "then") {
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let role_or_pos = |role: &str, pos: usize| -> Option<AstRef> {
+                role_child_ref(lang, node, role).or_else(|| {
+                    kids.get(pos)
+                        .and_then(Value::as_u64)
+                        .map(|i| AstRef::new(i as usize))
+                })
+            };
+            let cond_ref = role_or_pos("condition", 0).ok_or_else(|| {
+                LangError::engine_node("typecheck: loose if: no condition child", node)
+            })?;
+            let then_ref = role_or_pos("then", 1).ok_or_else(|| {
+                LangError::engine_node("typecheck: loose if: no then child", node)
+            })?;
+            let else_ref = role_or_pos("else", 2);
+            let bool_ty = ctx
+                .registry
+                .construct("type.bool", &Value::Null)
+                .ok_or_else(|| {
+                    LangError::engine("typecheck: loose if: construct failed for type.bool")
+                })?;
+            self.check_node(lang, ast, cond_ref, &bool_ty, ctx)?;
+            let _ = self.loose_synth_node(lang, ast, then_ref, ctx)?;
+            if let Some(er) = else_ref {
+                let _ = self.loose_synth_node(lang, ast, er, ctx)?;
+            }
+            let ty = unknown(ctx)?;
+            ctx.node_types.insert(node_ref.index(), ty.clone());
+            return Ok(ty);
+        }
+        // `match`-like: scrutinee + arm block. The dependent machinery
+        // checks each arm against the constant `type.unknown` motive —
+        // which re-enters this loose path through `check_node`.
+        if role_declared(lang, &node.kind, "scrutinee") {
+            let expected = unknown(ctx)?;
+            match self.dep_check_match(lang, ast, node, &expected, ctx) {
+                Ok(Some(ty)) => {
+                    ctx.node_types.insert(node_ref.index(), ty.clone());
+                    return Ok(ty);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+            // Explicit-motive or otherwise non-checkable match — fall
+            // through to ordinary synthesis (arms join as usual).
+            return self.synth_node(lang, ast, node_ref, ctx);
+        }
+        // `block`/`do` shape: statements in a scope that pops.
+        if is_block_node(lang, node) {
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .ok_or_else(|| {
+                    LangError::engine_node("typecheck: loose block: no children", node)
+                })?;
+            // Object-literal blocks (ADR-0079 contextual braces): `{ k: v,
+            // … }` — including the `loop_step` `{state: …}`/`{out: …}`
+            // records — parses as a block of entry children; when every
+            // child is entry-shaped the block denotes record *data*.
+            if let Some(rec) = self.loose_entry_record(lang, ast, node, &kids, ctx)? {
+                ctx.node_types.insert(node_ref.index(), rec.clone());
+                return Ok(rec);
+            }
+            let mark = ctx.mark();
+            let mut last_ty = unknown(ctx)?;
+            let res = (|| -> Result<(), LangError> {
+                for (i, entry) in kids.iter().enumerate() {
+                    let idx = entry.as_u64().ok_or_else(|| {
+                        LangError::engine_node(
+                            "typecheck: loose block: child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    let child_ref = AstRef::new(idx);
+                    let child_node = ast.get(child_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: loose block: child node {} out of bounds",
+                            idx
+                        ))
+                    })?;
+                    if i == kids.len() - 1 {
+                        last_ty = self.loose_synth_node(lang, ast, child_ref, ctx)?;
+                    } else if is_assign_node(lang, child_node)
+                        && role_declared(lang, &child_node.kind, "value")
+                    {
+                        last_ty = self.loose_assign(lang, ast, child_node, ctx)?;
+                    } else {
+                        last_ty = self.loose_synth_node(lang, ast, child_ref, ctx)?;
+                    }
+                }
+                Ok(())
+            })();
+            ctx.restore(mark);
+            res?;
+            ctx.node_types.insert(node_ref.index(), last_ty.clone());
+            return Ok(last_ty);
+        }
+        // `function` shape: params bind fresh metas, body loose-synths.
+        if role_declared(lang, &node.kind, "params") {
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let params_ref = role_child_ref(lang, node, "params")
+                .or_else(|| kids.first().and_then(Value::as_u64).map(|i| AstRef::new(i as usize)))
+                .ok_or_else(|| {
+                    LangError::engine_node("typecheck: loose fn: no params child", node)
+                })?;
+            let body_ref = role_child_ref(lang, node, "body")
+                .or_else(|| kids.get(1).and_then(Value::as_u64).map(|i| AstRef::new(i as usize)))
+                .ok_or_else(|| {
+                    LangError::engine_node("typecheck: loose fn: no body child", node)
+                })?;
+            let params_node = ast.get(params_ref).ok_or_else(|| {
+                LangError::engine(format!(
+                    "typecheck: loose fn: params node {} out of bounds",
+                    params_ref.index()
+                ))
+            })?;
+            let (param_names, rest_name) = lang
+                .param_names(ast, params_node)
+                .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+            let array_pattern = lang.is_array_pattern(params_node);
+            let mark = ctx.mark();
+            let mut elems: Vec<Value> = Vec::with_capacity(param_names.len() + 1);
+            for name in &param_names {
+                let m = meta_value(ctx.fresh_meta());
+                ctx.extend(name.clone(), m.clone());
+                elems.push(m);
+            }
+            if let Some(rest) = &rest_name {
+                let elem = meta_value(ctx.fresh_meta());
+                let rest_ty = ctx
+                    .registry
+                    .construct("type.array", &serde_json::json!({"element": elem}))
+                    .ok_or_else(|| {
+                        LangError::engine("typecheck: loose fn: construct failed for type.array")
+                    })?;
+                ctx.extend(rest.clone(), rest_ty.clone());
+                elems.push(rest_ty);
+            }
+            let body_res = self.loose_synth_node(lang, ast, body_ref, ctx);
+            ctx.restore(mark);
+            let body_ty = self.zonk(&body_res?, ctx);
+            let param_ty = if !array_pattern && param_names.len() == 1 && rest_name.is_none() {
+                elems.into_iter().next().unwrap_or(Value::Null)
+            } else {
+                ctx.registry
+                    .construct("type.array", &serde_json::json!({"elements": elems}))
+                    .ok_or_else(|| {
+                        LangError::engine("typecheck: loose fn: construct failed for type.array")
+                    })?
+            };
+            let ty = ctx
+                .registry
+                .construct(
+                    "type.function",
+                    &serde_json::json!({"param": param_ty, "body": body_ty}),
+                )
+                .ok_or_else(|| {
+                    LangError::engine("typecheck: loose fn: construct failed for type.function")
+                })?;
+            ctx.node_types.insert(node_ref.index(), ty.clone());
+            return Ok(ty);
+        }
+        // `assign` shape (declares `target` AND `value` — `field-access`
+        // shares `target` but carries `field`): plain `name = value`
+        // binds the loose value type; annotated/complex targets keep the
+        // strict `synth_assign` judgment (declared annotations mean it).
+        if is_assign_node(lang, node) && role_declared(lang, &node.kind, "value") {
+            let ty = self.loose_assign(lang, ast, node, ctx)?;
+            ctx.node_types.insert(node_ref.index(), ty.clone());
+            return Ok(ty);
+        }
+        // Object literal: each entry value loose-synthesizes into a
+        // `type.record` field.
+        if role_declared(lang, &node.kind, "entries") {
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut fields = serde_json::Map::new();
+            let mut ok = !kids.is_empty();
+            let mut entry_vals: Vec<(String, AstRef)> = Vec::new();
+            for entry in &kids {
+                let Some(eidx) = entry.as_u64() else {
+                    ok = false;
+                    break;
+                };
+                let Some(enode) = ast.get(AstRef::new(eidx as usize)) else {
+                    ok = false;
+                    break;
+                };
+                let ekids = enode.payload.get("children").and_then(|c| c.as_array());
+                let key_ref = role_child_ref(lang, enode, "key").or_else(|| {
+                    ekids.and_then(|c| c.first()).and_then(Value::as_u64).map(|i| AstRef::new(i as usize))
+                });
+                let val_ref = role_child_ref(lang, enode, "value").or_else(|| {
+                    ekids.and_then(|c| c.get(1)).and_then(Value::as_u64).map(|i| AstRef::new(i as usize))
+                });
+                let Some((kr, vr)) = key_ref.zip(val_ref) else {
+                    ok = false;
+                    break;
+                };
+                let Some(key) = ast
+                    .get(kr)
+                    .and_then(|kn| kn.payload.as_str().map(str::to_string))
+                else {
+                    ok = false;
+                    break;
+                };
+                entry_vals.push((key, vr));
+            }
+            if ok {
+                for (key, vr) in entry_vals {
+                    let vt = self.loose_synth_node(lang, ast, vr, ctx)?;
+                    fields.insert(key, vt);
+                }
+                let ty = ctx
+                    .registry
+                    .construct(
+                        "type.record",
+                        &serde_json::json!({"fields": Value::Object(fields)}),
+                    )
+                    .ok_or_else(|| {
+                        LangError::engine("typecheck: loose object: construct failed for type.record")
+                    })?;
+                ctx.node_types.insert(node_ref.index(), ty.clone());
+                return Ok(ty);
+            }
+            // Non-children/payload-encoded entries — ordinary synth.
+            return self.synth_node(lang, ast, node_ref, ctx);
+        }
+        // `return`-like (value role, no target): loose the value.
+        if is_return_node(lang, node) {
+            let kids = node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let value_ref = role_child_ref(lang, node, "value")
+                .or_else(|| kids.first().and_then(Value::as_u64).map(|i| AstRef::new(i as usize)))
+                .ok_or_else(|| {
+                    LangError::engine_node("typecheck: loose return: no value child", node)
+                })?;
+            let ty = self.loose_synth_node(lang, ast, value_ref, ctx)?;
+            ctx.node_types.insert(node_ref.index(), ty.clone());
+            return Ok(ty);
+        }
+        self.synth_node(lang, ast, node_ref, ctx)
+    }
+
+    /// Loose-mode `assign`: `name = value` (payload.name or a 2-child
+    /// `[var, value]` target) binds the loose-synthesized value type;
+    /// every other shape (annotations, destructuring targets, alias
+    /// heads) stays on the strict `synth_assign` judgment.
+    fn loose_assign(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &handl_language::AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = node
+            .payload
+            .get("children")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(name) = node.payload.get("name").and_then(Value::as_str) {
+            if let Some(vref) = kids
+                .first()
+                .and_then(Value::as_u64)
+                .map(|i| AstRef::new(i as usize))
+            {
+                let ty = self.loose_synth_node(lang, ast, vref, ctx)?;
+                ctx.extend(name.to_string(), ty.clone());
+                return Ok(ty);
+            }
+        }
+        if kids.len() == 2 {
+            if let Some((tidx, vidx)) = kids[0].as_u64().zip(kids[1].as_u64()) {
+                if let Some(lhs) = ast.get(AstRef::new(tidx as usize)) {
+                    let annot_like = role_declared(lang, &lhs.kind, "annot")
+                        || role_declared(lang, &lhs.kind, "subject")
+                        || role_declared(lang, &lhs.kind, "params");
+                    if !annot_like {
+                        if let Some(name) = lhs.payload.as_str().map(str::to_string) {
+                            let ty = self.loose_synth_node(
+                                lang,
+                                ast,
+                                AstRef::new(vidx as usize),
+                                ctx,
+                            )?;
+                            ctx.extend(name, ty.clone());
+                            return Ok(ty);
+                        }
+                    }
+                }
+            }
+        }
+        self.synth_assign_judgment(lang, ast, node, ctx)
     }
 
     /// Row-polymorphic record unification (ADR-0074 ID.7).
@@ -5018,6 +5881,14 @@ struct TypecheckContext {
     /// `Term`s must take the direct `TermData::from_term` path
     /// ([`NbeTypecheckEngine::eval_type_scheme`]).
     scheme_td: HashMap<*const Term, Rc<TermData>>,
+    /// Suspended-join depth: `> 0` while checking under a `type.unknown`
+    /// expected type or inside a `while` body ([`NbeTypecheckEngine::
+    /// loose_synth_node`]). Projection ops that would error on an
+    /// unsolved-meta container (`record_field_type`/`array_element_type`)
+    /// yield a fresh meta instead — a loop body's `a.f`/`xs[i]` on a
+    /// metavariable-typed binding stays maximally permissive rather than
+    /// failing the escape-hatch code the check now reaches.
+    loose: usize,
 }
 
 /// A registered dictionary instance (phase-3 WS-A): the elaboration
@@ -5085,6 +5956,7 @@ impl TypecheckContext {
             pending_instances: Vec::new(),
             instance_count: 0,
             scheme_td: HashMap::new(),
+            loose: 0,
         }
     }
 
@@ -5115,6 +5987,18 @@ impl TypecheckContext {
     /// Solve a metavariable to a value.
     fn solve_meta(&mut self, id: u64, val: Value) {
         if (id as usize) < self.metas.len() {
+            // A `Nat`-sorted meta bound to another unsolved meta passes
+            // the nonnegativity constraint on: `?k ≥ 0` and `?k := ?j`
+            // share the same cell, so `?j` must be ≥ 0 too — otherwise a
+            // later `?j := -1` silently violates `?k`'s sort (the
+            // `n ↦ ?k + 1` refinement reached through an implicit-`Pi`
+            // fill made `0 ≡ ?j + 1` look satisfiable and broke
+            // coverage's decided-impossible arm).
+            if self.nonneg_metas.contains(&id) {
+                if let Some(other) = extract_meta_id(&val) {
+                    self.nonneg_metas.insert(other);
+                }
+            }
             self.metas[id as usize] = Some(val);
         }
     }
@@ -5326,6 +6210,16 @@ fn role_index_of(lang: &Language, node_kind: &str, role: &str) -> Option<usize> 
 }
 
 /// Whether `node_kind`'s shape declares the given child role.
+/// Internal loose-top tag (see the `check_node` early-accept): expected
+/// type minted by `synth_while` for loop bodies — accepted by
+/// `check_node`, which then loose-synthesizes the node so internals
+/// report without sibling joins.
+const LOOSE_TOP_TAG: &str = "type.__loose_top__";
+
+fn loose_top() -> Value {
+    serde_json::json!({"__tag__": LOOSE_TOP_TAG})
+}
+
 fn role_declared(lang: &Language, node_kind: &str, role: &str) -> bool {
     role_index_of(lang, node_kind, role).is_some()
 }
