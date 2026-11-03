@@ -157,11 +157,7 @@ fn propagate_stuck(a: &SymExpr, b: &SymExpr) -> Option<SymExpr> {
 fn value_to_sym(v: &Value) -> Option<SymExpr> {
     if let Some(i) = v.as_i64() {
         Some(SymExpr::int(i))
-    } else if let Some(b) = v.as_bool() {
-        Some(SymExpr::boolean(b))
-    } else {
-        None
-    }
+    } else { v.as_bool().map(SymExpr::boolean) }
 }
 
 /// Normalize a symbolic expression one step. Returns `None` if the
@@ -856,13 +852,12 @@ impl super::NbeTypecheckEngine {
                 (ast.clone(), body_idx, param_name, None)
             } else {
                 // Phase 3.1: evaluate the type expression to get the closure.
-                if self.pure {
-                    if let Err(_) = super::check_pure(lang, ast, predicate_ref) {
+                if self.pure
+                    && super::check_pure(lang, ast, predicate_ref).is_err() {
                         return Proof::blocked(
                             "impure type expression in symbolic predicate check",
                         );
                     }
-                }
                 let sub = match ast.subtree(predicate_ref) {
                     Ok(s) => s,
                     Err(e) => return Proof::blocked(format!("subtree error: {}", e)),
@@ -936,15 +931,14 @@ impl super::NbeTypecheckEngine {
         // Add the closure's residual `binds` (if any). Serializable captures
         // were already substituted into `body_def` at mint time — e.g. `k = 3`
         // for `DivisibleBy(3)` — so only non-substitutable bindings land here.
-        if let Some(captured) = captured_env {
-            if let Some(obj) = captured.as_object() {
+        if let Some(captured) = captured_env
+            && let Some(obj) = captured.as_object() {
                 for (k, v) in obj {
                     if let Some(sym) = value_to_sym(v) {
                         env.insert(k.clone(), sym);
                     }
                 }
             }
-        }
 
         // Translate the predicate body to a symbolic expression. The body
         // index is valid in `body_ast` (the original AST for `function` nodes,
@@ -981,9 +975,7 @@ impl super::NbeTypecheckEngine {
         // Check if it's a type.function.
         let is_function = self.registry_id_check(expr_type);
         if !is_function {
-            return Proof::blocked(format!(
-                "purity: expression type is not a function, cannot check purity"
-            ));
+            return Proof::blocked("purity: expression type is not a function, cannot check purity".to_string());
         }
 
         // Read the effects field from the function type.

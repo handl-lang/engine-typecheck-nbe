@@ -191,7 +191,7 @@ fn extract_assign_value<'a>(
         .child_role_index(&assign_node.kind, "value")
         .ok()
         .flatten()
-        .or_else(|| if children.len() >= 2 { Some(1) } else { None })?;
+        .or(if children.len() >= 2 { Some(1) } else { None })?;
     let child_entry = children.get(value_idx)?;
     let value_ref = AstRef::new(child_entry.as_u64()? as usize);
     ast.get(value_ref)
@@ -218,13 +218,11 @@ fn find_assign_for_name(ast: &Ast, lang: &Language, name: &str) -> Option<AstRef
             // Role-less shape fallback: the canonical `assign` kind.
             node.kind == "assign"
         };
-        if is_binding {
-            if let Some(n) = extract_assign_name(ast, lang, node) {
-                if n == name {
+        if is_binding
+            && let Some(n) = extract_assign_name(ast, lang, node)
+                && n == name {
                     return Some(AstRef::new(idx));
                 }
-            }
-        }
     }
     None
 }
@@ -338,11 +336,10 @@ fn call_decreases_on_params(ast: &Ast, call_ref: AstRef, param_names: &[String])
     };
     // Skip child 0 (the callee); check children 1..N (the arguments).
     for arg_val in children.iter().skip(1) {
-        if let Some(arg_idx) = arg_val.as_u64() {
-            if is_strict_sub_structure(ast, AstRef::new(arg_idx as usize), param_names) {
+        if let Some(arg_idx) = arg_val.as_u64()
+            && is_strict_sub_structure(ast, AstRef::new(arg_idx as usize), param_names) {
                 return true;
             }
-        }
     }
     false
 }

@@ -34,8 +34,8 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    InstanceEntry, checker, extract_meta_id, is_assign_node, meta_value, role_child_ref,
-    NbeTypecheckEngine, TypecheckContext,
+    InstanceEntry, NbeTypecheckEngine, TypecheckContext, checker, extract_meta_id, is_assign_node,
+    meta_value, role_child_ref,
 };
 
 /// Build a tagged type value `{"__tag__": tag, "__registry__": id, …fields}`.
@@ -267,13 +267,11 @@ fn dim_meta(ctx: &mut TypecheckContext) -> Val {
 /// The literal dimension of a lifted `Former{type.hom}` head —
 /// `Some(m)` when `v` is `Hom(m, ·, ·)` with a literal `m`.
 fn hom_dim_lit(v: &Val) -> Option<u64> {
-    if let Val::Former { head, args } = v {
-        if head.handle() == checker::type_sym("type.hom").handle() && args.len() == 3 {
-            if let Val::Const(TaggedValue::Int(m)) = &args[0] {
+    if let Val::Former { head, args } = v
+        && head.handle() == checker::type_sym("type.hom").handle() && args.len() == 3
+            && let Val::Const(TaggedValue::Int(m)) = &args[0] {
                 return u64::try_from(*m).ok();
             }
-        }
-    }
     None
 }
 
@@ -295,7 +293,7 @@ fn children_of(node: &AstNode) -> Option<&Vec<Value>> {
     node.payload.get("children").and_then(|c| c.as_array())
 }
 
-fn child_at(ast: &Ast, node: &AstNode, i: usize) -> Option<AstRef> {
+fn child_at(_ast: &Ast, node: &AstNode, i: usize) -> Option<AstRef> {
     children_of(node)?
         .get(i)?
         .as_u64()
@@ -303,15 +301,12 @@ fn child_at(ast: &Ast, node: &AstNode, i: usize) -> Option<AstRef> {
 }
 
 fn node_name(node: &AstNode) -> Option<String> {
-    node.payload
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            node.payload
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+    node.payload.as_str().map(str::to_string).or_else(|| {
+        node.payload
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 /// Whether `name` is a builtin type-position identifier — the name table
@@ -475,11 +470,7 @@ fn zonk_domain_walk(v: &Value, ctx: &mut TypecheckContext) -> Value {
                 .map(|(k, x)| (k.clone(), zonk_domain_walk(x, ctx)))
                 .collect(),
         ),
-        Value::Array(xs) => Value::Array(
-            xs.iter()
-                .map(|x| zonk_domain_walk(x, ctx))
-                .collect(),
-        ),
+        Value::Array(xs) => Value::Array(xs.iter().map(|x| zonk_domain_walk(x, ctx)).collect()),
         _ => v.clone(),
     }
 }
@@ -543,10 +534,9 @@ fn display_inner(v: &Value, depth: usize) -> String {
             }
             if let Some(n) = o.get("__neutral__") {
                 let base = match n.get("head").and_then(Value::as_str) {
-                    Some("rigid") => format!(
-                        "#{}",
-                        n.get("index").and_then(Value::as_u64).unwrap_or(0)
-                    ),
+                    Some("rigid") => {
+                        format!("#{}", n.get("index").and_then(Value::as_u64).unwrap_or(0))
+                    }
                     Some("meta") => {
                         format!("?m{}", n.get("id").and_then(Value::as_u64).unwrap_or(0))
                     }
@@ -617,7 +607,11 @@ fn display_tagged(tag: &str, o: &Map<String, Value>, depth: usize) -> String {
                 .and_then(|b| b.get("var_name"))
                 .and_then(Value::as_str)
                 .unwrap_or("x");
-            let param_field = if tag == "type.forall" { "kind" } else { "param" };
+            let param_field = if tag == "type.forall" {
+                "kind"
+            } else {
+                "param"
+            };
             format!("{name}({var}: {})", field(param_field))
         }
         "type.family_app" | "type.family" => {
@@ -801,12 +795,11 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
         // Declared arity-0 ctor projection: a bare index-position `Z`
         // naming a registered nullary ctor (`Zero`) reads as its
         // template (`0`). A `results` binding shadows — checked above.
-        if let Some(p) = ctx.ctor_proj.get(name) {
-            if p.arity == 0 {
+        if let Some(p) = ctx.ctor_proj.get(name)
+            && p.arity == 0 {
                 let t = p.template.clone();
                 return eval_index_fuel(&t, ctx, fuel - 1);
             }
-        }
         return v.clone();
     }
     if tag_of(v) == Some("App") {
@@ -825,16 +818,13 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
         // Unregistered heads stay honest `App` atoms (args still
         // evaluate pointwise, so `App{F, 0+1}` canonicalizes to
         // `App{F, 1}`).
-        if tag_of(&callee) == Some("var") {
-            if let Some(cname) = callee.get("name").and_then(Value::as_str) {
-                if let Some(p) = ctx.ctor_proj.get(cname) {
-                    if p.arity == args.len() {
+        if tag_of(&callee) == Some("var")
+            && let Some(cname) = callee.get("name").and_then(Value::as_str)
+                && let Some(p) = ctx.ctor_proj.get(cname)
+                    && p.arity == args.len() {
                         let t = proj_instantiate(&p.template, &args);
                         return eval_index_fuel(&t, ctx, fuel - 1);
                     }
-                }
-            }
-        }
         return app_term(callee, args);
     }
     if tag_of(v) == Some("Bin") {
@@ -863,11 +853,10 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
     if tag_of(v) == Some("Un") {
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
         let o = eval_index_fuel(v.get("operand").unwrap_or(&Value::Null), ctx, fuel - 1);
-        if op == "unary.neg" {
-            if let Some(n) = num_val(&o) {
+        if op == "unary.neg"
+            && let Some(n) = num_val(&o) {
                 return Value::from(-n);
             }
-        }
         return ring_canon(un_term(op, o));
     }
     v.clone()
@@ -1005,12 +994,8 @@ fn poly_mul(a: &IndexPoly, b: &IndexPoly) -> Option<IndexPoly> {
     // a.terms * b.terms — merge atom bags (sorted by key).
     for ma in a.terms.values() {
         for mb in b.terms.values() {
-            let mut atoms: Vec<(String, Value)> = ma
-                .atoms
-                .iter()
-                .chain(mb.atoms.iter())
-                .cloned()
-                .collect();
+            let mut atoms: Vec<(String, Value)> =
+                ma.atoms.iter().chain(mb.atoms.iter()).cloned().collect();
             atoms.sort_by(|x, y| x.0.cmp(&y.0));
             if atoms.len() > POLY_MAX_FACTORS {
                 return None;
@@ -1022,10 +1007,7 @@ fn poly_mul(a: &IndexPoly, b: &IndexPoly) -> Option<IndexPoly> {
                 .join("*");
             out.terms
                 .entry(key)
-                .or_insert(IndexMono {
-                    coeff: 0.0,
-                    atoms,
-                })
+                .or_insert(IndexMono { coeff: 0.0, atoms })
                 .coeff += ma.coeff * mb.coeff;
         }
     }
@@ -1122,7 +1104,7 @@ fn add_fold(terms: &[Value]) -> Option<Value> {
 fn poly_to_term(p: &IndexPoly) -> Value {
     let mut pos: Vec<Value> = Vec::new();
     let mut neg: Vec<Value> = Vec::new();
-    for (_, m) in &p.terms {
+    for m in p.terms.values() {
         if m.coeff > 0.0 {
             pos.push(mono_term(m));
         } else if m.coeff < 0.0 {
@@ -1319,7 +1301,11 @@ fn solve_index_cases(term: &Value, target: i64, ctx: &mut TypecheckContext) -> S
         "binary.mul" => {
             if let Some(c) = rn {
                 if c == 0.0 {
-                    return if target == 0 { Solve::Ok } else { Solve::Decided };
+                    return if target == 0 {
+                        Solve::Ok
+                    } else {
+                        Solve::Decided
+                    };
                 }
                 if c.fract() == 0.0 && target % c as i64 == 0 {
                     solve_index(&l, target / c as i64, ctx)
@@ -1328,7 +1314,11 @@ fn solve_index_cases(term: &Value, target: i64, ctx: &mut TypecheckContext) -> S
                 }
             } else if let Some(c) = ln {
                 if c == 0.0 {
-                    return if target == 0 { Solve::Ok } else { Solve::Decided };
+                    return if target == 0 {
+                        Solve::Ok
+                    } else {
+                        Solve::Decided
+                    };
                 }
                 if c.fract() == 0.0 && target % c as i64 == 0 {
                     solve_index(&r, target / c as i64, ctx)
@@ -1485,15 +1475,14 @@ impl IndexSolver for BuiltinIndexSolver {
             return IndexVerdict::Proven;
         }
         for (target, term) in [(num_val(&eb), &ea), (num_val(&ea), &eb)] {
-            if let Some(t) = target {
-                if t.fract() == 0.0 {
+            if let Some(t) = target
+                && t.fract() == 0.0 {
                     return match solve_index(term, t as i64, ctx) {
                         Solve::Ok => IndexVerdict::Proven,
                         Solve::Decided => IndexVerdict::Disproven,
                         Solve::Stuck => IndexVerdict::Unknown,
                     };
                 }
-            }
         }
         IndexVerdict::Unknown
     }
@@ -1530,7 +1519,11 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         return (true, false);
     }
     if tag_of(&ea) == Some("var") {
-        let name = ea.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let name = ea
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if !name.is_empty() && !var_occurs(&name, &eb) {
             // A `Nat`-sorted rigid var cannot rewrite to a negative
             // numeral — decided-unsatisfiable, not bound.
@@ -1545,7 +1538,11 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         return (true, false);
     }
     if tag_of(&eb) == Some("var") {
-        let name = eb.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let name = eb
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if !name.is_empty() && !var_occurs(&name, &ea) {
             if ctx.nonneg_index_vars.contains(name.as_str())
                 && num_val(&ea).is_some_and(|n| n < 0.0)
@@ -1566,8 +1563,16 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
     // `eval_index` already rewrote them to arithmetic.
     if tag_of(&ea) == Some("App") && tag_of(&eb) == Some("App") {
         if ea.get("callee") == eb.get("callee") {
-            let xs = ea.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
-            let ys = eb.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+            let xs = ea
+                .get("args")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let ys = eb
+                .get("args")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             if xs.len() == ys.len() {
                 for (x, y) in xs.iter().zip(ys.iter()) {
                     let (ok, _) = unify_index(x, y, ctx);
@@ -1604,8 +1609,16 @@ fn unify_index(a: &Value, b: &Value, ctx: &mut TypecheckContext) -> (bool, bool)
         if ea.get("name") != eb.get("name") {
             return (false, true);
         }
-        let xs = ea.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
-        let ys = eb.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+        let xs = ea
+            .get("args")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let ys = eb
+            .get("args")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         if xs.len() != ys.len() {
             return (false, true);
         }
@@ -1753,13 +1766,7 @@ fn match_pattern_head(ast: &Ast, pattern: &AstNode) -> (Option<String>, Vec<Stri
                 .first()
                 .and_then(Value::as_u64)
                 .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .and_then(|n| {
-                    if n.kind == "var" {
-                        node_name(n)
-                    } else {
-                        None
-                    }
-                });
+                .and_then(|n| if n.kind == "var" { node_name(n) } else { None });
             let names: Vec<String> = pk
                 .iter()
                 .skip(1)
@@ -2085,8 +2092,7 @@ fn collect_ctors(lang: &Language, node: &AstNode, ast: &Ast, out: &mut Vec<DepCt
         "alt" => {
             if let Some(kids) = children_of(node) {
                 for c in kids {
-                    if let Some(n) = ast.get(AstRef::new(c.as_u64().unwrap_or(u64::MAX) as usize))
-                    {
+                    if let Some(n) = ast.get(AstRef::new(c.as_u64().unwrap_or(u64::MAX) as usize)) {
                         collect_ctors(lang, n, ast, out);
                     }
                 }
@@ -2106,11 +2112,10 @@ fn collect_ctors(lang: &Language, node: &AstNode, ast: &Ast, out: &mut Vec<DepCt
                 .unwrap_or(1);
             let cons_idx = kids.get(subj).and_then(Value::as_u64).map(|v| v as usize);
             let result_idx = kids.get(annot).and_then(Value::as_u64).map(|v| v as usize);
-            if let Some(ci) = cons_idx {
-                if let Some(cn) = ast.get(AstRef::new(ci)) {
+            if let Some(ci) = cons_idx
+                && let Some(cn) = ast.get(AstRef::new(ci)) {
                     collect_ctor_leaf(cn, ast, out, result_idx, false);
                 }
-            }
         }
         _ => collect_ctor_leaf(node, ast, out, None, node.kind == "var"),
     }
@@ -2131,7 +2136,9 @@ fn collect_ctor_leaf(
             bare: true,
         }),
         "call" => {
-            let Some(kids) = children_of(node) else { return };
+            let Some(kids) = children_of(node) else {
+                return;
+            };
             let Some(callee_idx) = kids.first().and_then(Value::as_u64) else {
                 return;
             };
@@ -2185,11 +2192,10 @@ fn occurs_name(ast: &Ast, node: &AstNode, name: &str) -> bool {
                 .is_some_and(|n| occurs_name(ast, n, name))
         });
     }
-    if let Some(b) = node.payload.get("body").and_then(Value::as_u64) {
-        if let Some(n) = ast.get(AstRef::new(b as usize)) {
+    if let Some(b) = node.payload.get("body").and_then(Value::as_u64)
+        && let Some(n) = ast.get(AstRef::new(b as usize)) {
             return occurs_name(ast, n, name);
         }
-    }
     false
 }
 
@@ -2216,7 +2222,8 @@ fn positivity_ok(ast: &Ast, node: &AstNode, name: &str) -> bool {
                 .and_then(Value::as_u64)
                 .and_then(|i| ast.get(AstRef::new(i as usize)))
                 .is_some_and(|n| {
-                    n.kind == "var" && (n.payload.as_str() == Some("->") || n.payload.as_str() == Some("~>"))
+                    n.kind == "var"
+                        && (n.payload.as_str() == Some("->") || n.payload.as_str() == Some("~>"))
                 });
             if callee_is_arrow && kids.len() >= 3 {
                 let dom_bad = kids
@@ -2271,273 +2278,275 @@ impl NbeTypecheckEngine {
         crate::stats::dep_synth_type(idx);
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
-            LangError::engine(format!("dep_synth_type: node {} out of bounds", idx))
-        })?;
-        match node.kind.as_str() {
-            "paren" => {
-                let kids = children_of(node)
-                    .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
-                if kids.len() > 1 {
-                    // Tuple position `(A, B)` — the `type.array{elements}`
-                    // convention `synth_function` mints for `(x, y) ~>`
-                    // domains.
-                    let mut els = Vec::with_capacity(kids.len());
-                    for k in kids {
-                        let i = k.as_u64().ok_or_else(|| {
-                            LangError::engine("dep_synth_type: paren child idx")
-                        })? as usize;
-                        els.push(self.dep_synth_type(lang, ast, i, ctx)?);
+            let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
+                LangError::engine(format!("dep_synth_type: node {} out of bounds", idx))
+            })?;
+            match node.kind.as_str() {
+                "paren" => {
+                    let kids = children_of(node)
+                        .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
+                    if kids.len() > 1 {
+                        // Tuple position `(A, B)` — the `type.array{elements}`
+                        // convention `synth_function` mints for `(x, y) ~>`
+                        // domains.
+                        let mut els = Vec::with_capacity(kids.len());
+                        for k in kids {
+                            let i = k.as_u64().ok_or_else(|| {
+                                LangError::engine("dep_synth_type: paren child idx")
+                            })? as usize;
+                            els.push(self.dep_synth_type(lang, ast, i, ctx)?);
+                        }
+                        let mut m = Map::new();
+                        m.insert("elements".to_string(), Value::Array(els));
+                        return Ok(make_tag(ctx, "type.array", m));
                     }
+                    let inner = child_at(ast, node, 0)
+                        .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
+                    self.dep_synth_type(lang, ast, inner.index(), ctx)
+                }
+                "type-annot" => {
+                    let annot = role_child_ref(lang, node, "annot")
+                        .or_else(|| child_at(ast, node, 1))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: type-annot missing annot")
+                        })?;
+                    self.dep_synth_type(lang, ast, annot.index(), ctx)
+                }
+                "value" | "lit" => Ok(node.payload.clone()),
+                "var" => self.dep_synth_var_type(lang, ast, node, ctx),
+                "field-access" => {
+                    let kids = children_of(node).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: field-access no children")
+                    })?;
+                    let field_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: field-access missing field child")
+                    })? as usize;
+                    let field = node_name(ast.get(AstRef::new(field_idx)).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: field node out of bounds")
+                    })?)
+                    .ok_or_else(|| LangError::engine("dep_synth_type: field name missing"))?;
+                    // `type.Name` — a declared alias spelled through the
+                    // type namespace (`type.Name := body`); expands
+                    // transparently when Γ-bound, else the builtin table.
+                    if let Some(bound) = ctx.lookup(&field).cloned()
+                        && tag_of(&bound) == Some("type.alias") {
+                            return self.expand_alias(lang, ast, &bound, &[], ctx);
+                        }
+                    self.dep_builtin_or_tag(&field, ctx)
+                }
+                "array" => {
+                    let inner = child_at(ast, node, 0)
+                        .ok_or_else(|| LangError::engine("dep_synth_type: empty array"))?;
+                    let el = self.dep_synth_type(lang, ast, inner.index(), ctx)?;
                     let mut m = Map::new();
-                    m.insert("elements".to_string(), Value::Array(els));
-                    return Ok(make_tag(ctx, "type.array", m));
+                    m.insert("element".to_string(), el);
+                    Ok(make_tag(ctx, "type.array", m))
                 }
-                let inner = child_at(ast, node, 0)
-                    .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
-                self.dep_synth_type(lang, ast, inner.index(), ctx)
-            }
-            "type-annot" => {
-                let annot = role_child_ref(lang, node, "annot")
-                    .or_else(|| child_at(ast, node, 1))
-                    .ok_or_else(|| LangError::engine("dep_synth_type: type-annot missing annot"))?;
-                self.dep_synth_type(lang, ast, annot.index(), ctx)
-            }
-            "value" | "lit" => Ok(node.payload.clone()),
-            "var" => self.dep_synth_var_type(lang, ast, node, ctx),
-            "field-access" => {
-                let kids = children_of(node)
-                    .ok_or_else(|| LangError::engine("dep_synth_type: field-access no children"))?;
-                let field_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
-                    LangError::engine("dep_synth_type: field-access missing field child")
-                })? as usize;
-                let field = node_name(ast.get(AstRef::new(field_idx)).ok_or_else(|| {
-                    LangError::engine("dep_synth_type: field node out of bounds")
-                })?)
-                .ok_or_else(|| LangError::engine("dep_synth_type: field name missing"))?;
-                // `type.Name` — a declared alias spelled through the
-                // type namespace (`type.Name := body`); expands
-                // transparently when Γ-bound, else the builtin table.
-                if let Some(bound) = ctx.lookup(&field).cloned() {
-                    if tag_of(&bound) == Some("type.alias") {
-                        return self.expand_alias(lang, ast, &bound, &[], ctx);
-                    }
-                }
-                self.dep_builtin_or_tag(&field, ctx)
-            }
-            "array" => {
-                let inner = child_at(ast, node, 0)
-                    .ok_or_else(|| LangError::engine("dep_synth_type: empty array"))?;
-                let el = self.dep_synth_type(lang, ast, inner.index(), ctx)?;
-                let mut m = Map::new();
-                m.insert("element".to_string(), el);
-                Ok(make_tag(ctx, "type.array", m))
-            }
-            "function" => {
-                let kids = children_of(node)
-                    .ok_or_else(|| LangError::engine("dep_synth_type: function no children"))?;
-                let params_idx = role_child_ref(lang, node, "params")
-                    .or_else(|| child_at(ast, node, 0))
-                    .ok_or_else(|| LangError::engine("dep_synth_type: function missing params"))?;
-                let body_idx = role_child_ref(lang, node, "body")
-                    .or_else(|| child_at(ast, node, 1))
-                    .ok_or_else(|| LangError::engine("dep_synth_type: function missing body"))?;
-                // The params child is a type expression — a `paren`-wrapped
-                // list takes its last child as the domain (the `A -> B`
-                // convention); any other node (`call` former
-                // applications like `Vec(n, a)`/`IO(sig)`, `var`, …) IS
-                // the domain.
-                let dom_idx = if let Some(p) = ast.get(params_idx) {
-                    if p.kind == "paren" {
-                        children_of(p)
-                            .and_then(|k| k.last())
-                            .and_then(Value::as_u64)
-                            .map(|i| AstRef::new(i as usize))
-                            .unwrap_or(params_idx)
+                "function" => {
+                    let _kids = children_of(node)
+                        .ok_or_else(|| LangError::engine("dep_synth_type: function no children"))?;
+                    let params_idx = role_child_ref(lang, node, "params")
+                        .or_else(|| child_at(ast, node, 0))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: function missing params")
+                        })?;
+                    let body_idx = role_child_ref(lang, node, "body")
+                        .or_else(|| child_at(ast, node, 1))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: function missing body")
+                        })?;
+                    // The params child is a type expression — a `paren`-wrapped
+                    // list takes its last child as the domain (the `A -> B`
+                    // convention); any other node (`call` former
+                    // applications like `Vec(n, a)`/`IO(sig)`, `var`, …) IS
+                    // the domain.
+                    let dom_idx = if let Some(p) = ast.get(params_idx) {
+                        if p.kind == "paren" {
+                            children_of(p)
+                                .and_then(|k| k.last())
+                                .and_then(Value::as_u64)
+                                .map(|i| AstRef::new(i as usize))
+                                .unwrap_or(params_idx)
+                        } else {
+                            params_idx
+                        }
                     } else {
                         params_idx
-                    }
-                } else {
-                    params_idx
-                };
-                let dom = self.dep_synth_type(lang, ast, dom_idx.index(), ctx)?;
-                let cod = self.dep_synth_type(lang, ast, body_idx.index(), ctx)?;
-                let mut m = Map::new();
-                m.insert("param".to_string(), dom);
-                m.insert("body".to_string(), cod);
-                Ok(make_tag(ctx, "type.function", m))
-            }
-            // `dimension` (`F<i⃗>`, the `<>` index-application spelling)
-            // elaborates through the same call-type path: `Vec<n, a>` is
-            // the former application `Vec{n, a}` used to spell.
-            "call" | "index_app" | "dimension" => {
-                self.dep_synth_call_type(lang, ast, node, ctx)
-            }
-            // `forall b, T` / `exists b, T` — parse-level `Pi`/`Sigma`
-            // aliases (phase-2 WS-C sugar; `exists` is the existential
-            // twin). The binder child is `type-annot(var, A)` or a bare
-            // `var` (unsorted — a fresh meta domain), the body child the
-            // type expression. Mints the *same* `type.pi{param,
-            // body_closure}` `Pi(A, b ~> T)` / `type.sigma{param,
-            // body_closure}` `Sigma(A, b ~> T)` produces — no new
-            // semantics.
-            kind @ ("forall" | "exists") => {
-                let (tag, kw) = if kind == "exists" {
-                    ("type.sigma", "exists")
-                } else {
-                    ("type.pi", "forall")
-                };
-                let kids = children_of(node).ok_or_else(|| {
-                    LangError::engine(format!("dep_synth_type: {kw} has no children"))
-                })?;
-                if kids.len() < 2 {
-                    return Err(LangError::engine(format!(
-                        "dep_synth_type: {kw} needs [binder, body]"
-                    )));
+                    };
+                    let dom = self.dep_synth_type(lang, ast, dom_idx.index(), ctx)?;
+                    let cod = self.dep_synth_type(lang, ast, body_idx.index(), ctx)?;
+                    let mut m = Map::new();
+                    m.insert("param".to_string(), dom);
+                    m.insert("body".to_string(), cod);
+                    Ok(make_tag(ctx, "type.function", m))
                 }
-                let binder_idx = kids[0].as_u64().ok_or_else(|| {
-                    LangError::engine(format!("dep_synth_type: {kw} binder idx"))
-                })? as usize;
-                let body_idx = kids[1].as_u64().ok_or_else(|| {
-                    LangError::engine(format!("dep_synth_type: {kw} body idx"))
-                })? as usize;
-                let bnode = ast.get(AstRef::new(binder_idx)).ok_or_else(|| {
-                    LangError::engine(format!("dep_synth_type: {kw} binder out of bounds"))
-                })?;
-                let (var_name, param) = if bnode.kind == "type-annot"
-                    || role_child_ref(lang, bnode, "annot").is_some()
-                {
-                    let bk = children_of(bnode).cloned().unwrap_or_default();
-                    let subj = lang
-                        .child_role_index(&bnode.kind, "subject")
-                        .ok()
-                        .flatten()
-                        .unwrap_or(0);
-                    let annot = lang
-                        .child_role_index(&bnode.kind, "annot")
-                        .ok()
-                        .flatten()
-                        .unwrap_or(1);
-                    let vn = bk
-                        .get(subj)
-                        .and_then(Value::as_u64)
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .and_then(node_name)
-                        .ok_or_else(|| {
-                            LangError::engine(format!(
-                                "dep_synth_type: {kw} binder is not a name"
-                            ))
-                        })?;
-                    let ty_idx = bk
-                        .get(annot)
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| {
-                            LangError::engine(format!(
-                                "dep_synth_type: {kw} binder missing sort"
-                            ))
-                        })? as usize;
-                    (vn, self.dep_synth_type(lang, ast, ty_idx, ctx)?)
-                } else {
-                    let vn = node_name(bnode).ok_or_else(|| {
-                        LangError::engine(format!(
-                            "dep_synth_type: {kw} binder is not a name"
-                        ))
+                // `dimension` (`F<i⃗>`, the `<>` index-application spelling)
+                // elaborates through the same call-type path: `Vec<n, a>` is
+                // the former application `Vec{n, a}` used to spell.
+                "call" | "index_app" | "dimension" => {
+                    self.dep_synth_call_type(lang, ast, node, ctx)
+                }
+                // `forall b, T` / `exists b, T` — parse-level `Pi`/`Sigma`
+                // aliases (phase-2 WS-C sugar; `exists` is the existential
+                // twin). The binder child is `type-annot(var, A)` or a bare
+                // `var` (unsorted — a fresh meta domain), the body child the
+                // type expression. Mints the *same* `type.pi{param,
+                // body_closure}` `Pi(A, b ~> T)` / `type.sigma{param,
+                // body_closure}` `Sigma(A, b ~> T)` produces — no new
+                // semantics.
+                kind @ ("forall" | "exists") => {
+                    let (tag, kw) = if kind == "exists" {
+                        ("type.sigma", "exists")
+                    } else {
+                        ("type.pi", "forall")
+                    };
+                    let kids = children_of(node).ok_or_else(|| {
+                        LangError::engine(format!("dep_synth_type: {kw} has no children"))
                     })?;
-                    (vn, meta_value(ctx.fresh_meta()))
-                };
-                let mut m = Map::new();
-                m.insert("param".to_string(), param);
-                m.insert(
+                    if kids.len() < 2 {
+                        return Err(LangError::engine(format!(
+                            "dep_synth_type: {kw} needs [binder, body]"
+                        )));
+                    }
+                    let binder_idx = kids[0].as_u64().ok_or_else(|| {
+                        LangError::engine(format!("dep_synth_type: {kw} binder idx"))
+                    })? as usize;
+                    let body_idx = kids[1].as_u64().ok_or_else(|| {
+                        LangError::engine(format!("dep_synth_type: {kw} body idx"))
+                    })? as usize;
+                    let bnode = ast.get(AstRef::new(binder_idx)).ok_or_else(|| {
+                        LangError::engine(format!("dep_synth_type: {kw} binder out of bounds"))
+                    })?;
+                    let (var_name, param) = if bnode.kind == "type-annot"
+                        || role_child_ref(lang, bnode, "annot").is_some()
+                    {
+                        let bk = children_of(bnode).cloned().unwrap_or_default();
+                        let subj = lang
+                            .child_role_index(&bnode.kind, "subject")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
+                        let annot = lang
+                            .child_role_index(&bnode.kind, "annot")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(1);
+                        let vn = bk
+                            .get(subj)
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .and_then(node_name)
+                            .ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "dep_synth_type: {kw} binder is not a name"
+                                ))
+                            })?;
+                        let ty_idx = bk.get(annot).and_then(Value::as_u64).ok_or_else(|| {
+                            LangError::engine(format!("dep_synth_type: {kw} binder missing sort"))
+                        })? as usize;
+                        (vn, self.dep_synth_type(lang, ast, ty_idx, ctx)?)
+                    } else {
+                        let vn = node_name(bnode).ok_or_else(|| {
+                            LangError::engine(format!("dep_synth_type: {kw} binder is not a name"))
+                        })?;
+                        (vn, meta_value(ctx.fresh_meta()))
+                    };
+                    let mut m = Map::new();
+                    m.insert("param".to_string(), param);
+                    m.insert(
                     "body_closure".to_string(),
                     serde_json::json!({"var_name": var_name, "body_child_idx": body_idx, "dep": true}),
                 );
-                Ok(make_tag(ctx, tag, m))
-            }
-            "dim_arrow" => {
-                // `A ~[k]~> B` in annotation position — `Hom(k, A, B)`
-                // (ADR-0153). The endpoints are *type expressions* —
-                // unlike `synth_dim_arrow` (term position, `synth_node`
-                // on operands) — and a src of `type-annot(f, A)` (the
-                // `f : A ~[k]~> B` assign-annot shape) unwraps to `A`
-                // through the `type-annot` arm above, so the bound
-                // name never enters the type.
-                let kids = children_of(node).ok_or_else(|| {
-                    LangError::engine("dep_synth_type: dim_arrow no children")
-                })?;
-                if kids.len() < 3 {
-                    return Err(LangError::engine(
-                        "dep_synth_type: dim_arrow missing operands",
-                    ));
+                    Ok(make_tag(ctx, tag, m))
                 }
-                let src_idx = kids[0].as_u64().ok_or_else(|| {
-                    LangError::engine("dep_synth_type: dim_arrow src index")
-                })? as usize;
-                let dim_idx = kids[1].as_u64().ok_or_else(|| {
-                    LangError::engine("dep_synth_type: dim_arrow dim index")
-                })? as usize;
-                let tgt_idx = kids[2].as_u64().ok_or_else(|| {
-                    LangError::engine("dep_synth_type: dim_arrow tgt index")
-                })? as usize;
-                let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
-                let tgt = self.dep_synth_type(lang, ast, tgt_idx, ctx)?;
-                let dim_node = ast.get(AstRef::new(dim_idx)).ok_or_else(|| {
-                    LangError::engine("dep_synth_type: dim node out of bounds")
-                })?;
-                let dim_inner = if dim_node.kind == "paren" {
-                    child_at(ast, dim_node, 0)
-                        .and_then(|i| ast.get(i))
-                        .unwrap_or(dim_node)
-                } else {
-                    dim_node
-                };
-                let dim_payload = &dim_inner.payload;
-                let dim_val = if dim_payload.is_object() {
-                    dim_payload.get("value").cloned().unwrap_or(Value::Null)
-                } else {
-                    dim_payload.clone()
-                };
-                let dim_v = if dim_inner.kind == "value" {
-                    match dim_val.as_i64() {
-                        Some(n) => Val::Const(TaggedValue::Int(n)),
-                        None => dim_meta(ctx),
+                "dim_arrow" => {
+                    // `A ~[k]~> B` in annotation position — `Hom(k, A, B)`
+                    // (ADR-0153). The endpoints are *type expressions* —
+                    // unlike `synth_dim_arrow` (term position, `synth_node`
+                    // on operands) — and a src of `type-annot(f, A)` (the
+                    // `f : A ~[k]~> B` assign-annot shape) unwraps to `A`
+                    // through the `type-annot` arm above, so the bound
+                    // name never enters the type.
+                    let kids = children_of(node).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: dim_arrow no children")
+                    })?;
+                    if kids.len() < 3 {
+                        return Err(LangError::engine(
+                            "dep_synth_type: dim_arrow missing operands",
+                        ));
                     }
-                } else {
-                    // A scope-bound dimension variable (`f<N> : T`
-                    // binder, ADR-0106 §12) elaborates as its rigid
-                    // index term — same rule `synth_dim_arrow` applies
-                    // in term position.
-                    let resolved = node_name(dim_inner)
-                        .filter(|_| dim_inner.kind == "var")
-                        .and_then(|n| ctx.results.get(n.as_str()).cloned())
-                        .map(|b| eval_index(&b, ctx))
-                        .filter(|v| tag_of(v) == Some("var") || num_val(v).is_some());
-                    match resolved {
-                        Some(v) => domain_lift(&v, ctx),
-                        None => dim_meta(ctx),
-                    }
-                };
-                let va = domain_lift(&src, ctx);
-                let vb = domain_lift(&tgt, ctx);
-                Ok(hom_former(dim_v, va, vb, ctx))
-            }
-            "absurd" | "if" | "match" | "object" | "index" => {
-                // Non-type positions in annotations — leave them open.
-                let mut m = Map::new();
-                Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
-            }
-            _ => {
-                if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
-                    let t = self.node_to_index_term(lang, ast, node, ctx);
-                    Ok(eval_index(&t, ctx))
-                } else if node.kind == "transport" {
-                    let mut m = Map::new();
-                    Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
-                } else {
+                    let src_idx = kids[0]
+                        .as_u64()
+                        .ok_or_else(|| LangError::engine("dep_synth_type: dim_arrow src index"))?
+                        as usize;
+                    let dim_idx = kids[1]
+                        .as_u64()
+                        .ok_or_else(|| LangError::engine("dep_synth_type: dim_arrow dim index"))?
+                        as usize;
+                    let tgt_idx = kids[2]
+                        .as_u64()
+                        .ok_or_else(|| LangError::engine("dep_synth_type: dim_arrow tgt index"))?
+                        as usize;
+                    let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
+                    let tgt = self.dep_synth_type(lang, ast, tgt_idx, ctx)?;
+                    let dim_node = ast.get(AstRef::new(dim_idx)).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: dim node out of bounds")
+                    })?;
+                    let dim_inner = if dim_node.kind == "paren" {
+                        child_at(ast, dim_node, 0)
+                            .and_then(|i| ast.get(i))
+                            .unwrap_or(dim_node)
+                    } else {
+                        dim_node
+                    };
+                    let dim_payload = &dim_inner.payload;
+                    let dim_val = if dim_payload.is_object() {
+                        dim_payload.get("value").cloned().unwrap_or(Value::Null)
+                    } else {
+                        dim_payload.clone()
+                    };
+                    let dim_v = if dim_inner.kind == "value" {
+                        match dim_val.as_i64() {
+                            Some(n) => Val::Const(TaggedValue::Int(n)),
+                            None => dim_meta(ctx),
+                        }
+                    } else {
+                        // A scope-bound dimension variable (`f<N> : T`
+                        // binder, ADR-0106 §12) elaborates as its rigid
+                        // index term — same rule `synth_dim_arrow` applies
+                        // in term position.
+                        let resolved = node_name(dim_inner)
+                            .filter(|_| dim_inner.kind == "var")
+                            .and_then(|n| ctx.results.get(n.as_str()).cloned())
+                            .map(|b| eval_index(&b, ctx))
+                            .filter(|v| tag_of(v) == Some("var") || num_val(v).is_some());
+                        match resolved {
+                            Some(v) => domain_lift(&v, ctx),
+                            None => dim_meta(ctx),
+                        }
+                    };
+                    let va = domain_lift(&src, ctx);
+                    let vb = domain_lift(&tgt, ctx);
+                    Ok(hom_former(dim_v, va, vb, ctx))
+                }
+                "absurd" | "if" | "match" | "object" | "index" => {
+                    // Non-type positions in annotations — leave them open.
                     let mut m = Map::new();
                     Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
                 }
+                _ => {
+                    if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
+                        let t = self.node_to_index_term(lang, ast, node, ctx);
+                        Ok(eval_index(&t, ctx))
+                    } else if node.kind == "transport" {
+                        let mut m = Map::new();
+                        Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
+                    } else {
+                        let mut m = Map::new();
+                        Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
+                    }
+                }
             }
-        }
         })
     }
 
@@ -2594,11 +2603,10 @@ impl NbeTypecheckEngine {
         // Γ bindings — source-level declarations (`data`, `type` aliases,
         // `assign`s, pattern binders) — legitimately shadow builtin names:
         // `data Bool :: …` must rebind `Bool` away from `type.bool`.
-        if let Some(bound) = ctx.lookup_gamma(name).cloned() {
-            if let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
+        if let Some(bound) = ctx.lookup_gamma(name).cloned()
+            && let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
                 return Ok(ty);
             }
-        }
         // Builtin type names resolve before *injected* globals: `hnl
         // typecheck` seeds the whole wire-prelude name set as
         // `type.unknown` placeholders, which would otherwise report
@@ -2608,11 +2616,10 @@ impl NbeTypecheckEngine {
         if is_builtin_type_name(name) {
             return self.dep_builtin_or_tag(name, ctx);
         }
-        if let Some(bound) = ctx.lookup_global(name).cloned() {
-            if let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
+        if let Some(bound) = ctx.lookup_global(name).cloned()
+            && let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
                 return Ok(ty);
             }
-        }
         self.dep_builtin_or_tag(name, ctx)
     }
 
@@ -2630,9 +2637,7 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
     ) -> Result<Option<Value>, LangError> {
         match tag_of(bound) {
-            Some("type.ctor_sig") => self
-                .instantiate_ctor_full(lang, ast, bound, ctx)
-                .map(Some),
+            Some("type.ctor_sig") => self.instantiate_ctor_full(lang, ast, bound, ctx).map(Some),
             Some("type.alias") => self.expand_alias(lang, ast, bound, &[], ctx).map(Some),
             Some("type.family") => {
                 if bound.get("name").and_then(Value::as_str).unwrap_or("") == name {
@@ -2642,11 +2647,7 @@ impl NbeTypecheckEngine {
                         .and_then(Value::as_array)
                         .map(|e| e.len())
                         .unwrap_or(0);
-                    let nat_flags = ctx
-                        .family_param_nat
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default();
+                    let nat_flags = ctx.family_param_nat.get(name).cloned().unwrap_or_default();
                     let args: Vec<Value> = (0..n)
                         .map(|i| {
                             let id = ctx.fresh_meta();
@@ -2669,7 +2670,11 @@ impl NbeTypecheckEngine {
     }
 
     /// The builtin-name table for bare type-position identifiers.
-    fn dep_builtin_or_tag(&self, name: &str, ctx: &mut TypecheckContext) -> Result<Value, LangError> {
+    fn dep_builtin_or_tag(
+        &self,
+        name: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
         let tag = match name {
             "Int" | "Nat" | "Number" => "type.number",
             "Bool" => "type.bool",
@@ -2695,7 +2700,7 @@ impl NbeTypecheckEngine {
             _ => {
                 return Err(LangError::engine(format!(
                     "dep_synth_type: unbound type variable '{name}'"
-                )))
+                )));
             }
         };
         let mut m = Map::new();
@@ -2728,172 +2733,174 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        let kids = children_of(node)
-            .ok_or_else(|| LangError::engine("dep_synth_type: call has no children"))?;
-        if kids.is_empty() {
-            return Err(LangError::engine("dep_synth_type: empty call"));
-        }
-        let callee_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("dep_synth_type: call callee not a node index")
-        })? as usize;
-        let callee = ast.get(AstRef::new(callee_idx)).ok_or_else(|| {
-            LangError::engine("dep_synth_type: callee out of bounds")
-        })?;
-        let callee_name = if callee.kind == "var" {
-            callee.payload.as_str().map(str::to_string)
-        } else if callee.kind == "field-access" {
-            children_of(callee)
-                .and_then(|k| k.get(1))
-                .and_then(Value::as_u64)
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .and_then(|n| node_name(n))
-        } else {
-            None
-        };
-        let arg_indices: Vec<usize> = kids
-            .iter()
-            .skip(1)
-            .filter_map(Value::as_u64)
-            .map(|v| v as usize)
-            .collect();
-        match callee_name.as_deref() {
-            Some("Family") => {
-                let base = match arg_indices.first() {
-                    Some(&i) => self.dep_synth_type(lang, ast, i, ctx)?,
-                    None => meta_value(ctx.fresh_meta()),
-                };
-                let mut m = Map::new();
-                m.insert("name".to_string(), Value::Null);
-                m.insert("base".to_string(), base);
-                Ok(make_tag(ctx, "type.family", m))
+            let kids = children_of(node)
+                .ok_or_else(|| LangError::engine("dep_synth_type: call has no children"))?;
+            if kids.is_empty() {
+                return Err(LangError::engine("dep_synth_type: empty call"));
             }
-            Some(tag @ ("Pi" | "Sigma" | "Forall")) => {
-                let kind = match tag {
-                    "Pi" => "type.pi",
-                    "Sigma" => "type.sigma",
-                    _ => "type.forall",
-                };
-                let param = match arg_indices.first() {
-                    Some(&i) => self.dep_synth_type(lang, ast, i, ctx)?,
-                    None => meta_value(ctx.fresh_meta()),
-                };
-                // The body argument is an arrow `n ~> T`: the closure
-                // records its param name and body child.
-                let (var_name, body_idx) = match arg_indices.get(1) {
-                    Some(&i) => self.arrow_parts(lang, ast, i).unwrap_or(("x".to_string(), i)),
-                    None => ("x".to_string(), callee_idx),
-                };
-                let mut m = Map::new();
-                let param_key = if tag == "Forall" { "kind" } else { "param" };
-                m.insert(param_key.to_string(), param);
-                m.insert(
+            let callee_idx = kids[0]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("dep_synth_type: call callee not a node index"))?
+                as usize;
+            let callee = ast
+                .get(AstRef::new(callee_idx))
+                .ok_or_else(|| LangError::engine("dep_synth_type: callee out of bounds"))?;
+            let callee_name = if callee.kind == "var" {
+                callee.payload.as_str().map(str::to_string)
+            } else if callee.kind == "field-access" {
+                children_of(callee)
+                    .and_then(|k| k.get(1))
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(node_name)
+            } else {
+                None
+            };
+            let arg_indices: Vec<usize> = kids
+                .iter()
+                .skip(1)
+                .filter_map(Value::as_u64)
+                .map(|v| v as usize)
+                .collect();
+            match callee_name.as_deref() {
+                Some("Family") => {
+                    let base = match arg_indices.first() {
+                        Some(&i) => self.dep_synth_type(lang, ast, i, ctx)?,
+                        None => meta_value(ctx.fresh_meta()),
+                    };
+                    let mut m = Map::new();
+                    m.insert("name".to_string(), Value::Null);
+                    m.insert("base".to_string(), base);
+                    Ok(make_tag(ctx, "type.family", m))
+                }
+                Some(tag @ ("Pi" | "Sigma" | "Forall")) => {
+                    let kind = match tag {
+                        "Pi" => "type.pi",
+                        "Sigma" => "type.sigma",
+                        _ => "type.forall",
+                    };
+                    let param = match arg_indices.first() {
+                        Some(&i) => self.dep_synth_type(lang, ast, i, ctx)?,
+                        None => meta_value(ctx.fresh_meta()),
+                    };
+                    // The body argument is an arrow `n ~> T`: the closure
+                    // records its param name and body child.
+                    let (var_name, body_idx) = match arg_indices.get(1) {
+                        Some(&i) => self
+                            .arrow_parts(lang, ast, i)
+                            .unwrap_or(("x".to_string(), i)),
+                        None => ("x".to_string(), callee_idx),
+                    };
+                    let mut m = Map::new();
+                    let param_key = if tag == "Forall" { "kind" } else { "param" };
+                    m.insert(param_key.to_string(), param);
+                    m.insert(
                     "body_closure".to_string(),
                     serde_json::json!({"var_name": var_name, "body_child_idx": body_idx, "dep": true}),
                 );
-                Ok(make_tag(ctx, kind, m))
-            }
-            Some("Path") => {
-                let frm = match arg_indices.first() {
-                    Some(&i) => {
-                        let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                        eval_index(&t, ctx)
-                    }
-                    None => Value::Null,
-                };
-                let to = match arg_indices.get(1) {
-                    Some(&i) => {
-                        let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                        eval_index(&t, ctx)
-                    }
-                    None => Value::Null,
-                };
-                Ok(path_val(frm, to))
-            }
-            Some("IO") => {
-                // `IO(sig)` — the typed-effect former (ADR-0153 §4):
-                // canonical `Former{type.io}` data. The sig index is
-                // an op-signature record — `{op: T, …}` entries
-                // synthesize their value types; `IO()` is `IO(⊤)`.
-                let sig = match arg_indices.first() {
-                    Some(&i) => self.io_sig(lang, ast, i, ctx)?,
-                    None => Value::Null,
-                };
-                let vs = domain_lift(&sig, ctx);
-                return Ok(domain_quote(
-                    &Val::Former {
-                        head: checker::type_sym("type.io"),
-                        args: if sig == Value::Null {
-                            vec![]
-                        } else {
-                            vec![vs]
+                    Ok(make_tag(ctx, kind, m))
+                }
+                Some("Path") => {
+                    let frm = match arg_indices.first() {
+                        Some(&i) => {
+                            let t = self.node_index_or_type(lang, ast, i, ctx)?;
+                            eval_index(&t, ctx)
+                        }
+                        None => Value::Null,
+                    };
+                    let to = match arg_indices.get(1) {
+                        Some(&i) => {
+                            let t = self.node_index_or_type(lang, ast, i, ctx)?;
+                            eval_index(&t, ctx)
+                        }
+                        None => Value::Null,
+                    };
+                    Ok(path_val(frm, to))
+                }
+                Some("IO") => {
+                    // `IO(sig)` — the typed-effect former (ADR-0153 §4):
+                    // canonical `Former{type.io}` data. The sig index is
+                    // an op-signature record — `{op: T, …}` entries
+                    // synthesize their value types; `IO()` is `IO(⊤)`.
+                    let sig = match arg_indices.first() {
+                        Some(&i) => self.io_sig(lang, ast, i, ctx)?,
+                        None => Value::Null,
+                    };
+                    let vs = domain_lift(&sig, ctx);
+                    Ok(domain_quote(
+                        &Val::Former {
+                            head: checker::type_sym("type.io"),
+                            args: if sig == Value::Null { vec![] } else { vec![vs] },
                         },
-                    },
-                    ctx,
-                ));
-            }
-            Some(name) => {
-                // A declared family's application: `Vec(i⃗)` →
-                // `type.family_app{name, args}` — index arguments
-                // evaluate (1+1 → 2), rigid vars stay `var{n}`.
-                // Inside a ctor telescope a family-param callee means
-                // its `__fam_<name>` binding.
-                let scoped = fam_scoped(name, ctx);
-                let name = scoped.as_str();
-        if let Some(bound) = ctx.lookup(name).cloned() {
-                    match tag_of(&bound) {
-                        Some("type.alias") => {
-                            // A declared `type.Name(p…) := T` alias —
-                            // transparent substitution: bind the params
-                            // to the argument types and re-synthesize
-                            // the body (ADR-0154 §3, no former mint).
-                            let mut args = Vec::with_capacity(arg_indices.len());
-                            for &i in &arg_indices {
-                                let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                                args.push(eval_index(&t, ctx));
-                            }
-                            return self.expand_alias(lang, ast, &bound, &args, ctx);
-                        }
-                        Some("type.family") => {
-                            let mut args = Vec::with_capacity(arg_indices.len());
-                            for &i in &arg_indices {
-                                let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                                args.push(eval_index(&t, ctx));
-                            }
-                            let mut m = Map::new();
-                            m.insert(
-                                "name".to_string(),
-                                bound.get("name").cloned().unwrap_or(Value::String(name.to_string())),
-                            );
-                            m.insert("args".to_string(), Value::Array(args));
-                            return Ok(make_tag(ctx, "type.family_app", m));
-                        }
-                        Some("type.ctor_sig") => {
-                            return self.instantiate_ctor_full(lang, ast, &bound, ctx);
-                        }
-                        _ => {}
-                    }
+                        ctx,
+                    ))
                 }
-                // `bound_callee`-style: a results-bound arrow applied to
-                // index terms — opaque `App` term.
-                if ctx.results.contains_key(name) {
-                    let mut m = Map::new();
-                    m.insert("callee".to_string(), var_term(name));
-                    let mut args = Vec::with_capacity(arg_indices.len());
-                    for &i in &arg_indices {
-                        let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                        args.push(eval_index(&t, ctx));
+                Some(name) => {
+                    // A declared family's application: `Vec(i⃗)` →
+                    // `type.family_app{name, args}` — index arguments
+                    // evaluate (1+1 → 2), rigid vars stay `var{n}`.
+                    // Inside a ctor telescope a family-param callee means
+                    // its `__fam_<name>` binding.
+                    let scoped = fam_scoped(name, ctx);
+                    let name = scoped.as_str();
+                    if let Some(bound) = ctx.lookup(name).cloned() {
+                        match tag_of(&bound) {
+                            Some("type.alias") => {
+                                // A declared `type.Name(p…) := T` alias —
+                                // transparent substitution: bind the params
+                                // to the argument types and re-synthesize
+                                // the body (ADR-0154 §3, no former mint).
+                                let mut args = Vec::with_capacity(arg_indices.len());
+                                for &i in &arg_indices {
+                                    let t = self.node_index_or_type(lang, ast, i, ctx)?;
+                                    args.push(eval_index(&t, ctx));
+                                }
+                                return self.expand_alias(lang, ast, &bound, &args, ctx);
+                            }
+                            Some("type.family") => {
+                                let mut args = Vec::with_capacity(arg_indices.len());
+                                for &i in &arg_indices {
+                                    let t = self.node_index_or_type(lang, ast, i, ctx)?;
+                                    args.push(eval_index(&t, ctx));
+                                }
+                                let mut m = Map::new();
+                                m.insert(
+                                    "name".to_string(),
+                                    bound
+                                        .get("name")
+                                        .cloned()
+                                        .unwrap_or(Value::String(name.to_string())),
+                                );
+                                m.insert("args".to_string(), Value::Array(args));
+                                return Ok(make_tag(ctx, "type.family_app", m));
+                            }
+                            Some("type.ctor_sig") => {
+                                return self.instantiate_ctor_full(lang, ast, &bound, ctx);
+                            }
+                            _ => {}
+                        }
                     }
-                    m.insert("args".to_string(), Value::Array(args));
-                    return Ok(make_tag(ctx, "App", m));
+                    // `bound_callee`-style: a results-bound arrow applied to
+                    // index terms — opaque `App` term.
+                    if ctx.results.contains_key(name) {
+                        let mut m = Map::new();
+                        m.insert("callee".to_string(), var_term(name));
+                        let mut args = Vec::with_capacity(arg_indices.len());
+                        for &i in &arg_indices {
+                            let t = self.node_index_or_type(lang, ast, i, ctx)?;
+                            args.push(eval_index(&t, ctx));
+                        }
+                        m.insert("args".to_string(), Value::Array(args));
+                        return Ok(make_tag(ctx, "App", m));
+                    }
+                    Err(LangError::engine(format!(
+                        "dep_synth_type: unsupported callee '{name}'"
+                    )))
                 }
-                Err(LangError::engine(format!(
-                    "dep_synth_type: unsupported callee '{name}'"
-                )))
+                None => Err(LangError::engine(
+                    "dep_synth_type: call callee is not a name".to_string(),
+                )),
             }
-            None => Err(LangError::engine(
-                "dep_synth_type: call callee is not a name".to_string(),
-            )),
-        }
         })
     }
 
@@ -2957,38 +2964,39 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        let params: Vec<String> = bound
-            .get("params")
-            .and_then(Value::as_array)
-            .map(|ps| {
-                ps.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !args.is_empty() && args.len() != params.len() {
-            return Err(LangError::engine(format!(
-                "type.alias: {} applied to {} args (expects {})",
-                bound.get("name").and_then(Value::as_str).unwrap_or("?"),
-                args.len(),
-                params.len()
-            )));
-        }
-        let body_idx = bound.get("body").and_then(Value::as_u64).ok_or_else(|| {
-            LangError::engine("type.alias: missing body index".to_string())
-        })? as usize;
-        let old_results = ctx.results.clone();
-        for (i, p) in params.iter().enumerate() {
-            let v = args
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
-            ctx.results.insert(p.clone(), v);
-        }
-        let r = self.dep_synth_type(lang, ast, body_idx, ctx);
-        ctx.results = old_results;
-        r
+            let params: Vec<String> = bound
+                .get("params")
+                .and_then(Value::as_array)
+                .map(|ps| {
+                    ps.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !args.is_empty() && args.len() != params.len() {
+                return Err(LangError::engine(format!(
+                    "type.alias: {} applied to {} args (expects {})",
+                    bound.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    args.len(),
+                    params.len()
+                )));
+            }
+            let body_idx =
+                bound.get("body").and_then(Value::as_u64).ok_or_else(|| {
+                    LangError::engine("type.alias: missing body index".to_string())
+                })? as usize;
+            let old_results = ctx.results.clone();
+            for (i, p) in params.iter().enumerate() {
+                let v = args
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
+                ctx.results.insert(p.clone(), v);
+            }
+            let r = self.dep_synth_type(lang, ast, body_idx, ctx);
+            ctx.results = old_results;
+            r
         })
     }
 
@@ -3002,9 +3010,9 @@ impl NbeTypecheckEngine {
         idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
-            LangError::engine("io: sig node out of bounds".to_string())
-        })?;
+        let node = ast
+            .get(AstRef::new(idx))
+            .ok_or_else(|| LangError::engine("io: sig node out of bounds".to_string()))?;
         if node.kind == "object" {
             let mut m = Map::new();
             if let Some(entries) = node.payload.get("entries").and_then(Value::as_array) {
@@ -3028,10 +3036,7 @@ impl NbeTypecheckEngine {
             }
             if m.is_empty() {
                 for k in children_of(node).cloned().unwrap_or_default() {
-                    let Some(en) = k
-                        .as_u64()
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    else {
+                    let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
                         continue;
                     };
                     // `IO<{ puts }>` — a bare-name child declares the op
@@ -3052,7 +3057,10 @@ impl NbeTypecheckEngine {
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
                         .and_then(|n| {
                             node_name(n).or_else(|| {
-                                n.payload.get("value").and_then(Value::as_str).map(str::to_string)
+                                n.payload
+                                    .get("value")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
                             })
                         });
                     let v_idx = children_of(en)
@@ -3073,10 +3081,7 @@ impl NbeTypecheckEngine {
             let mut m = Map::new();
             let mut entries = 0usize;
             for k in children_of(node).cloned().unwrap_or_default() {
-                let Some(tn) = k
-                    .as_u64()
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                else {
+                let Some(tn) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
                     continue;
                 };
                 if tn.kind != "type-annot" {
@@ -3084,22 +3089,25 @@ impl NbeTypecheckEngine {
                 }
                 let tk = children_of(tn)
                     .and_then(|c| c.first())
-                        .and_then(Value::as_u64)
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .and_then(|n| {
-                            node_name(n).or_else(|| {
-                                n.payload.get("value").and_then(Value::as_str).map(str::to_string)
-                            })
-                        });
-                    let v_idx = children_of(tn)
-                        .and_then(|c| c.get(1))
-                        .and_then(Value::as_u64)
-                        .map(|i| i as usize);
-                    if let (Some(k), Some(vi)) = (tk, v_idx) {
-                        m.insert(k, self.dep_synth_type(lang, ast, vi, ctx)?);
-                        entries += 1;
-                    }
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(|n| {
+                        node_name(n).or_else(|| {
+                            n.payload
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                    });
+                let v_idx = children_of(tn)
+                    .and_then(|c| c.get(1))
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize);
+                if let (Some(k), Some(vi)) = (tk, v_idx) {
+                    m.insert(k, self.dep_synth_type(lang, ast, vi, ctx)?);
+                    entries += 1;
                 }
+            }
             if entries > 0 {
                 return Ok(Value::Object(m));
             }
@@ -3119,11 +3127,10 @@ impl NbeTypecheckEngine {
         if inner.kind != "function" {
             return None;
         }
-        let kids = children_of(inner)?;
-        let params_idx = role_child_ref(lang, inner, "params")
-            .or_else(|| child_at(ast, inner, 0))?;
-        let body_idx = role_child_ref(lang, inner, "body")
-            .or_else(|| child_at(ast, inner, 1))?;
+        let _kids = children_of(inner)?;
+        let params_idx =
+            role_child_ref(lang, inner, "params").or_else(|| child_at(ast, inner, 0))?;
+        let body_idx = role_child_ref(lang, inner, "body").or_else(|| child_at(ast, inner, 1))?;
         let pnode = ast.get(params_idx)?;
         let name = lang
             .param_names(ast, pnode)
@@ -3147,70 +3154,69 @@ impl NbeTypecheckEngine {
         crate::stats::node_index_or_type(idx);
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
-            LangError::engine(format!("dep: node {} out of bounds", idx))
-        })?;
-        if node.kind.starts_with("binary.")
-            || node.kind.starts_with("unary.")
-            || matches!(node.kind.as_str(), "value" | "lit")
-        {
-            return Ok(self.node_to_index_term(lang, ast, node, ctx));
-        }
-        // `C(i⃗)`/`C<i⃗>` where `C` is a *term-level* constructor (a
-        // `type.ctor_sig` Γ binding, e.g. `Succ`) is an index *term*
-        // (`App{var C, i⃗}`), not an instantiated type — `Vec<Succ n, a>`
-        // carries `Succ n` as the index it refines against. Family
-        // callees (`Vec`, `Pi`, …) still synthesize types. The ctor's
-        // arguments elaborate through `node_to_index_term` — the index
-        // reading: a `var` arg is the rigid index atom `var{n}`, not the
-        // sort `Nat` a bare var resolves to in type position.
-        if matches!(node.kind.as_str(), "call" | "index_app" | "dimension") {
-            let kids = children_of(node).cloned().unwrap_or_default();
-            let callee_name = kids
-                .first()
-                .and_then(Value::as_u64)
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .filter(|n| n.kind == "var")
-                .and_then(node_name);
-            if let Some(cname) = callee_name {
-                // Ctor-telescope scope: a family-param callee means its
-                // `__fam_<name>` binding — and must never hit an outer
-                // ctor_sig of the same name.
-                let cname = fam_scoped(&cname, ctx);
-                if ctx
-                    .lookup(&cname)
-                    .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
-                {
-                    let mut args = Vec::with_capacity(kids.len().saturating_sub(1));
-                    for cv in kids.iter().skip(1) {
-                        let Some(ai) = cv.as_u64() else { continue };
-                        let Some(an) = ast.get(AstRef::new(ai as usize)) else {
-                            continue;
-                        };
-                        let t = self.node_to_index_term(lang, ast, an, ctx);
-                        args.push(eval_index(&t, ctx));
+            let node = ast
+                .get(AstRef::new(idx))
+                .ok_or_else(|| LangError::engine(format!("dep: node {} out of bounds", idx)))?;
+            if node.kind.starts_with("binary.")
+                || node.kind.starts_with("unary.")
+                || matches!(node.kind.as_str(), "value" | "lit")
+            {
+                return Ok(self.node_to_index_term(lang, ast, node, ctx));
+            }
+            // `C(i⃗)`/`C<i⃗>` where `C` is a *term-level* constructor (a
+            // `type.ctor_sig` Γ binding, e.g. `Succ`) is an index *term*
+            // (`App{var C, i⃗}`), not an instantiated type — `Vec<Succ n, a>`
+            // carries `Succ n` as the index it refines against. Family
+            // callees (`Vec`, `Pi`, …) still synthesize types. The ctor's
+            // arguments elaborate through `node_to_index_term` — the index
+            // reading: a `var` arg is the rigid index atom `var{n}`, not the
+            // sort `Nat` a bare var resolves to in type position.
+            if matches!(node.kind.as_str(), "call" | "index_app" | "dimension") {
+                let kids = children_of(node).cloned().unwrap_or_default();
+                let callee_name = kids
+                    .first()
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .filter(|n| n.kind == "var")
+                    .and_then(node_name);
+                if let Some(cname) = callee_name {
+                    // Ctor-telescope scope: a family-param callee means its
+                    // `__fam_<name>` binding — and must never hit an outer
+                    // ctor_sig of the same name.
+                    let cname = fam_scoped(&cname, ctx);
+                    if ctx
+                        .lookup(&cname)
+                        .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                    {
+                        let mut args = Vec::with_capacity(kids.len().saturating_sub(1));
+                        for cv in kids.iter().skip(1) {
+                            let Some(ai) = cv.as_u64() else { continue };
+                            let Some(an) = ast.get(AstRef::new(ai as usize)) else {
+                                continue;
+                            };
+                            let t = self.node_to_index_term(lang, ast, an, ctx);
+                            args.push(eval_index(&t, ctx));
+                        }
+                        return Ok(app_term(var_term(&cname), args));
                     }
-                    return Ok(app_term(var_term(&cname), args));
                 }
             }
-        }
-        // A bare `var` naming a declared ctor (`Zero` in `Vec(Zero, a)`)
-        // is an index atom `var{C}` — a registered arity-0 projection
-        // (`Zero ↦ 0`) then applies in `eval_index`. Without this arm the
-        // var would instantiate the ctor *signature* (its type), which
-        // is not an index term.
-        if node.kind == "var" {
-            if let Some(cname) = node_name(node) {
-                let cname = fam_scoped(&cname, ctx);
-                if ctx
-                    .lookup(&cname)
-                    .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
-                {
-                    return Ok(var_term(&cname));
+            // A bare `var` naming a declared ctor (`Zero` in `Vec(Zero, a)`)
+            // is an index atom `var{C}` — a registered arity-0 projection
+            // (`Zero ↦ 0`) then applies in `eval_index`. Without this arm the
+            // var would instantiate the ctor *signature* (its type), which
+            // is not an index term.
+            if node.kind == "var"
+                && let Some(cname) = node_name(node) {
+                    let cname = fam_scoped(&cname, ctx);
+                    if ctx
+                        .lookup(&cname)
+                        .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                    {
+                        return Ok(var_term(&cname));
+                    }
                 }
-            }
-        }
-        self.dep_synth_type(lang, ast, idx, ctx)
+            self.dep_synth_type(lang, ast, idx, ctx)
         })
     }
 
@@ -3225,69 +3231,69 @@ impl NbeTypecheckEngine {
     ) -> Value {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
-            let kids = children_of(node).cloned().unwrap_or_default();
-            if node.kind.starts_with("unary.") {
-                let o = kids
+            if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
+                let kids = children_of(node).cloned().unwrap_or_default();
+                if node.kind.starts_with("unary.") {
+                    let o = kids
+                        .first()
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                        .unwrap_or(Value::Null);
+                    return un_term(&node.kind, o);
+                }
+                let l = kids
                     .first()
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
                     .map(|n| self.node_to_index_term(lang, ast, n, ctx))
                     .unwrap_or(Value::Null);
-                return un_term(&node.kind, o);
-            }
-            let l = kids
-                .first()
-                .and_then(Value::as_u64)
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .map(|n| self.node_to_index_term(lang, ast, n, ctx))
-                .unwrap_or(Value::Null);
-            let r = kids
-                .get(1)
-                .and_then(Value::as_u64)
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .map(|n| self.node_to_index_term(lang, ast, n, ctx))
-                .unwrap_or(Value::Null);
-            return bin_term(&node.kind, l, r);
-        }
-        match node.kind.as_str() {
-            // A `var` leaf mints the rigid index atom — inside a ctor
-            // telescope the family params mint their `__fam_<name>`
-            // atoms so the meta bindings, not the user's rigids, solve.
-            "var" => var_term(
-                &node
-                    .payload
-                    .as_str()
-                    .map(|n| fam_scoped(n, ctx))
-                    .unwrap_or_default(),
-            ),
-            "paren" => child_at(ast, node, 0)
-                .and_then(|i| ast.get(i))
-                .map(|n| self.node_to_index_term(lang, ast, n, ctx))
-                .unwrap_or(Value::Null),
-            "value" | "lit" => node.payload.clone(),
-            // `f(i⃗)`/`f<i⃗>` as an index term — an opaque `App` on the
-            // callee's `var` (constructor or results-bound function).
-            "call" | "index_app" | "dimension" => {
-                let kids = children_of(node).cloned().unwrap_or_default();
-                let callee = kids
-                    .first()
+                let r = kids
+                    .get(1)
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .and_then(node_name)
-                    .map(|c| fam_scoped(&c, ctx))
-                    .unwrap_or_default();
-                let args: Vec<Value> = kids
-                    .iter()
-                    .skip(1)
-                    .filter_map(Value::as_u64)
-                    .filter_map(|i| ast.get(AstRef::new(i as usize)))
                     .map(|n| self.node_to_index_term(lang, ast, n, ctx))
-                    .collect();
-                app_term(var_term(&callee), args)
+                    .unwrap_or(Value::Null);
+                return bin_term(&node.kind, l, r);
             }
-            _ => Value::Null,
-        }
+            match node.kind.as_str() {
+                // A `var` leaf mints the rigid index atom — inside a ctor
+                // telescope the family params mint their `__fam_<name>`
+                // atoms so the meta bindings, not the user's rigids, solve.
+                "var" => var_term(
+                    &node
+                        .payload
+                        .as_str()
+                        .map(|n| fam_scoped(n, ctx))
+                        .unwrap_or_default(),
+                ),
+                "paren" => child_at(ast, node, 0)
+                    .and_then(|i| ast.get(i))
+                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .unwrap_or(Value::Null),
+                "value" | "lit" => node.payload.clone(),
+                // `f(i⃗)`/`f<i⃗>` as an index term — an opaque `App` on the
+                // callee's `var` (constructor or results-bound function).
+                "call" | "index_app" | "dimension" => {
+                    let kids = children_of(node).cloned().unwrap_or_default();
+                    let callee = kids
+                        .first()
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(node_name)
+                        .map(|c| fam_scoped(&c, ctx))
+                        .unwrap_or_default();
+                    let args: Vec<Value> = kids
+                        .iter()
+                        .skip(1)
+                        .filter_map(Value::as_u64)
+                        .filter_map(|i| ast.get(AstRef::new(i as usize)))
+                        .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                        .collect();
+                    app_term(var_term(&callee), args)
+                }
+                _ => Value::Null,
+            }
         })
     }
 
@@ -3307,9 +3313,9 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
         crate::stats::synth_data(node_ref.index());
-        let node = ast.get(node_ref).ok_or_else(|| {
-            LangError::engine("synth_data: node out of bounds".to_string())
-        })?;
+        let node = ast
+            .get(node_ref)
+            .ok_or_else(|| LangError::engine("synth_data: node out of bounds".to_string()))?;
         // Hand-built payload (`{"name","constructors"}`) — used by the
         // desugar-native tests; no AST params to bind, return unit.
         if node.payload.get("constructors").is_some() {
@@ -3357,17 +3363,15 @@ impl NbeTypecheckEngine {
         // Strict positivity — the checker owns it (it sees the sigs).
         for c in &ctors {
             for (_, ty_idx) in &c.args {
-                if let Some(ti) = ty_idx {
-                    if let Some(n) = ast.get(AstRef::new(*ti)) {
-                        if !positivity_ok(ast, n, &name) {
+                if let Some(ti) = ty_idx
+                    && let Some(n) = ast.get(AstRef::new(*ti))
+                        && !positivity_ok(ast, n, &name) {
                             return Err(LangError::engine(format!(
                                 "synth_data: strict positivity violated: constructor '{}' \
                                  mentions '{name}' in a negative position",
                                 c.name
                             )));
                         }
-                    }
-                }
             }
         }
         // `base` = the parameter sorts (`type.array` of them).
@@ -3706,7 +3710,11 @@ impl NbeTypecheckEngine {
             .unwrap_or_default();
         let mut metas = Vec::with_capacity(params.len());
         for p in &params {
-            let pname = p.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let pname = p
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let id = ctx.fresh_meta();
             if p.get("nat").and_then(Value::as_bool).unwrap_or(false) {
                 ctx.nonneg_metas.insert(id);
@@ -3749,96 +3757,94 @@ impl NbeTypecheckEngine {
         // instantiation must not leak the internal `__fam_` bindings
         // into the caller's scope.
         let out = (|ctx: &mut TypecheckContext| -> Result<Value, LangError> {
-        let mut domains = Vec::with_capacity(args.len());
-        for a in &args {
-            let ty = match a.get("node").and_then(Value::as_u64) {
-                Some(ti) => self.dep_synth_type(lang, ast, ti as usize, ctx)?,
+            let mut domains = Vec::with_capacity(args.len());
+            for a in &args {
+                let ty = match a.get("node").and_then(Value::as_u64) {
+                    Some(ti) => self.dep_synth_type(lang, ast, ti as usize, ctx)?,
+                    None => {
+                        let mut m = Map::new();
+                        make_tag(ctx, "type.unknown", std::mem::take(&mut m))
+                    }
+                };
+                domains.push(ty);
+            }
+            let family = spec
+                .get("family")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let result = match spec.get("result").and_then(Value::as_u64) {
+                Some(ri) => self.dep_synth_type(lang, ast, ri as usize, ctx)?,
                 None => {
                     let mut m = Map::new();
-                    make_tag(ctx, "type.unknown", std::mem::take(&mut m))
+                    if spec.get("bare").and_then(Value::as_bool).unwrap_or(false)
+                        && !params.is_empty()
+                    {
+                        // Bare ctor convention: `0` for the first `Nat`
+                        // parameter, param metas elsewhere.
+                        let mut idx_args = Vec::with_capacity(params.len());
+                        let mut used = false;
+                        for (i, p) in params.iter().enumerate() {
+                            let is_nat = p.get("nat").and_then(Value::as_bool).unwrap_or(false);
+                            if is_nat && !used {
+                                idx_args.push(Value::from(0));
+                                used = true;
+                            } else {
+                                idx_args.push(metas[i].clone());
+                            }
+                        }
+                        m.insert("args".to_string(), Value::Array(idx_args));
+                    } else {
+                        // Result-less ctor (`VCons(k : Nat, x : a,
+                        // xs : Vec(k, a))` — no `: F(i⃗)` annotation): an
+                        // index meta an argument domain can pin stays a
+                        // meta (`?a` solves through `x : a` /
+                        // `xs : Vec(k, a)`); a `nat` index parameter no
+                        // domain mentions is *unrecoverable* — the ctor
+                        // cannot compute it — so it mints the rigid
+                        // `var{name}` atom instead of a solvable meta.
+                        // `VCons(0, true, VNil) : Vec(5, Bool)` then
+                        // *fails* (`var{n} ≢ 5`) instead of letting
+                        // `?n := 5` — the F1 soundness hole.
+                        let idx_args: Vec<Value> = params
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| {
+                                let is_nat = p.get("nat").and_then(Value::as_bool).unwrap_or(false);
+                                let recoverable =
+                                    domains.iter().any(|d| meta_value_occurs(&metas[i], d));
+                                if is_nat && !recoverable {
+                                    // `lit null` — the desugar's
+                                    // unrecoverable-index convention: a
+                                    // `nat` index the ctor cannot compute
+                                    // never unifies with a numeral
+                                    // (`null ≢ 5`), so the result index is
+                                    // honestly absent, not a lie.
+                                    Value::Null
+                                } else {
+                                    metas[i].clone()
+                                }
+                            })
+                            .collect();
+                        m.insert("args".to_string(), Value::Array(idx_args));
+                    }
+                    m.insert("name".to_string(), Value::String(family.clone()));
+                    make_tag(ctx, "type.family_app", m)
                 }
             };
-            domains.push(ty);
-        }
-        let family = spec
-            .get("family")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let result = match spec.get("result").and_then(Value::as_u64) {
-            Some(ri) => self.dep_synth_type(lang, ast, ri as usize, ctx)?,
-            None => {
+            // Fold `type.function{param, body, param_name}` right-to-left.
+            let mut ty = result;
+            for (i, a) in args.iter().enumerate().rev() {
                 let mut m = Map::new();
-                if spec.get("bare").and_then(Value::as_bool).unwrap_or(false)
-                    && !params.is_empty()
-                {
-                    // Bare ctor convention: `0` for the first `Nat`
-                    // parameter, param metas elsewhere.
-                    let mut idx_args = Vec::with_capacity(params.len());
-                    let mut used = false;
-                    for (i, p) in params.iter().enumerate() {
-                        let is_nat = p.get("nat").and_then(Value::as_bool).unwrap_or(false);
-                        if is_nat && !used {
-                            idx_args.push(Value::from(0));
-                            used = true;
-                        } else {
-                            idx_args.push(metas[i].clone());
-                        }
-                    }
-                    m.insert("args".to_string(), Value::Array(idx_args));
-                } else {
-                    // Result-less ctor (`VCons(k : Nat, x : a,
-                    // xs : Vec(k, a))` — no `: F(i⃗)` annotation): an
-                    // index meta an argument domain can pin stays a
-                    // meta (`?a` solves through `x : a` /
-                    // `xs : Vec(k, a)`); a `nat` index parameter no
-                    // domain mentions is *unrecoverable* — the ctor
-                    // cannot compute it — so it mints the rigid
-                    // `var{name}` atom instead of a solvable meta.
-                    // `VCons(0, true, VNil) : Vec(5, Bool)` then
-                    // *fails* (`var{n} ≢ 5`) instead of letting
-                    // `?n := 5` — the F1 soundness hole.
-                    let idx_args: Vec<Value> = params
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| {
-                            let is_nat =
-                                p.get("nat").and_then(Value::as_bool).unwrap_or(false);
-                            let recoverable = domains
-                                .iter()
-                                .any(|d| meta_value_occurs(&metas[i], d));
-                            if is_nat && !recoverable {
-                                // `lit null` — the desugar's
-                                // unrecoverable-index convention: a
-                                // `nat` index the ctor cannot compute
-                                // never unifies with a numeral
-                                // (`null ≢ 5`), so the result index is
-                                // honestly absent, not a lie.
-                                Value::Null
-                            } else {
-                                metas[i].clone()
-                            }
-                        })
-                        .collect();
-                    m.insert("args".to_string(), Value::Array(idx_args));
-                }
-                m.insert("name".to_string(), Value::String(family.clone()));
-                make_tag(ctx, "type.family_app", m)
+                m.insert("param".to_string(), domains[i].clone());
+                m.insert("body".to_string(), ty);
+                m.insert(
+                    "param_name".to_string(),
+                    a.get("name").cloned().unwrap_or(Value::Null),
+                );
+                ty = make_tag(ctx, "type.function", m);
             }
-        };
-        // Fold `type.function{param, body, param_name}` right-to-left.
-        let mut ty = result;
-        for (i, a) in args.iter().enumerate().rev() {
-            let mut m = Map::new();
-            m.insert("param".to_string(), domains[i].clone());
-            m.insert("body".to_string(), ty);
-            m.insert(
-                "param_name".to_string(),
-                a.get("name").cloned().unwrap_or(Value::Null),
-            );
-            ty = make_tag(ctx, "type.function", m);
-        }
-        Ok(ty)
+            Ok(ty)
         })(ctx);
         ctx.restore(mark);
         ctx.results = old_results;
@@ -3983,9 +3989,7 @@ impl NbeTypecheckEngine {
                         .and_then(Value::as_array)
                         .map(|xs| {
                             xs.iter()
-                                .map(|a| {
-                                    a.get("node").and_then(Value::as_u64).map(|n| n as usize)
-                                })
+                                .map(|a| a.get("node").and_then(Value::as_u64).map(|n| n as usize))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -4039,11 +4043,8 @@ impl NbeTypecheckEngine {
             let (status, upos) = self.ctor_leaf_status(lang, ast, cname, family, &eargs, ctx);
             match status {
                 CtorStatus::Possible => {
-                    if !arm_covers(arms, cname)
-                        && !run.uncovered.iter().any(|(c, _)| c == cname)
-                    {
-                        run.uncovered
-                            .push((cname.clone(), render_split_path(path)));
+                    if !arm_covers(arms, cname) && !run.uncovered.iter().any(|(c, _)| c == cname) {
+                        run.uncovered.push((cname.clone(), render_split_path(path)));
                     }
                 }
                 CtorStatus::Undecided => {
@@ -4092,7 +4093,16 @@ impl NbeTypecheckEngine {
                 }
             }
             self.cover_split_tree(
-                lang, ast, node, family, s_args, ctors, arms, ctx, run, path,
+                lang,
+                ast,
+                node,
+                family,
+                s_args,
+                ctors,
+                arms,
+                ctx,
+                run,
+                path,
                 depth + 1,
             );
             path.pop();
@@ -4186,10 +4196,7 @@ impl NbeTypecheckEngine {
     /// coverage: `type.family_app{name, args}` direct, `type.family`
     /// as the arity-0 spelling. Returns `None` for non-family
     /// scrutinees — they get no coverage pass.
-    fn match_scrutinee_family(
-        &self,
-        scrutinee_type: &Value,
-    ) -> Option<(String, Vec<Value>)> {
+    fn match_scrutinee_family(&self, scrutinee_type: &Value) -> Option<(String, Vec<Value>)> {
         match tag_of(scrutinee_type) {
             Some("type.family_app") => Some((
                 scrutinee_type
@@ -4234,17 +4241,15 @@ impl NbeTypecheckEngine {
         else {
             return Vec::new();
         };
-        let flags = ctx.family_param_nat.get(family).cloned().unwrap_or_default();
+        let flags = ctx
+            .family_param_nat
+            .get(family)
+            .cloned()
+            .unwrap_or_default();
         elems
             .iter()
             .enumerate()
-            .map(|(i, e)| {
-                position_index_sort(
-                    Some(e),
-                    flags.get(i).copied().unwrap_or(false),
-                    ctx,
-                )
-            })
+            .map(|(i, e)| position_index_sort(Some(e), flags.get(i).copied().unwrap_or(false), ctx))
             .collect()
     }
 
@@ -4306,15 +4311,9 @@ impl NbeTypecheckEngine {
                 node,
             )
         })?;
-        let constraint_idx = kids
-            .first()
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                LangError::engine_node(
-                    "synth_instance: missing constraint child".to_string(),
-                    node,
-                )
-            })? as usize;
+        let constraint_idx = kids.first().and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine_node("synth_instance: missing constraint child".to_string(), node)
+        })? as usize;
         let dict_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
             LangError::engine_node("synth_instance: missing dict child".to_string(), node)
         })? as usize;
@@ -4363,8 +4362,8 @@ impl NbeTypecheckEngine {
             .and_then(|b| b.get("base").cloned())
             .and_then(|b| b.get("elements").cloned())
             .and_then(|e| e.as_array().map(|a| a.len()));
-        if let Some(n) = declared_arity {
-            if n != args.len() {
+        if let Some(n) = declared_arity
+            && n != args.len() {
                 return Err(LangError::engine_node(
                     format!(
                         "synth_instance: instance constraint `{head}` takes {n} index argument(s), got {}",
@@ -4373,7 +4372,6 @@ impl NbeTypecheckEngine {
                     node,
                 ));
             }
-        }
         // Unsolved metas in the shape (the bare `instance Eq` catch-all)
         // become per-instance rigid vars — a lookup must instantiate the
         // *shape*, never solve the shared meta cell.
@@ -4423,13 +4421,10 @@ impl NbeTypecheckEngine {
         ctx.instance_count += 1;
         ctx.extend(inst_name.clone(), constraint.clone());
         ctx.bind_result(inst_name.clone(), var_term(&inst_name));
-        ctx.instances
-            .entry(head)
-            .or_default()
-            .push(InstanceEntry {
-                name: inst_name,
-                args,
-            });
+        ctx.instances.entry(head).or_default().push(InstanceEntry {
+            name: inst_name,
+            args,
+        });
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
     }
@@ -4503,10 +4498,7 @@ impl NbeTypecheckEngine {
         match self.resolve_instance(&head, &guarded, ctx) {
             Some(dict) => Ok(dict),
             None => Err(LangError::engine_node(
-                format!(
-                    "typecheck: no instance for `{}`",
-                    display_type(&goal, ctx)
-                ),
+                format!("typecheck: no instance for `{}`", display_type(&goal, ctx)),
                 node,
             )),
         }
@@ -4585,160 +4577,168 @@ impl NbeTypecheckEngine {
     ) -> Result<(), LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        if a == b {
-            return Ok(());
-        }
-        // A solved meta stands for its solution: dereference it before
-        // the meta-solve shortcut so a second constraint on a shared
-        // meta checks against the *solution* — re-solving the cell
-        // would silently overwrite it. This is what rejects the IO
-        // widen: `x ~> x` synths `type.function{?m, ?m}` (param and
-        // body share the meta), so checking it against
-        // `IO(sa) ~> IO(sb)` solves `?m := IO(sa)` at the domain and
-        // leaves `dep_unify(IO(sa), IO(sb))` — signature subtyping
-        // through the IO arm below — at the codomain.
-        let za;
-        let zb;
-        let a = if extract_meta_id(a).is_some() {
-            za = self.zonk(a, ctx);
-            &za
-        } else {
-            a
-        };
-        let b = if extract_meta_id(b).is_some() {
-            zb = self.zonk(b, ctx);
-            &zb
-        } else {
-            b
-        };
-        let _t = crate::stats::timer(&crate::stats::T_DEP_UNIFY);
-        crate::stats::dep_unify(a, b);
-        if a == b {
-            return Ok(());
-        }
-        if extract_meta_id(a).is_some() || extract_meta_id(b).is_some() {
-            return self.unify(a, b, ctx);
-        }
-        // `type.unknown` is the dynamic top (see `unify`): consistent
-        // with every type on either side, in both the tagged and the
-        // domain-encoded spellings. Checked here — before the tag match
-        // — because the `io_headed` signature-subtyping arm below would
-        // otherwise reject `IO` vs `unknown` before `self.unify`'s
-        // accept could fire.
-        if is_unknown_ty(a) || is_unknown_ty(b) {
-            return Ok(());
-        }
-        match (tag_of(a), tag_of(b)) {
-            (Some("type.family_app"), Some("type.family_app")) => {
-                let na = a.get("name").and_then(Value::as_str).unwrap_or("");
-                let nb = b.get("name").and_then(Value::as_str).unwrap_or("");
-                if na != nb {
-                    return Err(LangError::engine(format!(
-                        "typecheck: cannot unify — expected {}, got {}",
-                        display_type(b, ctx),
-                        display_type(a, ctx)
-                    )));
-                }
-                let xs = a.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
-                let ys = b.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
-                if xs.len() != ys.len() {
-                    return Err(LangError::engine(format!(
-                        "typecheck: cannot unify — expected {}, got {}",
-                        display_type(b, ctx),
-                        display_type(a, ctx)
-                    )));
-                }
-                for (x, y) in xs.iter().zip(ys.iter()) {
-                    let (ok, decided) = unify_index(x, y, ctx);
-                    if !ok {
-                        if decided {
-                            return Err(LangError::engine(format!(
-                                "typecheck: cannot unify — expected {}, got {}",
-                                display_type(b, ctx),
-                                display_type(a, ctx)
-                            )));
+            if a == b {
+                return Ok(());
+            }
+            // A solved meta stands for its solution: dereference it before
+            // the meta-solve shortcut so a second constraint on a shared
+            // meta checks against the *solution* — re-solving the cell
+            // would silently overwrite it. This is what rejects the IO
+            // widen: `x ~> x` synths `type.function{?m, ?m}` (param and
+            // body share the meta), so checking it against
+            // `IO(sa) ~> IO(sb)` solves `?m := IO(sa)` at the domain and
+            // leaves `dep_unify(IO(sa), IO(sb))` — signature subtyping
+            // through the IO arm below — at the codomain.
+            let za;
+            let zb;
+            let a = if extract_meta_id(a).is_some() {
+                za = self.zonk(a, ctx);
+                &za
+            } else {
+                a
+            };
+            let b = if extract_meta_id(b).is_some() {
+                zb = self.zonk(b, ctx);
+                &zb
+            } else {
+                b
+            };
+            let _t = crate::stats::timer(&crate::stats::T_DEP_UNIFY);
+            crate::stats::dep_unify(a, b);
+            if a == b {
+                return Ok(());
+            }
+            if extract_meta_id(a).is_some() || extract_meta_id(b).is_some() {
+                return self.unify(a, b, ctx);
+            }
+            // `type.unknown` is the dynamic top (see `unify`): consistent
+            // with every type on either side, in both the tagged and the
+            // domain-encoded spellings. Checked here — before the tag match
+            // — because the `io_headed` signature-subtyping arm below would
+            // otherwise reject `IO` vs `unknown` before `self.unify`'s
+            // accept could fire.
+            if is_unknown_ty(a) || is_unknown_ty(b) {
+                return Ok(());
+            }
+            match (tag_of(a), tag_of(b)) {
+                (Some("type.family_app"), Some("type.family_app")) => {
+                    let na = a.get("name").and_then(Value::as_str).unwrap_or("");
+                    let nb = b.get("name").and_then(Value::as_str).unwrap_or("");
+                    if na != nb {
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify — expected {}, got {}",
+                            display_type(b, ctx),
+                            display_type(a, ctx)
+                        )));
+                    }
+                    let xs = a
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ys = b
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if xs.len() != ys.len() {
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify — expected {}, got {}",
+                            display_type(b, ctx),
+                            display_type(a, ctx)
+                        )));
+                    }
+                    for (x, y) in xs.iter().zip(ys.iter()) {
+                        let (ok, decided) = unify_index(x, y, ctx);
+                        if !ok {
+                            if decided {
+                                return Err(LangError::engine(format!(
+                                    "typecheck: cannot unify — expected {}, got {}",
+                                    display_type(b, ctx),
+                                    display_type(a, ctx)
+                                )));
+                            }
+                            // Stuck indices still try the structural path
+                            // (e.g. type-argument metas).
+                            self.unify(x, y, ctx).map_err(|_| {
+                                LangError::engine(format!(
+                                    "typecheck: cannot unify — expected {}, got {}",
+                                    display_type(b, ctx),
+                                    display_type(a, ctx)
+                                ))
+                            })?;
                         }
-                        // Stuck indices still try the structural path
-                        // (e.g. type-argument metas).
-                        self.unify(x, y, ctx).map_err(|_| {
-                            LangError::engine(format!(
-                                "typecheck: cannot unify — expected {}, got {}",
-                                display_type(b, ctx),
-                                display_type(a, ctx)
-                            ))
-                        })?;
+                    }
+                    Ok(())
+                }
+                (Some("Path"), Some("Path")) => {
+                    let fa = a.get("frm").cloned().unwrap_or(Value::Null);
+                    let fb = b.get("frm").cloned().unwrap_or(Value::Null);
+                    let ta = a.get("to").cloned().unwrap_or(Value::Null);
+                    let tb = b.get("to").cloned().unwrap_or(Value::Null);
+                    let (ok, _) = unify_index(&fa, &fb, ctx);
+                    if !ok {
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify Path sources — expected {}, got {}",
+                            display_type(&fb, ctx),
+                            display_type(&fa, ctx)
+                        )));
+                    }
+                    let (ok, _) = unify_index(&ta, &tb, ctx);
+                    if !ok {
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify Path targets — expected {}, got {}",
+                            display_type(&tb, ctx),
+                            display_type(&ta, ctx)
+                        )));
+                    }
+                    Ok(())
+                }
+                (Some("type.function"), Some("type.function")) => {
+                    // Recurse dependently: `family_app` codomains unify by
+                    // index (`unify_index`), which plain `unify` cannot see
+                    // inside `args` arrays. `effects` fields, when both are
+                    // present, unify through the structural path.
+                    let pa = a.get("param").cloned().unwrap_or(Value::Null);
+                    let pb = b.get("param").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&pa, &pb, ctx)?;
+                    let ba = a.get("body").cloned().unwrap_or(Value::Null);
+                    let bb = b.get("body").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&ba, &bb, ctx)?;
+                    match (a.get("effects"), b.get("effects")) {
+                        (Some(ea), Some(eb)) => self.unify(ea, eb, ctx),
+                        _ => Ok(()),
                     }
                 }
-                Ok(())
-            }
-            (Some("Path"), Some("Path")) => {
-                let fa = a.get("frm").cloned().unwrap_or(Value::Null);
-                let fb = b.get("frm").cloned().unwrap_or(Value::Null);
-                let ta = a.get("to").cloned().unwrap_or(Value::Null);
-                let tb = b.get("to").cloned().unwrap_or(Value::Null);
-                let (ok, _) = unify_index(&fa, &fb, ctx);
-                if !ok {
-                    return Err(LangError::engine(format!(
-                        "typecheck: cannot unify Path sources — expected {}, got {}",
-                        display_type(&fb, ctx),
-                        display_type(&fa, ctx)
-                    )));
-                }
-                let (ok, _) = unify_index(&ta, &tb, ctx);
-                if !ok {
-                    return Err(LangError::engine(format!(
-                        "typecheck: cannot unify Path targets — expected {}, got {}",
-                        display_type(&tb, ctx),
-                        display_type(&ta, ctx)
-                    )));
-                }
-                Ok(())
-            }
-            (Some("type.function"), Some("type.function")) => {
-                // Recurse dependently: `family_app` codomains unify by
-                // index (`unify_index`), which plain `unify` cannot see
-                // inside `args` arrays. `effects` fields, when both are
-                // present, unify through the structural path.
-                let pa = a.get("param").cloned().unwrap_or(Value::Null);
-                let pb = b.get("param").cloned().unwrap_or(Value::Null);
-                self.dep_unify(&pa, &pb, ctx)?;
-                let ba = a.get("body").cloned().unwrap_or(Value::Null);
-                let bb = b.get("body").cloned().unwrap_or(Value::Null);
-                self.dep_unify(&ba, &bb, ctx)?;
-                match (a.get("effects"), b.get("effects")) {
-                    (Some(ea), Some(eb)) => self.unify(ea, eb, ctx),
-                    _ => Ok(()),
-                }
-            }
-            (Some("type.function"), Some("type.family_app"))
-            | (Some("type.family_app"), Some("type.function")) => Err(LangError::engine(
-                format!(
-                    "typecheck: cannot unify — expected {}, got {}",
-                    display_type(b, ctx),
-                    display_type(a, ctx)
-                ),
-            )),
-            _ => {
-                // `Former{type.io}` — signature subtyping (record-width
-                // on the sig index): `IO(s) <: IO(s')` iff `s'` names
-                // at least the ops of `s` — directed, unlike index conv.
-                if io_headed(a) || io_headed(b) {
-                    let mark = ctx.vcheck.store_mark();
-                    let va = domain_lift(a, ctx);
-                    let vb = domain_lift(b, ctx);
-                    if ctx.vcheck.subtype(&va, &vb) {
-                        return Ok(());
-                    }
-                    ctx.vcheck.store_restore(mark);
-                    return Err(LangError::engine(format!(
+                (Some("type.function"), Some("type.family_app"))
+                | (Some("type.family_app"), Some("type.function")) => {
+                    Err(LangError::engine(format!(
                         "typecheck: cannot unify — expected {}, got {}",
                         display_type(b, ctx),
                         display_type(a, ctx)
-                    )));
+                    )))
                 }
-                self.unify(a, b, ctx)
+                _ => {
+                    // `Former{type.io}` — signature subtyping (record-width
+                    // on the sig index): `IO(s) <: IO(s')` iff `s'` names
+                    // at least the ops of `s` — directed, unlike index conv.
+                    if io_headed(a) || io_headed(b) {
+                        let mark = ctx.vcheck.store_mark();
+                        let va = domain_lift(a, ctx);
+                        let vb = domain_lift(b, ctx);
+                        if ctx.vcheck.subtype(&va, &vb) {
+                            return Ok(());
+                        }
+                        ctx.vcheck.store_restore(mark);
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify — expected {}, got {}",
+                            display_type(b, ctx),
+                            display_type(a, ctx)
+                        )));
+                    }
+                    self.unify(a, b, ctx)
+                }
             }
-        }
         })
     }
 
@@ -4755,170 +4755,169 @@ impl NbeTypecheckEngine {
     ) -> Option<Result<Value, LangError>> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        // `match` checked against an expected type: motive inference —
-        // a `return … with`-less match takes its motive from the expected
-        // type's family-app index pattern (or the constant expected
-        // type), checking each arm body against it rather than joining
-        // synthesized body types.
-        if let Some(node) = ast.get(node_ref) {
-            if node.kind == "match" {
-                match self.dep_check_match(lang, ast, node, expected, ctx) {
-                    Ok(Some(ty)) => return Some(Ok(ty)),
-                    Ok(None) => {}
+            // `match` checked against an expected type: motive inference —
+            // a `return … with`-less match takes its motive from the expected
+            // type's family-app index pattern (or the constant expected
+            // type), checking each arm body against it rather than joining
+            // synthesized body types.
+            if let Some(node) = ast.get(node_ref)
+                && node.kind == "match" {
+                    match self.dep_check_match(lang, ast, node, expected, ctx) {
+                        Ok(Some(ty)) => return Some(Ok(ty)),
+                        Ok(None) => {}
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            let tag = tag_of(expected)?;
+            if tag == "type.family_app" {
+                // Family applications check through index unification, not
+                // the node's `check` scheme (which cannot see `args`).
+                let ty = match self.synth_node(lang, ast, node_ref, ctx) {
+                    Ok(t) => t,
                     Err(e) => return Some(Err(e)),
-                }
+                };
+                return Some(match self.dep_unify(&ty, expected, ctx) {
+                    Ok(()) => Ok(ty),
+                    Err(e) => Err(e),
+                });
             }
-        }
-        let tag = tag_of(expected)?;
-        if tag == "type.family_app" {
-            // Family applications check through index unification, not
-            // the node's `check` scheme (which cannot see `args`).
-            let ty = match self.synth_node(lang, ast, node_ref, ctx) {
-                Ok(t) => t,
-                Err(e) => return Some(Err(e)),
-            };
-            return Some(match self.dep_unify(&ty, expected, ctx) {
-                Ok(()) => Ok(ty),
-                Err(e) => Err(e),
-            });
-        }
-        match tag {
-            "type.pi" | "type.family" | "type.sigma" | "type.forall" => {
-                let node = ast.get(node_ref)?;
-                if tag == "type.pi"
-                    && expected.get("implicit") == Some(&Value::Bool(true))
-                {
-                    // Implicit index binder (phase-2 WS-C `f<a, …}`): the
-                    // binder does NOT consume a lambda — bind its name
-                    // rigidly (Γ + results) and check the same node
-                    // against the already-elaborated `body`.
-                    Some(self.dep_intro_implicit(lang, ast, node_ref, expected, ctx))
-                } else if node.kind == "function" {
-                    Some(self.dep_intro_arrow(lang, ast, node, expected, ctx))
-                } else if tag == "type.sigma" && node.kind == "array" {
-                    Some(self.dep_intro_sigma(lang, ast, node, expected, ctx))
-                } else {
-                    None
-                }
-            }
-            // `type.array{elements}` (the tuple/product convention):
-            // a `paren`/`array` node checks positionally — element `i`
-            // against `elements[i]`.
-            "type.array" => {
-                let node = ast.get(node_ref)?;
-                let els = expected
-                    .get("elements")
-                    .and_then(Value::as_array)
-                    .cloned();
-                match (els, node.kind.as_str()) {
-                    (Some(els), "paren" | "array") => {
-                        let kids = children_of(node).cloned().unwrap_or_default();
-                        if kids.len() != els.len() {
-                            return Some(Err(LangError::engine(format!(
-                                "typecheck: tuple arity {} does not match expected {}",
-                                kids.len(),
-                                els.len()
-                            ))));
-                        }
-                        for (k, el) in kids.iter().zip(els.iter()) {
-                            let idx = match k.as_u64() {
-                                Some(i) => AstRef::new(i as usize),
-                                None => {
-                                    return Some(Err(LangError::engine(
-                                        "typecheck: bad tuple child",
-                                    )))
-                                }
-                            };
-                            if let Err(e) = self.check_node(lang, ast, idx, el, ctx) {
-                                return Some(Err(e));
-                            }
-                        }
-                        Some(Ok(expected.clone()))
-                    }
-                    _ => None,
-                }
-            }
-            // `type.function` is the *structural* arrow: its `check`
-            // scheme checks params/body positionally, which is the
-            // only path that handles non-binder params (synthetic
-            // `value` params in unit tests). Route to the dependent
-            // intro — bind the name at the domain, check the body
-            // against the codomain — only when the params side spells
-            // an actual binder: `param_names` accepts any
-            // string-payload leaf, so also require the shape data —
-            // `pattern_role` (`var`/`arr`/`rest`/`sequence`), a
-            // `subject` role (`type-annot`), or a variadic params
-            // collection (`paren`/`tuple`/`array`). A bare `value`/`lit`
-            // satisfies none of these.
-            "type.function" => {
-                let node = ast.get(node_ref)?;
-                if node.kind != "function" {
-                    None
-                } else {
-                    let binder = children_of(node)
-                        .and_then(|kids| kids.first().and_then(Value::as_u64))
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .map(|p| {
-                            let shaped = lang.pattern_role(&p.kind).is_some()
-                                || lang.has_variadic_role(&p.kind)
-                                || lang
-                                    .child_role_index(&p.kind, "subject")
-                                    .ok()
-                                    .flatten()
-                                    .is_some();
-                            shaped
-                                && lang
-                                    .param_names(ast, p)
-                                    .map(|(names, rest)| {
-                                        !names.is_empty() || rest.is_some()
-                                    })
-                                    .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if binder {
+            match tag {
+                "type.pi" | "type.family" | "type.sigma" | "type.forall" => {
+                    let node = ast.get(node_ref)?;
+                    if tag == "type.pi" && expected.get("implicit") == Some(&Value::Bool(true)) {
+                        // Implicit index binder (phase-2 WS-C `f<a, …}`): the
+                        // binder does NOT consume a lambda — bind its name
+                        // rigidly (Γ + results) and check the same node
+                        // against the already-elaborated `body`.
+                        Some(self.dep_intro_implicit(lang, ast, node_ref, expected, ctx))
+                    } else if node.kind == "function" {
                         Some(self.dep_intro_arrow(lang, ast, node, expected, ctx))
+                    } else if tag == "type.sigma" && node.kind == "array" {
+                        Some(self.dep_intro_sigma(lang, ast, node, expected, ctx))
                     } else {
                         None
                     }
                 }
-            }
-            "Path" => {
-                let node = ast.get(node_ref)?;
-                if node.kind == "var" && node_name(node).as_deref() == Some("refl") {
-                    let frm = expected.get("frm").cloned().unwrap_or(Value::Null);
-                    let to = expected.get("to").cloned().unwrap_or(Value::Null);
-                    let (ok, decided) = unify_index(&frm, &to, ctx);
-                    if ok {
-                        Some(Ok(expected.clone()))
-                    } else {
-                        Some(Err(LangError::engine(format!(
-                            "typecheck: refl cannot prove Path({frm:?}, {to:?}){}",
-                            if decided { " — decided inequality" } else { "" }
-                        ))))
+                // `type.array{elements}` (the tuple/product convention):
+                // a `paren`/`array` node checks positionally — element `i`
+                // against `elements[i]`.
+                "type.array" => {
+                    let node = ast.get(node_ref)?;
+                    let els = expected.get("elements").and_then(Value::as_array).cloned();
+                    match (els, node.kind.as_str()) {
+                        (Some(els), "paren" | "array") => {
+                            let kids = children_of(node).cloned().unwrap_or_default();
+                            if kids.len() != els.len() {
+                                return Some(Err(LangError::engine(format!(
+                                    "typecheck: tuple arity {} does not match expected {}",
+                                    kids.len(),
+                                    els.len()
+                                ))));
+                            }
+                            for (k, el) in kids.iter().zip(els.iter()) {
+                                let idx = match k.as_u64() {
+                                    Some(i) => AstRef::new(i as usize),
+                                    None => {
+                                        return Some(Err(LangError::engine(
+                                            "typecheck: bad tuple child",
+                                        )));
+                                    }
+                                };
+                                if let Err(e) = self.check_node(lang, ast, idx, el, ctx) {
+                                    return Some(Err(e));
+                                }
+                            }
+                            Some(Ok(expected.clone()))
+                        }
+                        _ => None,
                     }
-                } else if node.kind == "var" {
-                    // A Γ/results-bound `Path` witness also inhabits Path.
-                    let wit = node
-                        .payload
-                        .as_str()
-                        .and_then(|n| {
-                            ctx.results.get(n).cloned().or_else(|| ctx.lookup(n).cloned())
-                        })
-                        .unwrap_or(Value::Null);
-                    if tag_of(&wit) == Some("Path") {
-                        match self.dep_unify(&wit, expected, ctx) {
-                            Ok(()) => Some(Ok(expected.clone())),
-                            Err(e) => Some(Err(e)),
+                }
+                // `type.function` is the *structural* arrow: its `check`
+                // scheme checks params/body positionally, which is the
+                // only path that handles non-binder params (synthetic
+                // `value` params in unit tests). Route to the dependent
+                // intro — bind the name at the domain, check the body
+                // against the codomain — only when the params side spells
+                // an actual binder: `param_names` accepts any
+                // string-payload leaf, so also require the shape data —
+                // `pattern_role` (`var`/`arr`/`rest`/`sequence`), a
+                // `subject` role (`type-annot`), or a variadic params
+                // collection (`paren`/`tuple`/`array`). A bare `value`/`lit`
+                // satisfies none of these.
+                "type.function" => {
+                    let node = ast.get(node_ref)?;
+                    if node.kind != "function" {
+                        None
+                    } else {
+                        let binder = children_of(node)
+                            .and_then(|kids| kids.first().and_then(Value::as_u64))
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .map(|p| {
+                                let shaped = lang.pattern_role(&p.kind).is_some()
+                                    || lang.has_variadic_role(&p.kind)
+                                    || lang
+                                        .child_role_index(&p.kind, "subject")
+                                        .ok()
+                                        .flatten()
+                                        .is_some();
+                                shaped
+                                    && lang
+                                        .param_names(ast, p)
+                                        .map(|(names, rest)| !names.is_empty() || rest.is_some())
+                                        .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if binder {
+                            Some(self.dep_intro_arrow(lang, ast, node, expected, ctx))
+                        } else {
+                            None
+                        }
+                    }
+                }
+                "Path" => {
+                    let node = ast.get(node_ref)?;
+                    if node.kind == "var" && node_name(node).as_deref() == Some("refl") {
+                        let frm = expected.get("frm").cloned().unwrap_or(Value::Null);
+                        let to = expected.get("to").cloned().unwrap_or(Value::Null);
+                        let (ok, decided) = unify_index(&frm, &to, ctx);
+                        if ok {
+                            Some(Ok(expected.clone()))
+                        } else {
+                            Some(Err(LangError::engine(format!(
+                                "typecheck: refl cannot prove Path({frm:?}, {to:?}){}",
+                                if decided {
+                                    " — decided inequality"
+                                } else {
+                                    ""
+                                }
+                            ))))
+                        }
+                    } else if node.kind == "var" {
+                        // A Γ/results-bound `Path` witness also inhabits Path.
+                        let wit = node
+                            .payload
+                            .as_str()
+                            .and_then(|n| {
+                                ctx.results
+                                    .get(n)
+                                    .cloned()
+                                    .or_else(|| ctx.lookup(n).cloned())
+                            })
+                            .unwrap_or(Value::Null);
+                        if tag_of(&wit) == Some("Path") {
+                            match self.dep_unify(&wit, expected, ctx) {
+                                Ok(()) => Some(Ok(expected.clone())),
+                                Err(e) => Some(Err(e)),
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
                     }
-                } else {
-                    None
                 }
+                _ => None,
             }
-            _ => None,
-        }
         })
     }
 
@@ -4933,7 +4932,7 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let kids = children_of(node)
+        let _kids = children_of(node)
             .ok_or_else(|| LangError::engine("dep_intro: function has no children"))?;
         let params_idx = role_child_ref(lang, node, "params")
             .or_else(|| child_at(ast, node, 0))
@@ -4941,9 +4940,9 @@ impl NbeTypecheckEngine {
         let body_idx = role_child_ref(lang, node, "body")
             .or_else(|| child_at(ast, node, 1))
             .ok_or_else(|| LangError::engine("dep_intro: no body child"))?;
-        let pnode = ast.get(params_idx).ok_or_else(|| {
-            LangError::engine("dep_intro: params node out of bounds".to_string())
-        })?;
+        let pnode = ast
+            .get(params_idx)
+            .ok_or_else(|| LangError::engine("dep_intro: params node out of bounds".to_string()))?;
         let (names, _rest) = lang
             .param_names(ast, pnode)
             .map_err(|e| LangError::engine(e.to_string()))?;
@@ -5042,17 +5041,19 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("dep_intro: sigma pair has no children"))?;
-        let fst_idx = kids.first().and_then(Value::as_u64).ok_or_else(|| {
-            LangError::engine("dep_intro: sigma pair is empty".to_string())
-        })? as usize;
+        let fst_idx = kids
+            .first()
+            .and_then(Value::as_u64)
+            .ok_or_else(|| LangError::engine("dep_intro: sigma pair is empty".to_string()))?
+            as usize;
         let snd_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
             LangError::engine("dep_intro: sigma pair needs 2 elements".to_string())
         })? as usize;
         let param = expected.get("param").cloned().unwrap_or(Value::Null);
         self.check_node(lang, ast, AstRef::new(fst_idx), &param, ctx)?;
-        let fst_node = ast.get(AstRef::new(fst_idx)).ok_or_else(|| {
-            LangError::engine("dep_intro: fst node out of bounds".to_string())
-        })?;
+        let fst_node = ast
+            .get(AstRef::new(fst_idx))
+            .ok_or_else(|| LangError::engine("dep_intro: fst node out of bounds".to_string()))?;
         let fst_term = self.node_to_index_term(lang, ast, fst_node, ctx);
         let snd_ty = self.dep_closure_apply_term(lang, ast, expected, &fst_term, ctx)?;
         self.check_node(lang, ast, AstRef::new(snd_idx), &snd_ty, ctx)?;
@@ -5069,9 +5070,9 @@ impl NbeTypecheckEngine {
         _arg: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let bc = ty.get("body_closure").ok_or_else(|| {
-            LangError::engine("dep_closure_apply: no body_closure".to_string())
-        })?;
+        let bc = ty
+            .get("body_closure")
+            .ok_or_else(|| LangError::engine("dep_closure_apply: no body_closure".to_string()))?;
         let var_name = bc.get("var_name").and_then(Value::as_str).unwrap_or("x");
         let body_idx = bc
             .get("body_child_idx")
@@ -5135,9 +5136,9 @@ impl NbeTypecheckEngine {
         term: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let bc = ty.get("body_closure").ok_or_else(|| {
-            LangError::engine("dep_closure_apply: no body_closure".to_string())
-        })?;
+        let bc = ty
+            .get("body_closure")
+            .ok_or_else(|| LangError::engine("dep_closure_apply: no body_closure".to_string()))?;
         let var_name = bc
             .get("var_name")
             .and_then(Value::as_str)
@@ -5271,28 +5272,30 @@ impl NbeTypecheckEngine {
         let mut arm_types: Vec<Value> = Vec::new();
         let mut arm_covers: Vec<ArmCover> = Vec::new();
         for &arm_idx in arm_indices {
-            let arm = ast.get(AstRef::new(arm_idx)).ok_or_else(|| {
-                LangError::engine(format!("match: arm {arm_idx} out of bounds"))
-            })?;
-            let kids = children_of(arm)
-                .ok_or_else(|| LangError::engine("match: arm has no children"))?;
+            let arm = ast
+                .get(AstRef::new(arm_idx))
+                .ok_or_else(|| LangError::engine(format!("match: arm {arm_idx} out of bounds")))?;
+            let kids =
+                children_of(arm).ok_or_else(|| LangError::engine("match: arm has no children"))?;
             if kids.len() < 2 {
                 return Err(LangError::engine(
                     "match: arm needs [pattern, body]".to_string(),
                 ));
             }
-            let pat_idx = kids[0].as_u64().ok_or_else(|| {
-                LangError::engine("match: pattern index not a u64".to_string())
-            })? as usize;
-            let body_idx = kids[1].as_u64().ok_or_else(|| {
-                LangError::engine("match: body index not a u64".to_string())
-            })? as usize;
+            let pat_idx = kids[0]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("match: pattern index not a u64".to_string()))?
+                as usize;
+            let body_idx = kids[1]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("match: body index not a u64".to_string()))?
+                as usize;
             let pattern = ast.get(AstRef::new(pat_idx)).ok_or_else(|| {
                 LangError::engine("match: pattern node out of bounds".to_string())
             })?;
-            let body_node = ast.get(AstRef::new(body_idx)).ok_or_else(|| {
-                LangError::engine("match: body node out of bounds".to_string())
-            })?;
+            let body_node = ast
+                .get(AstRef::new(body_idx))
+                .ok_or_else(|| LangError::engine("match: body node out of bounds".to_string()))?;
             let is_absurd = body_node.kind == "absurd";
 
             let mark = ctx.mark();
@@ -5310,10 +5313,7 @@ impl NbeTypecheckEngine {
             } else {
                 match &cons_name {
                     Some(n) => {
-                        let family = scrut
-                            .as_ref()
-                            .map(|(f, _)| f.as_str())
-                            .unwrap_or("");
+                        let family = scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("");
                         let is_own_ctor = ctx
                             .lookup(n)
                             .filter(|v| tag_of(v) == Some("type.ctor_sig"))
@@ -5348,10 +5348,7 @@ impl NbeTypecheckEngine {
                 let inst = self.instantiate_ctor_full(lang, ast, sig, ctx)?;
                 let (doms, res) = self.peel_ctor(&inst);
                 for (i, (_pname, dom)) in doms.into_iter().enumerate() {
-                    domains.push((
-                        arg_names.get(i).cloned().unwrap_or_default(),
-                        dom,
-                    ));
+                    domains.push((arg_names.get(i).cloned().unwrap_or_default(), dom));
                 }
                 ctor_result = res;
             }
@@ -5373,7 +5370,10 @@ impl NbeTypecheckEngine {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let c_name = ctor_result.get("name").and_then(Value::as_str).unwrap_or("");
+                let c_name = ctor_result
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if s_name != c_name {
                     impossible = true;
                     if !is_absurd {
@@ -5418,10 +5418,8 @@ impl NbeTypecheckEngine {
                             idx_args.push(eb);
                         } else {
                             let (ok, decided) = unify_index(&ea, &eb, ctx);
-                            if !ok {
-                                if decided
-                                    || (num_val(&ea).is_some() && num_val(&eb).is_some())
-                                {
+                            if !ok
+                                && (decided || (num_val(&ea).is_some() && num_val(&eb).is_some())) {
                                     // Decided-unsatisfiable index
                                     // equation: the arm can never fire.
                                     // No diagnostic — the arm is
@@ -5429,7 +5427,6 @@ impl NbeTypecheckEngine {
                                     impossible = true;
                                     index_decided = true;
                                 }
-                            }
                             idx_args.push(eb);
                         }
                     }
@@ -5506,21 +5503,11 @@ impl NbeTypecheckEngine {
             // scrutinee is opaque). `leaf` (`var`/`value`/`arr`) and
             // role-less patterns (`call` ctor patterns, literals) are
             // handled by the ctor/catchall path above.
-            match lang
+            if let Some("sequence" | "entries" | "entry" | "rest") = lang
                 .ast
                 .get_by_identity(&pattern.kind)
-                .and_then(|s| s.pattern_role.as_deref())
-            {
-                Some("sequence" | "entries" | "entry" | "rest") => {
-                    self.bind_pattern_vars(
-                        lang,
-                        ast,
-                        AstRef::new(pat_idx),
-                        scrutinee_type,
-                        ctx,
-                    )?;
-                }
-                _ => {}
+                .and_then(|s| s.pattern_role.as_deref()) {
+                self.bind_pattern_vars(lang, ast, AstRef::new(pat_idx), scrutinee_type, ctx)?;
             }
 
             // Body: against the motive applied at the refined indices
@@ -5547,16 +5534,7 @@ impl NbeTypecheckEngine {
         // and uncovered is a non-exhaustive error; still-undecided at a
         // final leaf is a `coverage unknown` warning (bounded split).
         if let Some((fname, sargs)) = &scrut {
-            self.match_coverage(
-                lang,
-                ast,
-                node,
-                fname,
-                sargs,
-                &arm_covers,
-                index_sorts,
-                ctx,
-            )?;
+            self.match_coverage(lang, ast, node, fname, sargs, &arm_covers, index_sorts, ctx)?;
         }
         ctx.nonneg_index_vars = saved_nonneg;
 
@@ -5601,9 +5579,7 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
         match motive {
-            MatchMotive::Ast(mi) => {
-                self.apply_motive(lang, ast, *mi, arg_vals, scrutinee_idx, ctx)
-            }
+            MatchMotive::Ast(mi) => self.apply_motive(lang, ast, *mi, arg_vals, scrutinee_idx, ctx),
             MatchMotive::Inferred { vars, template } => {
                 let mut out = template.clone();
                 for (i, v) in vars.iter().enumerate() {
@@ -5644,16 +5620,23 @@ impl NbeTypecheckEngine {
             // existing synth path — inference only fills an *absent* one.
             return Ok(None);
         }
-        let scrutinee_idx = children[0].as_u64().ok_or_else(|| {
-            LangError::engine("match: scrutinee index not a u64".to_string())
-        })? as usize;
-        let block_idx = children[1].as_u64().ok_or_else(|| {
-            LangError::engine("match: block index not a u64".to_string())
-        })? as usize;
+        let scrutinee_idx = children[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("match: scrutinee index not a u64".to_string()))?
+            as usize;
+        let block_idx = children[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("match: block index not a u64".to_string()))?
+            as usize;
         let arm_indices: Vec<usize> = ast
             .get(AstRef::new(block_idx))
             .and_then(children_of)
-            .map(|bs| bs.iter().filter_map(Value::as_u64).map(|i| i as usize).collect())
+            .map(|bs| {
+                bs.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|i| i as usize)
+                    .collect()
+            })
             .unwrap_or_default();
         let scrutinee_type = self.synth_node(lang, ast, AstRef::new(scrutinee_idx), ctx)?;
         let motive = Self::inferred_motive(expected, &scrutinee_type, ctx);
@@ -5674,7 +5657,11 @@ impl NbeTypecheckEngine {
     /// for each scrutinee index arg that is a rigid `var` occurring in the
     /// expected family args, mint a motive binder `im_i` and substitute it
     /// into the expected type.
-    fn inferred_motive(expected: &Value, scrutinee_type: &Value, ctx: &mut TypecheckContext) -> MatchMotive {
+    fn inferred_motive(
+        expected: &Value,
+        scrutinee_type: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> MatchMotive {
         let mut vars: Vec<String> = Vec::new();
         let mut template = expected.clone();
         if tag_of(expected) == Some("type.family_app")
@@ -5703,10 +5690,7 @@ impl NbeTypecheckEngine {
                 }
             }
         }
-        MatchMotive::Inferred {
-            vars,
-            template,
-        }
+        MatchMotive::Inferred { vars, template }
     }
 
     /// Motive application `return (i⃗, w) ~> T with`: bind the motive's
@@ -5754,13 +5738,7 @@ impl NbeTypecheckEngine {
                 let body = lam.get("body").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let scrut_name = ast
                     .get(AstRef::new(scrutinee_idx))
-                    .and_then(|n| {
-                        if n.kind == "var" {
-                            node_name(n)
-                        } else {
-                            None
-                        }
-                    })
+                    .and_then(|n| if n.kind == "var" { node_name(n) } else { None })
                     .unwrap_or_else(|| "_scrut".to_string());
                 let old_results = ctx.results.clone();
                 for (i, name) in names.iter().enumerate() {
@@ -5796,13 +5774,7 @@ impl NbeTypecheckEngine {
             .map_err(|e| LangError::engine(e.to_string()))?;
         let scrut_name = ast
             .get(AstRef::new(scrutinee_idx))
-            .and_then(|n| {
-                if n.kind == "var" {
-                    node_name(n)
-                } else {
-                    None
-                }
-            })
+            .and_then(|n| if n.kind == "var" { node_name(n) } else { None })
             .unwrap_or_else(|| "_scrut".to_string());
         let old_results = ctx.results.clone();
         for (i, name) in names.iter().enumerate() {
@@ -5840,21 +5812,16 @@ impl NbeTypecheckEngine {
                 m.insert("__tag__".to_string(), Value::String("Refl".to_string()));
                 // Identity path — `Path{refl, refl}` reads as transport
                 // with frm == to; record the refl marker.
-                return Some(path_val(
-                    Value::Object(m.clone()),
-                    Value::Object(m),
-                ));
+                return Some(path_val(Value::Object(m.clone()), Value::Object(m)));
             }
-            if let Some(w) = ctx.results.get(&name) {
-                if tag_of(w) == Some("Path") {
+            if let Some(w) = ctx.results.get(&name)
+                && tag_of(w) == Some("Path") {
                     return Some(w.clone());
                 }
-            }
-            if let Some(w) = ctx.lookup(&name) {
-                if tag_of(w) == Some("Path") {
+            if let Some(w) = ctx.lookup(&name)
+                && tag_of(w) == Some("Path") {
                     return Some(w.clone());
                 }
-            }
             let bound = ctx
                 .results
                 .get(&name)
@@ -5882,17 +5849,21 @@ impl NbeTypecheckEngine {
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("transport: no children".to_string()))?;
         if kids.len() < 2 {
-            return Err(LangError::engine("transport: needs [path, value]".to_string()));
+            return Err(LangError::engine(
+                "transport: needs [path, value]".to_string(),
+            ));
         }
-        let path_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("transport: path index not a u64".to_string())
-        })? as usize;
-        let val_idx = kids[1].as_u64().ok_or_else(|| {
-            LangError::engine("transport: value index not a u64".to_string())
-        })? as usize;
-        let path_node = ast.get(AstRef::new(path_idx)).ok_or_else(|| {
-            LangError::engine("transport: path node out of bounds".to_string())
-        })?;
+        let path_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("transport: path index not a u64".to_string()))?
+            as usize;
+        let val_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("transport: value index not a u64".to_string()))?
+            as usize;
+        let path_node = ast
+            .get(AstRef::new(path_idx))
+            .ok_or_else(|| LangError::engine("transport: path node out of bounds".to_string()))?;
         let path = self.resolve_path(path_node, ctx).ok_or_else(|| {
             LangError::engine(format!(
                 "transport: operand is not a Path (kind '{}')",
@@ -5915,7 +5886,10 @@ impl NbeTypecheckEngine {
                 .map(|a| eval_index(&subst_index(a, &frm, &to), ctx))
                 .collect();
             let mut m = Map::new();
-            m.insert("name".to_string(), vty.get("name").cloned().unwrap_or(Value::Null));
+            m.insert(
+                "name".to_string(),
+                vty.get("name").cloned().unwrap_or(Value::Null),
+            );
             m.insert("args".to_string(), Value::Array(args));
             make_tag(ctx, "type.family_app", m)
         } else {
@@ -5942,26 +5916,31 @@ impl NbeTypecheckEngine {
         node: &AstNode,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let kids = children_of(node)
-            .ok_or_else(|| LangError::engine("j: no children".to_string()))?;
+        let kids =
+            children_of(node).ok_or_else(|| LangError::engine("j: no children".to_string()))?;
         if kids.len() < 3 {
-            return Err(LangError::engine("j: needs [path, motive, base]".to_string()));
+            return Err(LangError::engine(
+                "j: needs [path, motive, base]".to_string(),
+            ));
         }
-        let path_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("j: path index not a u64".to_string())
-        })? as usize;
-        let motive_idx = kids[1].as_u64().ok_or_else(|| {
-            LangError::engine("j: motive index not a u64".to_string())
-        })? as usize;
-        let base_idx = kids[2].as_u64().ok_or_else(|| {
-            LangError::engine("j: base index not a u64".to_string())
-        })? as usize;
-        let path_node = ast.get(AstRef::new(path_idx)).ok_or_else(|| {
-            LangError::engine("j: path node out of bounds".to_string())
-        })?;
-        let path = self.resolve_path(path_node, ctx).ok_or_else(|| {
-            LangError::engine("j: operand is not a Path".to_string())
-        })?;
+        let path_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("j: path index not a u64".to_string()))?
+            as usize;
+        let motive_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("j: motive index not a u64".to_string()))?
+            as usize;
+        let base_idx = kids[2]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("j: base index not a u64".to_string()))?
+            as usize;
+        let path_node = ast
+            .get(AstRef::new(path_idx))
+            .ok_or_else(|| LangError::engine("j: path node out of bounds".to_string()))?;
+        let path = self
+            .resolve_path(path_node, ctx)
+            .ok_or_else(|| LangError::engine("j: operand is not a Path".to_string()))?;
         let frm = eval_index(&path.get("frm").cloned().unwrap_or(Value::Null), ctx);
         let to = eval_index(&path.get("to").cloned().unwrap_or(Value::Null), ctx);
         let expected_base = self.apply_motive(lang, ast, motive_idx, &[frm], path_idx, ctx)?;
@@ -5982,15 +5961,18 @@ impl NbeTypecheckEngine {
         if kids.len() < 3 {
             return Err(LangError::engine("dim_arrow: missing operands".to_string()));
         }
-        let src_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("dim_arrow: src index not a u64".to_string())
-        })? as usize;
-        let dim_idx = kids[1].as_u64().ok_or_else(|| {
-            LangError::engine("dim_arrow: dim index not a u64".to_string())
-        })? as usize;
-        let tgt_idx = kids[2].as_u64().ok_or_else(|| {
-            LangError::engine("dim_arrow: tgt index not a u64".to_string())
-        })? as usize;
+        let src_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("dim_arrow: src index not a u64".to_string()))?
+            as usize;
+        let dim_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("dim_arrow: dim index not a u64".to_string()))?
+            as usize;
+        let tgt_idx = kids[2]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("dim_arrow: tgt index not a u64".to_string()))?
+            as usize;
         // The `source`/`target` endpoints are quoted *law terms*
         // (ADR-0119): the bootstrap scope pass checks them in pattern
         // mode — a free `var` is a pattern variable (`g` in
@@ -6015,9 +5997,9 @@ impl NbeTypecheckEngine {
         ctx.restore(law_mark);
         let (src, tgt) = judged?;
         // Dimension literal (from the child payload), then its type.
-        let dim_node = ast.get(AstRef::new(dim_idx)).ok_or_else(|| {
-            LangError::engine("dim_arrow: dim node out of bounds".to_string())
-        })?;
+        let dim_node = ast
+            .get(AstRef::new(dim_idx))
+            .ok_or_else(|| LangError::engine("dim_arrow: dim node out of bounds".to_string()))?;
         let dim_inner = if dim_node.kind == "paren" {
             child_at(ast, dim_node, 0)
                 .and_then(|i| ast.get(i))
@@ -6076,28 +6058,27 @@ impl NbeTypecheckEngine {
     ) {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        if node.kind == "var" {
-            if let Some(name) = node_name(node) {
-                let resolvable = name == "_"
-                    || ctx.lookup(&name).is_some()
-                    || ctx.results.contains_key(name.as_str())
-                    || lang.globals.contains_key(name.as_str());
-                if !resolvable {
-                    let meta = ctx.fresh_meta();
-                    ctx.extend(name, meta_value(meta));
-                }
-            }
-            return;
-        }
-        if let Some(kids) = children_of(node) {
-            for cv in kids {
-                if let Some(i) = cv.as_u64() {
-                    if let Some(child) = ast.get(AstRef::new(i as usize)) {
-                        self.bind_law_pattern_vars(lang, ast, child, ctx);
+            if node.kind == "var" {
+                if let Some(name) = node_name(node) {
+                    let resolvable = name == "_"
+                        || ctx.lookup(&name).is_some()
+                        || ctx.results.contains_key(name.as_str())
+                        || lang.globals.contains_key(name.as_str());
+                    if !resolvable {
+                        let meta = ctx.fresh_meta();
+                        ctx.extend(name, meta_value(meta));
                     }
                 }
+                return;
             }
-        }
+            if let Some(kids) = children_of(node) {
+                for cv in kids {
+                    if let Some(i) = cv.as_u64()
+                        && let Some(child) = ast.get(AstRef::new(i as usize)) {
+                            self.bind_law_pattern_vars(lang, ast, child, ctx);
+                        }
+                }
+            }
         })
     }
 
@@ -6112,17 +6093,19 @@ impl NbeTypecheckEngine {
         node: &AstNode,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let kids = children_of(node)
-            .ok_or_else(|| LangError::engine("flow: no children".to_string()))?;
+        let kids =
+            children_of(node).ok_or_else(|| LangError::engine("flow: no children".to_string()))?;
         if kids.len() < 2 {
             return Err(LangError::engine("flow: needs two operands".to_string()));
         }
-        let f_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("flow: lhs index not a u64".to_string())
-        })? as usize;
-        let g_idx = kids[1].as_u64().ok_or_else(|| {
-            LangError::engine("flow: rhs index not a u64".to_string())
-        })? as usize;
+        let f_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("flow: lhs index not a u64".to_string()))?
+            as usize;
+        let g_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("flow: rhs index not a u64".to_string()))?
+            as usize;
         let f_ty = self.synth_node(lang, ast, AstRef::new(f_idx), ctx)?;
         let g_ty = self.synth_node(lang, ast, AstRef::new(g_idx), ctx)?;
         self.flow_of(&f_ty, &g_ty, ctx)
@@ -6140,12 +6123,7 @@ impl NbeTypecheckEngine {
         // boundary law — `f >>> g` on `Hom`-typed cells is the
         // axis-0 paste.
         if is_domain_encoded(f_ty) || is_domain_encoded(g_ty) {
-            return self.comp_axis_typed(
-                &Val::Const(TaggedValue::Int(0)),
-                f_ty,
-                g_ty,
-                ctx,
-            );
+            return self.comp_axis_typed(&Val::Const(TaggedValue::Int(0)), f_ty, g_ty, ctx);
         }
         // `f >>> P` — reindexing: a family over `f`'s source (pullback).
         if tag_of(g_ty) == Some("type.family") {
@@ -6160,7 +6138,10 @@ impl NbeTypecheckEngine {
             let g_base = g_ty.get("base").cloned().unwrap_or(Value::Null);
             self.unify(&f_cod, &g_base, ctx)?;
             let mut m = Map::new();
-            m.insert("name".to_string(), g_ty.get("name").cloned().unwrap_or(Value::Null));
+            m.insert(
+                "name".to_string(),
+                g_ty.get("name").cloned().unwrap_or(Value::Null),
+            );
             m.insert("base".to_string(), f_dom);
             return Ok(make_tag(ctx, "type.family", m));
         }
@@ -6170,8 +6151,14 @@ impl NbeTypecheckEngine {
                 let g_param = g_ty.get("param").cloned().unwrap_or(Value::Null);
                 self.dep_unify(&f_body, &g_param, ctx)?;
                 let mut m = Map::new();
-                m.insert("param".to_string(), f_ty.get("param").cloned().unwrap_or(Value::Null));
-                m.insert("body".to_string(), g_ty.get("body").cloned().unwrap_or(Value::Null));
+                m.insert(
+                    "param".to_string(),
+                    f_ty.get("param").cloned().unwrap_or(Value::Null),
+                );
+                m.insert(
+                    "body".to_string(),
+                    g_ty.get("body").cloned().unwrap_or(Value::Null),
+                );
                 Ok(make_tag(ctx, "type.function", m))
             }
             (Some("type.function"), Some("type.pi"))
@@ -6243,18 +6230,21 @@ impl NbeTypecheckEngine {
         if kids.len() < 3 {
             return Err(LangError::engine("axis_flow: needs [a, k, b]".to_string()));
         }
-        let a_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("axis_flow: lhs index not a u64".to_string())
-        })? as usize;
-        let k_idx = kids[1].as_u64().ok_or_else(|| {
-            LangError::engine("axis_flow: axis index not a u64".to_string())
-        })? as usize;
-        let b_idx = kids[2].as_u64().ok_or_else(|| {
-            LangError::engine("axis_flow: rhs index not a u64".to_string())
-        })? as usize;
-        let k_node = ast.get(AstRef::new(k_idx)).ok_or_else(|| {
-            LangError::engine("axis_flow: axis node out of bounds".to_string())
-        })?;
+        let a_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("axis_flow: lhs index not a u64".to_string()))?
+            as usize;
+        let k_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("axis_flow: axis index not a u64".to_string()))?
+            as usize;
+        let b_idx = kids[2]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("axis_flow: rhs index not a u64".to_string()))?
+            as usize;
+        let k_node = ast
+            .get(AstRef::new(k_idx))
+            .ok_or_else(|| LangError::engine("axis_flow: axis node out of bounds".to_string()))?;
         let k_lit = k_node.payload.as_f64();
         let a_ty = self.synth_node(lang, ast, AstRef::new(a_idx), ctx)?;
         let b_ty = self.synth_node(lang, ast, AstRef::new(b_idx), ctx)?;
@@ -6310,9 +6300,10 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("cell_id: no children".to_string()))?;
-        let x_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("cell_id: operand index not a u64".to_string())
-        })? as usize;
+        let x_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("cell_id: operand index not a u64".to_string()))?
+            as usize;
         let x_ty = self.synth_node(lang, ast, AstRef::new(x_idx), ctx)?;
         let vx = domain_lift(&x_ty, ctx);
         Ok(hom_former(
@@ -6336,14 +6327,18 @@ impl NbeTypecheckEngine {
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("cell_comp: no children".to_string()))?;
         if kids.len() < 2 {
-            return Err(LangError::engine("cell_comp: needs two operands".to_string()));
+            return Err(LangError::engine(
+                "cell_comp: needs two operands".to_string(),
+            ));
         }
-        let a_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("cell_comp: lhs index not a u64".to_string())
-        })? as usize;
-        let b_idx = kids[1].as_u64().ok_or_else(|| {
-            LangError::engine("cell_comp: rhs index not a u64".to_string())
-        })? as usize;
+        let a_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("cell_comp: lhs index not a u64".to_string()))?
+            as usize;
+        let b_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("cell_comp: rhs index not a u64".to_string()))?
+            as usize;
         let a_ty = self.synth_node(lang, ast, AstRef::new(a_idx), ctx)?;
         let b_ty = self.synth_node(lang, ast, AstRef::new(b_idx), ctx)?;
         self.comp_axis_typed(&Val::Const(TaggedValue::Int(axis)), &a_ty, &b_ty, ctx)
@@ -6385,7 +6380,7 @@ impl NbeTypecheckEngine {
                     .and_then(|k| k.get(1))
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .and_then(|n| node_name(n))
+                    .and_then(node_name)
                     .or_else(|| {
                         callee
                             .payload
@@ -6399,9 +6394,7 @@ impl NbeTypecheckEngine {
             }
             _ => false,
         };
-        is_perform
-            && ctx.lookup_gamma("perform").is_none()
-            && !ctx.results.contains_key("perform")
+        is_perform && ctx.lookup_gamma("perform").is_none() && !ctx.results.contains_key("perform")
     }
 
     /// `perform(op, arg)` — synthesize `IO{op: T}` (ADR-0153 §4). `op` is
@@ -6422,15 +6415,13 @@ impl NbeTypecheckEngine {
         kids: &[Value],
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let op_idx = kids
-            .get(1)
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
+        let op_idx =
+            kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
                 LangError::engine("perform: expected perform(op, arg)".to_string())
             })? as usize;
-        let op_node = ast.get(AstRef::new(op_idx)).ok_or_else(|| {
-            LangError::engine("perform: op operand out of bounds".to_string())
-        })?;
+        let op_node = ast
+            .get(AstRef::new(op_idx))
+            .ok_or_else(|| LangError::engine("perform: op operand out of bounds".to_string()))?;
         let string_payload = |n: &AstNode| {
             n.payload
                 .get("value")
@@ -6457,7 +6448,7 @@ impl NbeTypecheckEngine {
                                 .and_then(|k| k.get(1))
                                 .and_then(Value::as_u64)
                                 .and_then(|i| ast.get(AstRef::new(i as usize)))
-                                .and_then(|f| node_name(f))
+                                .and_then(node_name)
                         }
                     });
                 match cname.as_deref() {
@@ -6465,7 +6456,7 @@ impl NbeTypecheckEngine {
                         .and_then(|k| k.get(1))
                         .and_then(Value::as_u64)
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .and_then(|a| string_payload(a)),
+                        .and_then(string_payload),
                     _ => None,
                 }
             }
@@ -6524,13 +6515,16 @@ impl NbeTypecheckEngine {
         }
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("check_call: no children".to_string()))?;
-        let callee_idx = kids.first().and_then(Value::as_u64).ok_or_else(|| {
-            LangError::engine("check_call: callee index not a u64".to_string())
-        })? as usize;
+        let callee_idx =
+            kids.first().and_then(Value::as_u64).ok_or_else(|| {
+                LangError::engine("check_call: callee index not a u64".to_string())
+            })? as usize;
         let funtype = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
-        let arg_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
-            LangError::engine("check_call: arg index not a u64".to_string())
-        })? as usize;
+        let arg_idx = kids
+            .get(1)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| LangError::engine("check_call: arg index not a u64".to_string()))?
+            as usize;
         let param = funtype.get("param").cloned().unwrap_or(Value::Null);
         self.check_node(lang, ast, AstRef::new(arg_idx), &param, ctx)?;
         Ok(funtype.get("body").cloned().unwrap_or(Value::Null))
@@ -6547,14 +6541,15 @@ impl NbeTypecheckEngine {
         node: &AstNode,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let kids = children_of(node)
-            .ok_or_else(|| LangError::engine("call: no children".to_string()))?;
+        let kids =
+            children_of(node).ok_or_else(|| LangError::engine("call: no children".to_string()))?;
         if kids.len() < 2 {
             return Err(LangError::engine("call: needs callee and args".to_string()));
         }
-        let callee_idx = kids[0].as_u64().ok_or_else(|| {
-            LangError::engine("call: callee index not a u64".to_string())
-        })? as usize;
+        let callee_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("call: callee index not a u64".to_string()))?
+            as usize;
         // `perform` — the `IO<sig>` op-emission builtin (ADR-0153 §4):
         // `perform(op, arg)` synthesizes `IO{op: T}` — `op` is a *named*
         // op (a name operand, not a checked value) and `T` the arg's
@@ -6570,9 +6565,10 @@ impl NbeTypecheckEngine {
         // fills the next implicit `type.pi` as an index term.
         let is_index_app = matches!(node.kind.as_str(), "index_app" | "dimension");
         for cv in kids.iter().skip(1) {
-            let arg_idx = cv.as_u64().ok_or_else(|| {
-                LangError::engine("call: arg index not a u64".to_string())
-            })? as usize;
+            let arg_idx = cv
+                .as_u64()
+                .ok_or_else(|| LangError::engine("call: arg index not a u64".to_string()))?
+                as usize;
             let arg_ref = AstRef::new(arg_idx);
             cur = zonk_index(&cur, ctx);
             // `f<i, …>` index application (phase-2 WS-C): each argument
@@ -6604,8 +6600,7 @@ impl NbeTypecheckEngine {
             // instances is *evidence* — dictionary search runs first
             // (`implicit_pi_fill`), with the fresh-meta index fill as
             // the fallback for ordinary index binders.
-            while tag_of(&cur) == Some("type.pi")
-                && cur.get("implicit") == Some(&Value::Bool(true))
+            while tag_of(&cur) == Some("type.pi") && cur.get("implicit") == Some(&Value::Bool(true))
             {
                 let binder = cur
                     .get("binder")
@@ -6635,10 +6630,7 @@ impl NbeTypecheckEngine {
                     // domain spells `type.array{element: t}` (uniform)
                     // and still checks the argument as a whole array.
                     let domains = if tag_of(&param) == Some("type.array") {
-                        param
-                            .get("elements")
-                            .and_then(Value::as_array)
-                            .cloned()
+                        param.get("elements").and_then(Value::as_array).cloned()
                     } else {
                         None
                     };
@@ -6646,17 +6638,13 @@ impl NbeTypecheckEngine {
                         Some(domains) if !domains.is_empty() => {
                             self.check_node(lang, ast, arg_ref, &domains[0], ctx)?;
                             if domains.len() > 1 {
-                                let mut rem =
-                                    cur.as_object().cloned().unwrap_or_default();
+                                let mut rem = cur.as_object().cloned().unwrap_or_default();
                                 let mut dom = Map::new();
                                 dom.insert(
                                     "elements".to_string(),
                                     Value::Array(domains[1..].to_vec()),
                                 );
-                                rem.insert(
-                                    "param".to_string(),
-                                    make_tag(ctx, "type.array", dom),
-                                );
+                                rem.insert("param".to_string(), make_tag(ctx, "type.array", dom));
                                 Value::Object(rem)
                             } else {
                                 cur.get("body").cloned().unwrap_or(Value::Null)
@@ -6682,8 +6670,7 @@ impl NbeTypecheckEngine {
                                             "call: arg node out of bounds".to_string(),
                                         )
                                     })?;
-                                    let term =
-                                        self.node_to_index_term(lang, ast, arg_node, ctx);
+                                    let term = self.node_to_index_term(lang, ast, arg_node, ctx);
                                     if term.is_null() {
                                         body
                                     } else {
@@ -6727,7 +6714,10 @@ impl NbeTypecheckEngine {
                     let t = self.node_index_or_type(lang, ast, arg_idx, ctx)?;
                     args.push(eval_index(&t, ctx));
                     let mut m = Map::new();
-                    m.insert("name".to_string(), cur.get("name").cloned().unwrap_or(Value::Null));
+                    m.insert(
+                        "name".to_string(),
+                        cur.get("name").cloned().unwrap_or(Value::Null),
+                    );
                     m.insert("args".to_string(), Value::Array(args));
                     make_tag(ctx, "type.family_app", m)
                 }
@@ -6915,10 +6905,7 @@ impl NbeTypecheckEngine {
                     .join(", ")
             )));
         }
-        let covered: Vec<&String> = sig_obj
-            .keys()
-            .filter(|k| fields.contains_key(*k))
-            .collect();
+        let covered: Vec<&String> = sig_obj.keys().filter(|k| fields.contains_key(*k)).collect();
         if !sig_obj.is_empty() && covered.is_empty() {
             return Err(LangError::engine(format!(
                 "typecheck: handle: handler covers none of the body's declared ops ({}) — the handle is a guaranteed no-op",
@@ -6972,16 +6959,14 @@ impl NbeTypecheckEngine {
         // Re-wrap in the body's own spelling.
         let mut out = io_val.as_object().cloned().unwrap_or_default();
         if let Some(f) = out.get_mut("__former__").and_then(Value::as_object_mut) {
-            if let Some(args) = f.get_mut("args").and_then(Value::as_array_mut) {
-                if let Some(slot) = args.first_mut() {
+            if let Some(args) = f.get_mut("args").and_then(Value::as_array_mut)
+                && let Some(slot) = args.first_mut() {
                     *slot = Value::Object(out_sig);
                 }
-            }
-        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut) {
-            if let Some(slot) = indices.first_mut() {
+        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut)
+            && let Some(slot) = indices.first_mut() {
                 *slot = Value::Object(out_sig);
             }
-        }
         Ok(Value::Object(out))
     }
 }
@@ -7075,34 +7060,33 @@ impl NbeTypecheckEngine {
                 .as_u64()
                 .ok_or_else(|| LangError::engine("synth_assign: value idx".to_string()))?
                 as usize;
-            let t_node = ast.get(AstRef::new(tidx)).ok_or_else(|| {
-                LangError::engine("synth_assign: lhs out of bounds".to_string())
-            })?;
-            let n = if t_node.kind == "type-annot"
-                || role_child_ref(lang, t_node, "annot").is_some()
-            {
-                let subj = lang
-                    .child_role_index(&t_node.kind, "subject")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                children_of(t_node)
-                    .and_then(|k| k.get(subj))
-                    .and_then(Value::as_u64)
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .and_then(|s| {
-                        self.implicit_binder_head(lang, ast, s)
-                            .map(|(n, bs)| {
-                                implicit_binders = bs;
-                                n
-                            })
-                            .or_else(|| node_name(s))
-                    })
-                    .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?
-            } else {
-                node_name(t_node)
-                    .ok_or_else(|| LangError::engine("synth_assign: var name".to_string()))?
-            };
+            let t_node = ast
+                .get(AstRef::new(tidx))
+                .ok_or_else(|| LangError::engine("synth_assign: lhs out of bounds".to_string()))?;
+            let n =
+                if t_node.kind == "type-annot" || role_child_ref(lang, t_node, "annot").is_some() {
+                    let subj = lang
+                        .child_role_index(&t_node.kind, "subject")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    children_of(t_node)
+                        .and_then(|k| k.get(subj))
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(|s| {
+                            self.implicit_binder_head(lang, ast, s)
+                                .map(|(n, bs)| {
+                                    implicit_binders = bs;
+                                    n
+                                })
+                                .or_else(|| node_name(s))
+                        })
+                        .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?
+                } else {
+                    node_name(t_node)
+                        .ok_or_else(|| LangError::engine("synth_assign: var name".to_string()))?
+                };
             (n, AstRef::new(vidx), Some(AstRef::new(aidx)))
         } else {
             if children.len() < 2 {
@@ -7118,9 +7102,9 @@ impl NbeTypecheckEngine {
                 .as_u64()
                 .ok_or_else(|| LangError::engine("synth_assign: value idx".to_string()))?
                 as usize;
-            let lhs_node = ast.get(AstRef::new(lhs_idx)).ok_or_else(|| {
-                LangError::engine("synth_assign: lhs out of bounds".to_string())
-            })?;
+            let lhs_node = ast
+                .get(AstRef::new(lhs_idx))
+                .ok_or_else(|| LangError::engine("synth_assign: lhs out of bounds".to_string()))?;
             if let Some((aname, aparams)) = self.type_alias_head(ast, lhs_node) {
                 // `type.Name := T` / `type.Name(p…) := T` — a transparent
                 // type alias (ADR-0154 §3): bind a `type.alias` expansion
@@ -7128,9 +7112,12 @@ impl NbeTypecheckEngine {
                 // substitute at use sites — no former mint.
                 alias_params = Some(aparams);
                 (aname, AstRef::new(vidx), None)
-            } else if role_child_ref(lang, lhs_node, "annot").is_some() || lhs_node.kind == "type-annot" {
-                let ta = children_of(lhs_node)
-                    .ok_or_else(|| LangError::engine("synth_assign: type-annot children".to_string()))?;
+            } else if role_child_ref(lang, lhs_node, "annot").is_some()
+                || lhs_node.kind == "type-annot"
+            {
+                let ta = children_of(lhs_node).ok_or_else(|| {
+                    LangError::engine("synth_assign: type-annot children".to_string())
+                })?;
                 if ta.len() < 2 {
                     return Err(LangError::engine(
                         "synth_assign: type-annot needs 2 children".to_string(),
@@ -7211,9 +7198,7 @@ impl NbeTypecheckEngine {
                 } else {
                     pnode
                 };
-                if pinner.kind == "type-annot"
-                    || role_child_ref(lang, pinner, "annot").is_some()
-                {
+                if pinner.kind == "type-annot" || role_child_ref(lang, pinner, "annot").is_some() {
                     let subj = lang
                         .child_role_index(&pinner.kind, "subject")
                         .ok()
@@ -7231,9 +7216,7 @@ impl NbeTypecheckEngine {
                                 })
                                 .or_else(|| node_name(s))
                         })
-                        .ok_or_else(|| {
-                            LangError::engine("synth_assign: annot var".to_string())
-                        })?;
+                        .ok_or_else(|| LangError::engine("synth_assign: annot var".to_string()))?;
                     (iv, AstRef::new(vidx), Some(AstRef::new(lhs_idx)))
                 } else {
                     return Err(LangError::engine(
@@ -7298,9 +7281,7 @@ impl NbeTypecheckEngine {
                 // A term-valued annotation (e.g. `call` on a results-bound
                 // name — `inc(4)` lowers to `App{var inc, [4]}`) reduces
                 // against the bound-value env before classification.
-                Ok(a) if is_ann_term(&a) => {
-                    self.eval_ann_term(lang, ast, &a, ctx, ANN_FUEL)?
-                }
+                Ok(a) if is_ann_term(&a) => self.eval_ann_term(lang, ast, &a, ctx, ANN_FUEL)?,
                 // `type.unknown` is the *unruled-kind fallback*, not a
                 // real annotation — an ordered value annotation
                 // (`x : E := v`, ADR-0103) evaluates `E` as a term
@@ -7384,7 +7365,15 @@ impl NbeTypecheckEngine {
             ctx.extend(name.clone(), ann.clone());
             if matches!(
                 ann.get("__tag__").and_then(Value::as_str),
-                Some("type.pi" | "type.family" | "type.sigma" | "Path" | "type.forall" | "type.family_app" | "type.array")
+                Some(
+                    "type.pi"
+                        | "type.family"
+                        | "type.sigma"
+                        | "Path"
+                        | "type.forall"
+                        | "type.family_app"
+                        | "type.array"
+                )
             ) {
                 self.check_node(lang, ast, value_ref, &ann, ctx)?;
             } else if is_plain_ann_value(&ann) {
@@ -7407,9 +7396,7 @@ impl NbeTypecheckEngine {
                 // family-membership check: apply it to the value.
                 let v = self.eval_ann_node(lang, ast, value_ref.index(), ctx);
                 let applied = match v {
-                    Ok(vv) => {
-                        self.apply_ann_val(lang, ast, &ann, &[vv], ctx, ANN_FUEL)?
-                    }
+                    Ok(vv) => self.apply_ann_val(lang, ast, &ann, &[vv], ctx, ANN_FUEL)?,
                     Err(_) => Value::Null,
                 };
                 if applied == Value::Bool(false) {
@@ -7457,11 +7444,10 @@ impl NbeTypecheckEngine {
         // env ordered annotations evaluate against (the model's
         // `tc_bind_result`). `var{name}` inside a call annotation resolves
         // to this term (e.g. `inc ↦ Lam{params, body}`).
-        if let Some(vn) = ast.get(value_ref) {
-            if let Some(t) = self.node_to_ann_term(lang, ast, vn) {
+        if let Some(vn) = ast.get(value_ref)
+            && let Some(t) = self.node_to_ann_term(lang, ast, vn) {
                 ctx.bind_result(name.clone(), t);
             }
-        }
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
     }
@@ -7601,9 +7587,7 @@ fn freeze_metas(v: &Value, inst: usize, pos: &mut usize) -> Value {
                 .map(|(k, x)| (k.clone(), freeze_metas(x, inst, pos)))
                 .collect(),
         ),
-        Value::Array(xs) => {
-            Value::Array(xs.iter().map(|x| freeze_metas(x, inst, pos)).collect())
-        }
+        Value::Array(xs) => Value::Array(xs.iter().map(|x| freeze_metas(x, inst, pos)).collect()),
         _ => v.clone(),
     }
 }
@@ -7621,9 +7605,7 @@ fn guard_rigid_vars(args: &[Value]) -> Vec<Value> {
             return app_term(var_term("$rigid"), vec![v.clone()]);
         }
         match v {
-            Value::Object(m) => Value::Object(
-                m.iter().map(|(k, x)| (k.clone(), go(x))).collect(),
-            ),
+            Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), go(x))).collect()),
             Value::Array(xs) => Value::Array(xs.iter().map(go).collect()),
             _ => v.clone(),
         }
@@ -7641,13 +7623,10 @@ fn register_imported_instance(ctx: &mut TypecheckContext, name: &str, ty: &Value
     let Some((head, args)) = instance_goal_parts(ty) else {
         return;
     };
-    ctx.instances
-        .entry(head)
-        .or_default()
-        .push(InstanceEntry {
-            name: name.to_string(),
-            args,
-        });
+    ctx.instances.entry(head).or_default().push(InstanceEntry {
+        name: name.to_string(),
+        args,
+    });
 }
 
 /// Collect the `var` names in an AST subtree that bind to nothing —
@@ -7664,16 +7643,15 @@ fn collect_unbound_index_vars(
         return;
     };
     if node.kind == "var" {
-        if let Some(name) = node_name(node) {
-            if !name.is_empty()
+        if let Some(name) = node_name(node)
+            && !name.is_empty()
                 && !ctx.results.contains_key(&name)
                 && ctx.lookup(&name).is_none()
                 && !is_builtin_type_name(&name)
-                && !out.iter().any(|n| *n == name)
+                && !out.contains(&name)
             {
                 out.push(name);
             }
-        }
         return;
     }
     if let Some(kids) = children_of(node) {
@@ -7690,136 +7668,132 @@ impl NbeTypecheckEngine {
     /// `node_term_`). Returns `None` for kinds outside the evaluable
     /// fragment — the annotation then keeps the type-interpretation
     /// error path.
-    fn node_to_ann_term(
-        &self,
-        lang: &Language,
-        ast: &Ast,
-        node: &AstNode,
-    ) -> Option<Value> {
+    fn node_to_ann_term(&self, lang: &Language, ast: &Ast, node: &AstNode) -> Option<Value> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        let kids = children_of(node).cloned().unwrap_or_default();
-        let at = |i: usize| -> Option<&AstNode> {
-            kids.get(i)
-                .and_then(Value::as_u64)
-                .and_then(|j| ast.get(AstRef::new(j as usize)))
-        };
-        match node.kind.as_str() {
-            "value" | "lit" => Some(match &node.payload {
-                Value::Object(m) => m.get("value").cloned().unwrap_or(Value::Null),
-                p => p.clone(),
-            }),
-            "var" => Some(var_term(&node_name(node)?)),
-            "paren" => self.node_to_ann_term(lang, ast, at(0)?),
-            // `dimension`/`index_app` share `call`'s `[callee, args…]`
-            // layout — `inc<4>` in an ordered-value annotation evaluates
-            // exactly like `inc(4)`.
-            "call" | "index_app" | "dimension" => {
-                let callee_role = lang
-                    .child_role_index(&node.kind, "callee")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                let args_role = lang
-                    .child_role_index(&node.kind, "args")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(1);
-                let callee = self.node_to_ann_term(lang, ast, at(callee_role)?)?;
-                let mut args = Vec::new();
-                for i in args_role..kids.len() {
-                    args.push(self.node_to_ann_term(lang, ast, at(i)?)?);
+            let kids = children_of(node).cloned().unwrap_or_default();
+            let at = |i: usize| -> Option<&AstNode> {
+                kids.get(i)
+                    .and_then(Value::as_u64)
+                    .and_then(|j| ast.get(AstRef::new(j as usize)))
+            };
+            match node.kind.as_str() {
+                "value" | "lit" => Some(match &node.payload {
+                    Value::Object(m) => m.get("value").cloned().unwrap_or(Value::Null),
+                    p => p.clone(),
+                }),
+                "var" => Some(var_term(&node_name(node)?)),
+                "paren" => self.node_to_ann_term(lang, ast, at(0)?),
+                // `dimension`/`index_app` share `call`'s `[callee, args…]`
+                // layout — `inc<4>` in an ordered-value annotation evaluates
+                // exactly like `inc(4)`.
+                "call" | "index_app" | "dimension" => {
+                    let callee_role = lang
+                        .child_role_index(&node.kind, "callee")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    let args_role = lang
+                        .child_role_index(&node.kind, "args")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(1);
+                    let callee = self.node_to_ann_term(lang, ast, at(callee_role)?)?;
+                    let mut args = Vec::new();
+                    for i in args_role..kids.len() {
+                        args.push(self.node_to_ann_term(lang, ast, at(i)?)?);
+                    }
+                    Some(app_term(callee, args))
                 }
-                Some(app_term(callee, args))
-            }
-            "function" => {
-                // Rich `{params: [..], body: idx}` payload or the
-                // children [params, body] layout (roles per ADR-0081).
-                if let (Some(params), Some(body)) = (
-                    node.payload.get("params").and_then(Value::as_array),
-                    node.payload.get("body").and_then(Value::as_u64),
-                ) {
-                    let names: Vec<Value> = params.clone();
+                "function" => {
+                    // Rich `{params: [..], body: idx}` payload or the
+                    // children [params, body] layout (roles per ADR-0081).
+                    if let (Some(params), Some(body)) = (
+                        node.payload.get("params").and_then(Value::as_array),
+                        node.payload.get("body").and_then(Value::as_u64),
+                    ) {
+                        let names: Vec<Value> = params.clone();
+                        let mut m = Map::new();
+                        m.insert("__tag__".to_string(), Value::String("Lam".to_string()));
+                        m.insert("params".to_string(), Value::Array(names));
+                        m.insert("body".to_string(), Value::from(body));
+                        return Some(Value::Object(m));
+                    }
+                    let params_idx =
+                        role_child_ref(lang, node, "params").or_else(|| child_at(ast, node, 0))?;
+                    let body_idx =
+                        role_child_ref(lang, node, "body").or_else(|| child_at(ast, node, 1))?;
+                    let pnode = ast.get(params_idx)?;
+                    let (names, _rest) = lang.param_names(ast, pnode).ok()?;
                     let mut m = Map::new();
                     m.insert("__tag__".to_string(), Value::String("Lam".to_string()));
-                    m.insert("params".to_string(), Value::Array(names));
-                    m.insert("body".to_string(), Value::from(body));
-                    return Some(Value::Object(m));
-                }
-                let params_idx = role_child_ref(lang, node, "params").or_else(|| child_at(ast, node, 0))?;
-                let body_idx = role_child_ref(lang, node, "body").or_else(|| child_at(ast, node, 1))?;
-                let pnode = ast.get(params_idx)?;
-                let (names, _rest) = lang.param_names(ast, pnode).ok()?;
-                let mut m = Map::new();
-                m.insert("__tag__".to_string(), Value::String("Lam".to_string()));
-                m.insert(
-                    "params".to_string(),
-                    Value::Array(names.into_iter().map(Value::String).collect()),
-                );
-                m.insert("body".to_string(), Value::from(body_idx.index() as u64));
-                Some(Value::Object(m))
-            }
-            "if" => {
-                let cond = role_child_ref(lang, node, "condition").or_else(|| child_at(ast, node, 0))?;
-                let then = role_child_ref(lang, node, "then").or_else(|| child_at(ast, node, 1))?;
-                let els = role_child_ref(lang, node, "else").or_else(|| child_at(ast, node, 2));
-                let mut m = Map::new();
-                m.insert("__tag__".to_string(), Value::String("If".to_string()));
-                m.insert(
-                    "cond".to_string(),
-                    self.node_to_ann_term(lang, ast, ast.get(cond)?)?,
-                );
-                m.insert(
-                    "then".to_string(),
-                    self.node_to_ann_term(lang, ast, ast.get(then)?)?,
-                );
-                if let Some(e) = els.and_then(|r| ast.get(r)) {
                     m.insert(
-                        "else".to_string(),
-                        self.node_to_ann_term(lang, ast, e)?,
+                        "params".to_string(),
+                        Value::Array(names.into_iter().map(Value::String).collect()),
                     );
+                    m.insert("body".to_string(), Value::from(body_idx.index() as u64));
+                    Some(Value::Object(m))
                 }
-                Some(Value::Object(m))
-            }
-            "array" => {
-                let mut els = Vec::new();
-                for i in 0..kids.len() {
-                    els.push(self.node_to_ann_term(lang, ast, at(i)?)?);
+                "if" => {
+                    let cond = role_child_ref(lang, node, "condition")
+                        .or_else(|| child_at(ast, node, 0))?;
+                    let then =
+                        role_child_ref(lang, node, "then").or_else(|| child_at(ast, node, 1))?;
+                    let els = role_child_ref(lang, node, "else").or_else(|| child_at(ast, node, 2));
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("If".to_string()));
+                    m.insert(
+                        "cond".to_string(),
+                        self.node_to_ann_term(lang, ast, ast.get(cond)?)?,
+                    );
+                    m.insert(
+                        "then".to_string(),
+                        self.node_to_ann_term(lang, ast, ast.get(then)?)?,
+                    );
+                    if let Some(e) = els.and_then(|r| ast.get(r)) {
+                        m.insert("else".to_string(), self.node_to_ann_term(lang, ast, e)?);
+                    }
+                    Some(Value::Object(m))
                 }
-                let mut m = Map::new();
-                m.insert("__tag__".to_string(), Value::String("ArrLit".to_string()));
-                m.insert("elements".to_string(), Value::Array(els));
-                Some(Value::Object(m))
+                "array" => {
+                    let mut els = Vec::new();
+                    for i in 0..kids.len() {
+                        els.push(self.node_to_ann_term(lang, ast, at(i)?)?);
+                    }
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("ArrLit".to_string()));
+                    m.insert("elements".to_string(), Value::Array(els));
+                    Some(Value::Object(m))
+                }
+                "flow" => {
+                    let l = self.node_to_ann_term(lang, ast, at(0)?)?;
+                    let r = self.node_to_ann_term(lang, ast, at(1)?)?;
+                    let mut m = Map::new();
+                    m.insert("__tag__".to_string(), Value::String("Comp".to_string()));
+                    m.insert("l".to_string(), l);
+                    m.insert("r".to_string(), r);
+                    Some(Value::Object(m))
+                }
+                _ if node.kind.starts_with("binary.") => {
+                    let l = role_child_ref(lang, node, "left")
+                        .or_else(|| child_at(ast, node, 0))
+                        .and_then(|r| ast.get(r))
+                        .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
+                    let r = role_child_ref(lang, node, "right")
+                        .or_else(|| child_at(ast, node, 1))
+                        .and_then(|r| ast.get(r))
+                        .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
+                    Some(bin_term(&node.kind, l, r))
+                }
+                _ if node.kind.starts_with("unary.") => {
+                    let o = role_child_ref(lang, node, "operand")
+                        .or_else(|| child_at(ast, node, 0))
+                        .and_then(|r| ast.get(r))
+                        .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
+                    Some(un_term(&node.kind, o))
+                }
+                _ => None,
             }
-            "flow" => {
-                let l = self.node_to_ann_term(lang, ast, at(0)?)?;
-                let r = self.node_to_ann_term(lang, ast, at(1)?)?;
-                let mut m = Map::new();
-                m.insert("__tag__".to_string(), Value::String("Comp".to_string()));
-                m.insert("l".to_string(), l);
-                m.insert("r".to_string(), r);
-                Some(Value::Object(m))
-            }
-            _ if node.kind.starts_with("binary.") => {
-                let l = role_child_ref(lang, node, "left")
-                    .or_else(|| child_at(ast, node, 0))
-                    .and_then(|r| ast.get(r))
-                    .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
-                let r = role_child_ref(lang, node, "right")
-                    .or_else(|| child_at(ast, node, 1))
-                    .and_then(|r| ast.get(r))
-                    .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
-                Some(bin_term(&node.kind, l, r))
-            }
-            _ if node.kind.starts_with("unary.") => {
-                let o = role_child_ref(lang, node, "operand")
-                    .or_else(|| child_at(ast, node, 0))
-                    .and_then(|r| ast.get(r))
-                    .and_then(|n| self.node_to_ann_term(lang, ast, n))?;
-                Some(un_term(&node.kind, o))
-            }
-            _ => None,
-        }
         })
     }
 
@@ -7831,9 +7805,9 @@ impl NbeTypecheckEngine {
         idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
-            LangError::engine(format!("ann eval: node {idx} out of bounds"))
-        })?;
+        let node = ast
+            .get(AstRef::new(idx))
+            .ok_or_else(|| LangError::engine(format!("ann eval: node {idx} out of bounds")))?;
         let term = self.node_to_ann_term(lang, ast, node).ok_or_else(|| {
             LangError::engine(format!(
                 "ann eval: node kind '{}' is not evaluable",
@@ -7856,97 +7830,63 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        if fuel == 0 {
-            return Ok(term.clone());
-        }
-        match tag_of(term) {
-            Some("var") => {
-                let name = term.get("name").and_then(Value::as_str).unwrap_or("");
-                match ctx.results.get(name) {
-                    // A `var{n} ↦ var{n}` self-binding stays symbolic —
-                    // recursing would burn the fuel on a fixed point.
-                    Some(bound) if bound != term => {
-                        self.eval_ann_term(lang, ast, &bound.clone(), ctx, fuel - 1)
+            if fuel == 0 {
+                return Ok(term.clone());
+            }
+            match tag_of(term) {
+                Some("var") => {
+                    let name = term.get("name").and_then(Value::as_str).unwrap_or("");
+                    match ctx.results.get(name) {
+                        // A `var{n} ↦ var{n}` self-binding stays symbolic —
+                        // recursing would burn the fuel on a fixed point.
+                        Some(bound) if bound != term => {
+                            self.eval_ann_term(lang, ast, &bound.clone(), ctx, fuel - 1)
+                        }
+                        _ => Ok(term.clone()),
                     }
-                    _ => Ok(term.clone()),
                 }
-            }
-            Some("Lam") => {
-                let mut m = Map::new();
-                m.insert("__tag__".to_string(), Value::String("LamVal".to_string()));
-                m.insert(
-                    "params".to_string(),
-                    term.get("params").cloned().unwrap_or(Value::Array(vec![])),
-                );
-                m.insert(
-                    "body".to_string(),
-                    term.get("body").cloned().unwrap_or(Value::Null),
-                );
-                m.insert(
-                    "env".to_string(),
-                    Value::Object(
-                        ctx.results
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    ),
-                );
-                Ok(Value::Object(m))
-            }
-            Some("App") => {
-                let callee = self.eval_ann_term(
-                    lang,
-                    ast,
-                    &term.get("callee").cloned().unwrap_or(Value::Null),
-                    ctx,
-                    fuel - 1,
-                )?;
-                let mut args = Vec::new();
-                for a in term
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    args.push(self.eval_ann_term(lang, ast, &a, ctx, fuel - 1)?);
-                }
-                self.apply_ann_val(lang, ast, &callee, &args, ctx, fuel - 1)
-            }
-            Some("Comp") => {
-                let l = self.eval_ann_term(
-                    lang,
-                    ast,
-                    &term.get("l").cloned().unwrap_or(Value::Null),
-                    ctx,
-                    fuel - 1,
-                )?;
-                let r = self.eval_ann_term(
-                    lang,
-                    ast,
-                    &term.get("r").cloned().unwrap_or(Value::Null),
-                    ctx,
-                    fuel - 1,
-                )?;
-                if is_applicable_ann(&r) && !is_applicable_ann(&l) {
-                    self.apply_ann_val(lang, ast, &r, &[l], ctx, fuel - 1)
-                } else if is_applicable_ann(&l) && is_applicable_ann(&r) {
+                Some("Lam") => {
                     let mut m = Map::new();
-                    m.insert("__tag__".to_string(), Value::String("CompVal".to_string()));
-                    m.insert("l".to_string(), l);
-                    m.insert("r".to_string(), r);
-                    Ok(Value::Object(m))
-                } else {
-                    let mut m = Map::new();
-                    m.insert("__tag__".to_string(), Value::String("Comp".to_string()));
-                    m.insert("l".to_string(), l);
-                    m.insert("r".to_string(), r);
+                    m.insert("__tag__".to_string(), Value::String("LamVal".to_string()));
+                    m.insert(
+                        "params".to_string(),
+                        term.get("params").cloned().unwrap_or(Value::Array(vec![])),
+                    );
+                    m.insert(
+                        "body".to_string(),
+                        term.get("body").cloned().unwrap_or(Value::Null),
+                    );
+                    m.insert(
+                        "env".to_string(),
+                        Value::Object(
+                            ctx.results
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        ),
+                    );
                     Ok(Value::Object(m))
                 }
-            }
-            Some("Bin") | Some("Un") => {
-                // Evaluate subterms first (they may contain App/Lam), then
-                // fold closed arithmetic through the index evaluator.
-                let evaled = if tag_of(term) == Some("Bin") {
+                Some("App") => {
+                    let callee = self.eval_ann_term(
+                        lang,
+                        ast,
+                        &term.get("callee").cloned().unwrap_or(Value::Null),
+                        ctx,
+                        fuel - 1,
+                    )?;
+                    let mut args = Vec::new();
+                    for a in term
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        args.push(self.eval_ann_term(lang, ast, &a, ctx, fuel - 1)?);
+                    }
+                    self.apply_ann_val(lang, ast, &callee, &args, ctx, fuel - 1)
+                }
+                Some("Comp") => {
                     let l = self.eval_ann_term(
                         lang,
                         ast,
@@ -7961,111 +7901,136 @@ impl NbeTypecheckEngine {
                         ctx,
                         fuel - 1,
                     )?;
-                    bin_term(
-                        term.get("op").and_then(Value::as_str).unwrap_or(""),
-                        l,
-                        r,
-                    )
-                } else {
-                    let o = self.eval_ann_term(
+                    if is_applicable_ann(&r) && !is_applicable_ann(&l) {
+                        self.apply_ann_val(lang, ast, &r, &[l], ctx, fuel - 1)
+                    } else if is_applicable_ann(&l) && is_applicable_ann(&r) {
+                        let mut m = Map::new();
+                        m.insert("__tag__".to_string(), Value::String("CompVal".to_string()));
+                        m.insert("l".to_string(), l);
+                        m.insert("r".to_string(), r);
+                        Ok(Value::Object(m))
+                    } else {
+                        let mut m = Map::new();
+                        m.insert("__tag__".to_string(), Value::String("Comp".to_string()));
+                        m.insert("l".to_string(), l);
+                        m.insert("r".to_string(), r);
+                        Ok(Value::Object(m))
+                    }
+                }
+                Some("Bin") | Some("Un") => {
+                    // Evaluate subterms first (they may contain App/Lam), then
+                    // fold closed arithmetic through the index evaluator.
+                    let evaled = if tag_of(term) == Some("Bin") {
+                        let l = self.eval_ann_term(
+                            lang,
+                            ast,
+                            &term.get("l").cloned().unwrap_or(Value::Null),
+                            ctx,
+                            fuel - 1,
+                        )?;
+                        let r = self.eval_ann_term(
+                            lang,
+                            ast,
+                            &term.get("r").cloned().unwrap_or(Value::Null),
+                            ctx,
+                            fuel - 1,
+                        )?;
+                        bin_term(term.get("op").and_then(Value::as_str).unwrap_or(""), l, r)
+                    } else {
+                        let o = self.eval_ann_term(
+                            lang,
+                            ast,
+                            &term.get("operand").cloned().unwrap_or(Value::Null),
+                            ctx,
+                            fuel - 1,
+                        )?;
+                        un_term(term.get("op").and_then(Value::as_str).unwrap_or(""), o)
+                    };
+                    // `binary.eq`/`neq`/comparisons on plain literals fold too —
+                    // `eval_index` covers arithmetic; close the scalar fragment.
+                    if tag_of(&evaled) == Some("Bin") {
+                        let op = evaled.get("op").and_then(Value::as_str).unwrap_or("");
+                        let l = eval_index(evaled.get("l").unwrap_or(&Value::Null), ctx);
+                        let r = eval_index(evaled.get("r").unwrap_or(&Value::Null), ctx);
+                        let (ln, rn) = (num_val(&l), num_val(&r));
+                        let folded = match op {
+                            "binary.eq" if l == r || (ln.is_some() && ln == rn) => {
+                                Some(Value::Bool(true))
+                            }
+                            "binary.eq" if ln.is_some() && rn.is_some() => Some(Value::Bool(false)),
+                            "binary.neq" if ln.is_some() && rn.is_some() => {
+                                Some(Value::Bool(ln != rn))
+                            }
+                            "binary.lt" => ln.zip(rn).map(|(a, b)| Value::Bool(a < b)),
+                            "binary.lte" => ln.zip(rn).map(|(a, b)| Value::Bool(a <= b)),
+                            "binary.gt" => ln.zip(rn).map(|(a, b)| Value::Bool(a > b)),
+                            "binary.gte" => ln.zip(rn).map(|(a, b)| Value::Bool(a >= b)),
+                            "binary.and" => match (&l, &r) {
+                                (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(*a && *b)),
+                                _ => None,
+                            },
+                            "binary.or" => match (&l, &r) {
+                                (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(*a || *b)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(v) = folded {
+                            return Ok(v);
+                        }
+                    }
+                    Ok(eval_index(&evaled, ctx))
+                }
+                Some("If") => {
+                    let c = self.eval_ann_term(
                         lang,
                         ast,
-                        &term.get("operand").cloned().unwrap_or(Value::Null),
+                        &term.get("cond").cloned().unwrap_or(Value::Null),
                         ctx,
                         fuel - 1,
                     )?;
-                    un_term(
-                        term.get("op").and_then(Value::as_str).unwrap_or(""),
-                        o,
-                    )
-                };
-                // `binary.eq`/`neq`/comparisons on plain literals fold too —
-                // `eval_index` covers arithmetic; close the scalar fragment.
-                if tag_of(&evaled) == Some("Bin") {
-                    let op = evaled.get("op").and_then(Value::as_str).unwrap_or("");
-                    let l = eval_index(evaled.get("l").unwrap_or(&Value::Null), ctx);
-                    let r = eval_index(evaled.get("r").unwrap_or(&Value::Null), ctx);
-                    let (ln, rn) = (num_val(&l), num_val(&r));
-                    let folded = match op {
-                        "binary.eq" if l == r || (ln.is_some() && ln == rn) => {
-                            Some(Value::Bool(true))
-                        }
-                        "binary.eq" if ln.is_some() && rn.is_some() => {
-                            Some(Value::Bool(false))
-                        }
-                        "binary.neq" if ln.is_some() && rn.is_some() => {
-                            Some(Value::Bool(ln != rn))
-                        }
-                        "binary.lt" => ln.zip(rn).map(|(a, b)| Value::Bool(a < b)),
-                        "binary.lte" => ln.zip(rn).map(|(a, b)| Value::Bool(a <= b)),
-                        "binary.gt" => ln.zip(rn).map(|(a, b)| Value::Bool(a > b)),
-                        "binary.gte" => ln.zip(rn).map(|(a, b)| Value::Bool(a >= b)),
-                        "binary.and" => match (&l, &r) {
-                            (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(*a && *b)),
-                            _ => None,
-                        },
-                        "binary.or" => match (&l, &r) {
-                            (Value::Bool(a), Value::Bool(b)) => Some(Value::Bool(*a || *b)),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(v) = folded {
-                        return Ok(v);
+                    match c {
+                        Value::Bool(true) => self.eval_ann_term(
+                            lang,
+                            ast,
+                            &term.get("then").cloned().unwrap_or(Value::Null),
+                            ctx,
+                            fuel - 1,
+                        ),
+                        Value::Bool(false) => self.eval_ann_term(
+                            lang,
+                            ast,
+                            &term.get("else").cloned().unwrap_or(Value::Null),
+                            ctx,
+                            fuel - 1,
+                        ),
+                        _ => Ok(term.clone()),
                     }
                 }
-                Ok(eval_index(&evaled, ctx))
-            }
-            Some("If") => {
-                let c = self.eval_ann_term(
-                    lang,
-                    ast,
-                    &term.get("cond").cloned().unwrap_or(Value::Null),
-                    ctx,
-                    fuel - 1,
-                )?;
-                match c {
-                    Value::Bool(true) => self.eval_ann_term(
-                        lang,
-                        ast,
-                        &term.get("then").cloned().unwrap_or(Value::Null),
-                        ctx,
-                        fuel - 1,
-                    ),
-                    Value::Bool(false) => self.eval_ann_term(
-                        lang,
-                        ast,
-                        &term.get("else").cloned().unwrap_or(Value::Null),
-                        ctx,
-                        fuel - 1,
-                    ),
-                    _ => Ok(term.clone()),
+                Some("ArrLit") => {
+                    let mut els = Vec::new();
+                    let mut all_plain = true;
+                    for e in term
+                        .get("elements")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        let v = self.eval_ann_term(lang, ast, &e, ctx, fuel - 1)?;
+                        all_plain &= tag_of(&v).is_none();
+                        els.push(v);
+                    }
+                    if all_plain {
+                        Ok(Value::Array(els))
+                    } else {
+                        let mut m = Map::new();
+                        m.insert("__tag__".to_string(), Value::String("ArrLit".to_string()));
+                        m.insert("elements".to_string(), Value::Array(els));
+                        Ok(Value::Object(m))
+                    }
                 }
+                _ => Ok(term.clone()),
             }
-            Some("ArrLit") => {
-                let mut els = Vec::new();
-                let mut all_plain = true;
-                for e in term
-                    .get("elements")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    let v = self.eval_ann_term(lang, ast, &e, ctx, fuel - 1)?;
-                    all_plain &= tag_of(&v).is_none();
-                    els.push(v);
-                }
-                if all_plain {
-                    Ok(Value::Array(els))
-                } else {
-                    let mut m = Map::new();
-                    m.insert("__tag__".to_string(), Value::String("ArrLit".to_string()));
-                    m.insert("elements".to_string(), Value::Array(els));
-                    Ok(Value::Object(m))
-                }
-            }
-            _ => Ok(term.clone()),
-        }
         })
     }
 
@@ -8084,46 +8049,46 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-        match tag_of(f) {
-            Some("LamVal") => {
-                let params: Vec<String> = f
-                    .get("params")
-                    .and_then(Value::as_array)
-                    .map(|ps| {
-                        ps.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let body_idx = f
-                    .get("body")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| LangError::engine("LamVal: no body index".to_string()))?
-                    as usize;
-                // bound_env = captured env + params ↦ args.
-                let mut bound_env: HashMap<String, Value> = f
-                    .get("env")
-                    .and_then(Value::as_object)
-                    .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
-                for (p, a) in params.iter().zip(args.iter()) {
-                    bound_env.insert(p.clone(), a.clone());
+            match tag_of(f) {
+                Some("LamVal") => {
+                    let params: Vec<String> = f
+                        .get("params")
+                        .and_then(Value::as_array)
+                        .map(|ps| {
+                            ps.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let body_idx = f
+                        .get("body")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| LangError::engine("LamVal: no body index".to_string()))?
+                        as usize;
+                    // bound_env = captured env + params ↦ args.
+                    let mut bound_env: HashMap<String, Value> = f
+                        .get("env")
+                        .and_then(Value::as_object)
+                        .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default();
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        bound_env.insert(p.clone(), a.clone());
+                    }
+                    let old_results = ctx.results.clone();
+                    ctx.results = bound_env;
+                    let r = self.eval_ann_node(lang, ast, body_idx, ctx);
+                    ctx.results = old_results;
+                    r
                 }
-                let old_results = ctx.results.clone();
-                ctx.results = bound_env;
-                let r = self.eval_ann_node(lang, ast, body_idx, ctx);
-                ctx.results = old_results;
-                r
+                Some("CompVal") => {
+                    let l = f.get("l").cloned().unwrap_or(Value::Null);
+                    let r = f.get("r").cloned().unwrap_or(Value::Null);
+                    let inner = self.apply_ann_val(lang, ast, &l, args, ctx, fuel - 1)?;
+                    self.apply_ann_val(lang, ast, &r, &[inner], ctx, fuel - 1)
+                }
+                _ => Ok(app_term(f.clone(), args.to_vec())),
             }
-            Some("CompVal") => {
-                let l = f.get("l").cloned().unwrap_or(Value::Null);
-                let r = f.get("r").cloned().unwrap_or(Value::Null);
-                let inner = self.apply_ann_val(lang, ast, &l, args, ctx, fuel - 1)?;
-                self.apply_ann_val(lang, ast, &r, &[inner], ctx, fuel - 1)
-            }
-            _ => Ok(app_term(f.clone(), args.to_vec())),
-        }
         })
     }
 }
@@ -8168,10 +8133,7 @@ impl NbeTypecheckEngine {
             Some(list) => {
                 let mut fields = Map::new();
                 for (name, sig) in list {
-                    fields.insert(
-                        name,
-                        sig.unwrap_or_else(|| self.type_unknown(ctx)),
-                    );
+                    fields.insert(name, sig.unwrap_or_else(|| self.type_unknown(ctx)));
                 }
                 let mut payload = Map::new();
                 payload.insert("module".to_string(), Value::String(spec.to_string()));
@@ -8404,10 +8366,7 @@ impl NbeTypecheckEngine {
 /// `subject` of a `type-annot` target) — mirrors the bootstrap scope
 /// pass's `binding_target_name` (ADR-0081 roles).
 fn assign_target_name(lang: &Language, ast: &Ast, node: &AstNode) -> Option<String> {
-    let t_idx = lang
-        .child_role_index(&node.kind, "target")
-        .ok()
-        .flatten()?;
+    let t_idx = lang.child_role_index(&node.kind, "target").ok().flatten()?;
     let tref = children_of(node)
         .and_then(|c| c.get(t_idx))
         .and_then(Value::as_u64)?;
@@ -8513,10 +8472,7 @@ mod index_solver_tests {
         // Distribution: n*(m+k) → n*m + n*k.
         assert_eq!(
             eval_index(&mul(var("n"), add(var("m"), var("k"))), &c),
-            eval_index(
-                &add(mul(var("n"), var("m")), mul(var("n"), var("k"))),
-                &c
-            )
+            eval_index(&add(mul(var("n"), var("m")), mul(var("n"), var("k"))), &c)
         );
         // Constant pooling: (n + 2) + 3 → n + 5.
         assert_eq!(
@@ -8588,10 +8544,7 @@ mod index_solver_tests {
         // Linear: ?k + 3 ≡ 7 solves ?k := 4.
         c.metas.push(None);
         let k = meta_value(0);
-        assert_eq!(
-            unify_index(&add(k, num(3)), &num(7), &mut c),
-            (true, false)
-        );
+        assert_eq!(unify_index(&add(k, num(3)), &num(7), &mut c), (true, false));
         assert_eq!(c.metas[0], Some(num(4)));
         // Exact division: ?k * 3 ≡ 9 → ?k := 3; non-divisible is decided.
         c.metas.push(None);
@@ -8626,11 +8579,7 @@ mod index_solver_tests {
             IndexVerdict::Unknown
         );
         assert_eq!(
-            INDEX_SOLVER.prove(
-                &add(var("n"), var("m")),
-                &add(var("m"), var("n")),
-                &mut c
-            ),
+            INDEX_SOLVER.prove(&add(var("n"), var("m")), &add(var("m"), var("n")), &mut c),
             IndexVerdict::Proven
         );
     }
@@ -8676,10 +8625,7 @@ mod index_solver_tests {
             add(var("n"), Value::from(2.0))
         );
         assert_eq!(eval_index(&var("Zero"), &c), num(0));
-        assert_eq!(
-            eval_index(&succ(add(num(0), num(0))), &c),
-            Value::from(1.0)
-        );
+        assert_eq!(eval_index(&succ(add(num(0), num(0))), &c), Value::from(1.0));
         // unify: `Vec(Succ n) ≡ Vec(n+1)` both directions, `≡ Vec(n+2)`
         // for the nested form.
         assert_eq!(

@@ -49,13 +49,17 @@ impl handl_platform::Module for TestModule {
         vec!["flag".to_string()]
     }
     fn value(&self, name: &str) -> Option<Value> {
-        (name == "flag").then(|| Value::Bool(true))
+        (name == "flag").then_some(Value::Bool(true))
     }
 }
 
 struct Double;
 impl handl_platform::Function for Double {
-    fn call(&self, _args: &[Value], _ctx: &mut handl_platform::EvalContext) -> Result<Value, handl_platform::EvalError> {
+    fn call(
+        &self,
+        _args: &[Value],
+        _ctx: &mut handl_platform::EvalContext,
+    ) -> Result<Value, handl_platform::EvalError> {
         Ok(Value::Null)
     }
     fn as_type_signature(&self) -> Option<&dyn handl_platform::TypeSignature> {
@@ -71,8 +75,7 @@ static DOUBLE: Double = Double;
 
 fn engine() -> Box<dyn TypecheckEngine> {
     let registry = handl_plugin_module::ModuleRegistry::new().with(TestModule);
-    NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()))
-        .with_modules(Rc::new(registry))
+    NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new())).with_modules(Rc::new(registry))
 }
 
 fn tag(v: &Value) -> Option<&str> {
@@ -115,10 +118,7 @@ fn named_import_binds_field_projection() {
         .values()
         .find(|v| tag(v) == Some("type.function"))
         .cloned();
-    assert!(
-        t.is_some(),
-        "d should carry double's signature: {result:?}"
-    );
+    assert!(t.is_some(), "d should carry double's signature: {result:?}");
 }
 
 /// `from "m" import *` splices `Sig_m`'s fields into Γ and also binds the
@@ -126,7 +126,10 @@ fn named_import_binds_field_projection() {
 #[test]
 fn star_import_splices_fields() {
     let lang = canonical_lang();
-    let ast = parse(&lang, "do {\nfrom \"mymod\" import *\nx = flag\ny = mymod.double\n}");
+    let ast = parse(
+        &lang,
+        "do {\nfrom \"mymod\" import *\nx = flag\ny = mymod.double\n}",
+    );
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -142,7 +145,10 @@ fn star_import_splices_fields() {
 #[test]
 fn dynamic_import_is_unknown() {
     let lang = canonical_lang();
-    let ast = parse(&lang, "do {\nimport no_such_module_xyz\nx = no_such_module_xyz\n}");
+    let ast = parse(
+        &lang,
+        "do {\nimport no_such_module_xyz\nx = no_such_module_xyz\n}",
+    );
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -189,7 +195,10 @@ fn export_binding_records_type() {
         .get("fields")
         .and_then(Value::as_object)
         .expect("signature should carry a fields record");
-    assert_eq!(tag(fields.get("x").expect("x exported")), Some("type.number"));
+    assert_eq!(
+        tag(fields.get("x").expect("x exported")),
+        Some("type.number")
+    );
 }
 
 /// A `type.module_sig` bound in Γ projects fields through the ordinary
@@ -238,14 +247,19 @@ fn missing_sig_field_probes_module_chain() {
 #[test]
 fn resolve_dynamic_binds_unknown() {
     let lang = canonical_lang();
-    let ast = parse(&lang, "do {\nfrom \"./local/file.hnl\" import thing\nx = thing\n}");
+    let ast = parse(
+        &lang,
+        "do {\nfrom \"./local/file.hnl\" import thing\nx = thing\n}",
+    );
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
-    assert!(result
-        .node_types
-        .values()
-        .any(|v| tag(v) == Some("type.unknown")));
+    assert!(
+        result
+            .node_types
+            .values()
+            .any(|v| tag(v) == Some("type.unknown"))
+    );
 }
 
 /// Globals map smoke: the engine's own `with_global` path is untouched.

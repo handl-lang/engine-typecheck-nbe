@@ -38,9 +38,7 @@ fn check(src: &str) -> Result<hnl_engine_typecheck::TypecheckResult, String> {
         .map_err(|e| format!("parse: {e}"))?;
     let engine = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
     let req = TypecheckRequest::new(ast);
-    engine
-        .typecheck(&lang, &req)
-        .map_err(|e| e.to_string())
+    engine.typecheck(&lang, &req).map_err(|e| e.to_string())
 }
 
 fn err(src: &str) -> String {
@@ -68,7 +66,10 @@ fn ok(src: &str) -> hnl_engine_typecheck::TypecheckResult {
                 .iter()
                 .find(|d| d.severity.eq_ignore_ascii_case("error"))
             {
-                panic!("expected ok, got error diagnostic: {}\n  src: {src}", d.message);
+                panic!(
+                    "expected ok, got error diagnostic: {}\n  src: {src}",
+                    d.message
+                );
             }
             res
         }

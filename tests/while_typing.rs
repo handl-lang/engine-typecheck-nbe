@@ -30,9 +30,7 @@ fn check(src: &str) -> Result<hnl_engine_typecheck::TypecheckResult, String> {
         .map_err(|e| format!("parse: {e}"))?;
     let engine = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
     let req = TypecheckRequest::new(ast);
-    engine
-        .typecheck(&lang, &req)
-        .map_err(|e| e.to_string())
+    engine.typecheck(&lang, &req).map_err(|e| e.to_string())
 }
 
 fn err(src: &str) -> String {
@@ -108,7 +106,9 @@ fn while_body_binds_do_not_escape() {
 fn while_state_form_step_body_checked() {
     // The classic corpus shape: match on the destructured state, continue
     // with `{state: …}` or exit with `{out: …}`.
-    ok("r := while { xs: [1, 2], acc: 0 } {\n  (xs, acc) ~> match xs {\n    []: { out: acc },\n    [h, ...t]: { state: { xs: t, acc: acc + h } }\n  }\n}");
+    ok(
+        "r := while { xs: [1, 2], acc: 0 } {\n  (xs, acc) ~> match xs {\n    []: { out: acc },\n    [h, ...t]: { state: { xs: t, acc: acc + h } }\n  }\n}",
+    );
 }
 
 /// Errors inside the step body report: `n + \"s\"` mixes Number and Str.
@@ -122,7 +122,10 @@ fn while_state_form_body_error_reports() {
 #[test]
 fn while_state_form_unbound_var_reports() {
     let e = err("r := while { n: 0 } { (n) ~> { out: missing_name } }");
-    assert!(e.contains("unbound") || e.contains("missing_name"), "got: {e}");
+    assert!(
+        e.contains("unbound") || e.contains("missing_name"),
+        "got: {e}"
+    );
 }
 
 /// Single-param step receives the whole state object; `s.xs` projects a
@@ -131,4 +134,3 @@ fn while_state_form_unbound_var_reports() {
 fn while_state_single_param_gets_state() {
     ok("r := while { xs: [1], n: 0 } { s ~> if s.n > 1 { { out: s.xs } } else { { state: s } } }");
 }
-

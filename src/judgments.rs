@@ -25,8 +25,8 @@ use std::rc::Rc;
 use handl_language::{Ast, AstRef, Language};
 use handl_value::nbe::{ArrowVal, Lvl, Spine, Val};
 use handl_value::{Sym, TaggedValue};
-use hnl_engine::nbe::{EvalError, OpHandler};
 use hnl_engine::Term;
+use hnl_engine::nbe::{EvalError, OpHandler};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 
@@ -112,16 +112,14 @@ fn const_val(v: impl Into<serde_json::Value>) -> Val {
 fn decode_body(def: &TaggedValue) -> Result<Ast, EvalError> {
     handl_language::as_ast(&handl_value::tagged_to_value(def))
         .filter(|a| !a.is_empty())
-        .ok_or_else(|| {
-            EvalError::Op("apply_arrow: body_def is not a __ast__ arena".into())
-        })
+        .ok_or_else(|| EvalError::Op("apply_arrow: body_def is not a __ast__ arena".into()))
 }
 
 /// The arena index of the child at `role` (ADR-0081) — `pos` is the
 /// positional fallback when the node kind declares no roles or no
 /// language is installed.
 fn body_child(
-    ast: &Ast,
+    _ast: &Ast,
     node: &handl_language::AstNode,
     lang: Option<&Language>,
     role: &str,
@@ -497,7 +495,7 @@ fn fold_scalar(kind: &str, l: &Val, r: Option<&Val>) -> Option<Val> {
         _ => None,
     };
     let is_int = |v: &Val| matches!(v, Val::Const(TaggedValue::Int(_)));
-    if let (Some(a), Some(Some(b))) = (int(l), r.map(|r| int(r))) {
+    if let (Some(a), Some(Some(b))) = (int(l), r.map(int)) {
         let v = match kind {
             "binary.add" => Some(a + b),
             "binary.sub" => Some(a - b),
@@ -511,7 +509,7 @@ fn fold_scalar(kind: &str, l: &Val, r: Option<&Val>) -> Option<Val> {
             return Some(const_val(n));
         }
     }
-    if let (Some(a), Some(Some(b))) = (num(l), r.map(|r| num(r))) {
+    if let (Some(a), Some(Some(b))) = (num(l), r.map(&num)) {
         let v = match kind {
             "binary.eq" => Some(const_val(a == b)),
             "binary.neq" => Some(const_val(a != b)),
@@ -526,7 +524,7 @@ fn fold_scalar(kind: &str, l: &Val, r: Option<&Val>) -> Option<Val> {
             return v;
         }
     }
-    if let (Some(a), Some(Some(b))) = (bool(l), r.map(|r| bool(r))) {
+    if let (Some(a), Some(Some(b))) = (bool(l), r.map(&bool)) {
         let v = match kind {
             "binary.and" => Some(a && b),
             "binary.or" => Some(a || b),
@@ -603,10 +601,7 @@ fn apply_body_value(
             Val::Former { head, args: fargs } => {
                 let mut fargs = fargs;
                 fargs.push(arg);
-                f = Val::Former {
-                    head,
-                    args: fargs,
-                };
+                f = Val::Former { head, args: fargs };
                 continue;
             }
             other => {
@@ -648,11 +643,7 @@ fn apply_body_value(
 
 /// Read a string argument: the op `lit`, the first `args` const, or
 /// the threaded `input`.
-fn str_arg<'a>(
-    lit: Option<&'a Value>,
-    args: &'a [Val],
-    input: &'a Val,
-) -> Option<String> {
+fn str_arg<'a>(lit: Option<&'a Value>, args: &'a [Val], input: &'a Val) -> Option<String> {
     if let Some(s) = lit.and_then(Value::as_str) {
         return Some(s.to_string());
     }
@@ -706,8 +697,7 @@ impl OpHandler for JudgmentOps {
                 })
             }
             "universe" => {
-                let i = int_arg(lit, args, &input)
-                    .ok_or_else(|| err("expected a level".into()))?;
+                let i = int_arg(lit, args, &input).ok_or_else(|| err("expected a level".into()))?;
                 if i < 0 {
                     return Err(err("negative universe level".into()));
                 }
@@ -802,11 +792,7 @@ impl OpHandler for JudgmentOps {
             "quote" => {
                 let c = self.checker.borrow();
                 let v = args.first().unwrap_or(&input);
-                Ok(Val::Const(handl_value::nbe::quote(
-                    &c.metas,
-                    c.lvl(),
-                    v,
-                )))
+                Ok(Val::Const(handl_value::nbe::quote(&c.metas, c.lvl(), v)))
             }
 
             // -- pure index arithmetic (normalization = evaluation) -----------
@@ -906,11 +892,7 @@ impl OpHandler for JudgmentOps {
                     }
                     3 => (args[0].clone(), args[1].clone(), args[2].clone()),
                     4 => (args[0].clone(), args[2].clone(), args[3].clone()),
-                    _ => {
-                        return Err(err(
-                            "expected [a, b] (+lit axis) or [k, a, b]".into(),
-                        ))
-                    }
+                    _ => return Err(err("expected [a, b] (+lit axis) or [k, a, b]".into())),
                 };
                 // The boundary law is decided now (fail-fast); the
                 // composite is canonical former data — `infer` of
@@ -985,7 +967,10 @@ impl OpHandler for JudgmentOps {
                 }
                 hnl_engine::nbe::apply(&b, a, self)
             }
-            "const" => Ok(args.first().cloned().unwrap_or(Val::Const(TaggedValue::Null))),
+            "const" => Ok(args
+                .first()
+                .cloned()
+                .unwrap_or(Val::Const(TaggedValue::Null))),
 
             other => Err(EvalError::Op(format!("unknown judgment op `{other}`"))),
         }
@@ -1035,18 +1020,12 @@ mod tests {
         // `former("vec.Vec", 2, nominal("type.int"))`
         let a = jop(
             "former",
-            vec![
-                ct(2),
-                jop("nominal", vec![], Some("type.Int".into())),
-            ],
+            vec![ct(2), jop("nominal", vec![], Some("type.Int".into()))],
             Some("vec.Vec".into()),
         );
         let b = jop(
             "former",
-            vec![
-                ct(2),
-                jop("nominal", vec![], Some("type.Int".into())),
-            ],
+            vec![ct(2), jop("nominal", vec![], Some("type.Int".into()))],
             Some("vec.Vec".into()),
         );
         let va = eval(&a, Val::Const(TaggedValue::Null), &ops).unwrap();
@@ -1176,18 +1155,29 @@ mod tests {
         }
 
         // `lit{__type__}` → `Val::Universe`.
-        let v = eval_arrow_body(&arrow_with_body(serde_json::json!({"__type__": 1})), &[], None, 0)
-            .unwrap();
+        let v = eval_arrow_body(
+            &arrow_with_body(serde_json::json!({"__type__": 1})),
+            &[],
+            None,
+            0,
+        )
+        .unwrap();
         assert!(matches!(v, Val::Universe(1)));
 
         // A plain object payload is the literal itself — `Const(Obj)`,
         // not `Null`.
-        let v = eval_arrow_body(&arrow_with_body(serde_json::json!({"a": 1})), &[], None, 0).unwrap();
+        let v =
+            eval_arrow_body(&arrow_with_body(serde_json::json!({"a": 1})), &[], None, 0).unwrap();
         assert!(matches!(v, Val::Const(TaggedValue::Obj(_))));
 
         // The `{"value": …}` envelope still unwraps first.
-        let v =
-            eval_arrow_body(&arrow_with_body(serde_json::json!({"value": 7})), &[], None, 0).unwrap();
+        let v = eval_arrow_body(
+            &arrow_with_body(serde_json::json!({"value": 7})),
+            &[],
+            None,
+            0,
+        )
+        .unwrap();
         assert!(matches!(v, Val::Const(TaggedValue::Int(7))));
 
         // Scalar payloads are unchanged.

@@ -826,10 +826,7 @@ fn type_alias_expands_transparently() {
 
     let bad_tuple = parse_block(
         &lang,
-        &[
-            "type.Pair(A, B) := (A, B)",
-            "p : Pair(Nat, Bool) = (1, 2)",
-        ],
+        &["type.Pair(A, B) := (A, B)", "p : Pair(Nat, Bool) = (1, 2)"],
     );
     let result = typecheck(&lang, bad_tuple);
     assert!(
@@ -862,7 +859,9 @@ fn io_signature_subtyping() {
 
     let bad = parse_block(
         &lang,
-        &["widen : IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> ~> IO<{ puts: Str ~> Unit }> = x ~> x"],
+        &[
+            "widen : IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> ~> IO<{ puts: Str ~> Unit }> = x ~> x",
+        ],
     );
     let result = typecheck(&lang, bad);
     assert!(
@@ -1260,6 +1259,91 @@ fn sigma_destructure_wrong_payload_errors() {
     );
 }
 
+/// `exists m : S, T` — `Sigma` surface sugar, `forall`'s existential
+/// twin. In annotation position the `exists` node mints the same
+/// `type.sigma{param, body_closure}` `Sigma(S, m ~> T)` produces, so the
+/// `[witness, value]` pair intro and the `match` pair destructure work
+/// unchanged.
+#[test]
+fn exists_sugar_mints_sigma() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            // `exists` in a plain annotation — the pair intro checks
+            // against the minted `type.sigma` exactly like `Sigma(...)`.
+            "one_vec : exists m : Nat, Vec(m, Bool) = [Succ(Zero), VCons(true, VNil)]",
+            // `exists` in an arrow codomain — the `filter` shape where
+            // the output length can't be named.
+            "export single_vec<a> : a ~> exists m : Nat, Vec(m, a) = x ~> [Succ(Zero), VCons(x, VNil)]",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "exists annotations should mint type.sigma and check cleanly, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The lib-collections `filter` repro: `exists m : Nat, Vec(m, a)` as
+/// the return type, the `[m, ys]` destructure binding `m` rigidly, and
+/// the recursive repack solving `?k := var{m}` — the `Sigma(Nat, m ~>
+/// Vec(m, a))` workaround written in the sugared spelling.
+#[test]
+fn exists_sugar_filter_repro() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export filter<n, a> : (a ~> Bool) ~> Vec<n, a> ~> exists m : Nat, Vec(m, a) = f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter(f)(xs) { [m, ys]: if f(x) { [Succ(m), VCons(x, ys)] } else { [m, ys] } } }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "filter with an exists-typed result should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The `exists` sugar still rejects a genuinely wrong repack — the same
+/// decided-mismatch coverage `Sigma(...)` has (`VCons(Zero, VNil)` is
+/// `Vec(1, Nat)`, never `Vec(m + 1, a)` for rigid `m`, `a`).
+#[test]
+fn exists_sugar_wrong_payload_errors() {
+    let lang = canonical_lang();
+    let decls = [
+        "data Nat :: Zero | Succ(pred : Nat)",
+        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+    ];
+    let ast = parse_block(
+        &lang,
+        &[
+            decls[0],
+            decls[1],
+            "export bump<a> : (exists m : Nat, Vec(m, a)) ~> exists k : Nat, Vec(k, a) = s ~> match s { [m, ys]: [Succ(m), VCons(Zero, VNil)] }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "VCons(Zero, VNil) : Vec(1, Nat) against Vec(m + 1, a) should error"
+    );
+}
+
 /// `Vec(n + m)` splits: `VNil` is possible only at `n ↦ 0, m ↦ 0` and
 /// `VCons` only when `n + m ≥ 1`. The `{VNil, VCons}` match is proved
 /// exhaustive through the split tree; dropping either arm is a
@@ -1298,7 +1382,10 @@ fn match_split_tree_decides_n_plus_m_coverage() {
     let result = typecheck(&lang, missing_nil);
     let diags = diags_of(&result);
     assert!(
-        has_error(&result) && diags.iter().any(|d| d.contains("non-exhaustive") && d.contains("VNil")),
+        has_error(&result)
+            && diags
+                .iter()
+                .any(|d| d.contains("non-exhaustive") && d.contains("VNil")),
         "VCons-only on Vec(n + m) must report VNil reachable under n ↦ 0, m ↦ 0, got {diags:?}"
     );
 
@@ -1313,7 +1400,10 @@ fn match_split_tree_decides_n_plus_m_coverage() {
     let result = typecheck(&lang, missing_cons);
     let diags = diags_of(&result);
     assert!(
-        has_error(&result) && diags.iter().any(|d| d.contains("non-exhaustive") && d.contains("VCons")),
+        has_error(&result)
+            && diags
+                .iter()
+                .any(|d| d.contains("non-exhaustive") && d.contains("VCons")),
         "VNil-only on Vec(n + m) must report VCons reachable, got {diags:?}"
     );
 }
@@ -1358,7 +1448,10 @@ fn match_enum_scrutinee_requires_all_ctors_or_catchall() {
     let result = typecheck(&lang, missing);
     let diags = diags_of(&result);
     assert!(
-        has_error(&result) && diags.iter().any(|d| d.contains("non-exhaustive") && d.contains("False")),
+        has_error(&result)
+            && diags
+                .iter()
+                .any(|d| d.contains("non-exhaustive") && d.contains("False")),
         "True-only match on Bool should report `False` not covered, got {diags:?}"
     );
 
@@ -1447,10 +1540,7 @@ fn dependent_hnl_parses_and_typechecks() {
 #[test]
 fn ordered_call_annotation_checks_equality() {
     let lang = canonical_lang();
-    let good = parse_block(
-        &lang,
-        &["inc := n ~> n + 1", "f : inc(4) := 5"],
-    );
+    let good = parse_block(&lang, &["inc := n ~> n + 1", "f : inc(4) := 5"]);
     let result = typecheck(&lang, good);
     assert!(
         !has_error(&result),
@@ -1458,10 +1548,7 @@ fn ordered_call_annotation_checks_equality() {
         diags_of(&result)
     );
 
-    let bad = parse_block(
-        &lang,
-        &["inc := n ~> n + 1", "f : inc(4) := 6"],
-    );
+    let bad = parse_block(&lang, &["inc := n ~> n + 1", "f : inc(4) := 6"]);
     let result = typecheck(&lang, bad);
     assert!(
         has_error(&result),
@@ -1470,7 +1557,11 @@ fn ordered_call_annotation_checks_equality() {
 
     let nested = parse_block(
         &lang,
-        &["inc := n ~> n + 1", "dbl := n ~> n * 2", "f : dbl(inc(4)) := 10"],
+        &[
+            "inc := n ~> n + 1",
+            "dbl := n ~> n * 2",
+            "f : dbl(inc(4)) := 10",
+        ],
     );
     let result = typecheck(&lang, nested);
     assert!(
@@ -1532,10 +1623,7 @@ fn handle_missing_required_op_errors() {
         has_error(&result),
         "handler declaring a spurious op should error"
     );
-    let empty = parse_block(
-        &lang,
-        &[decls[0], "x := handle print(\"x\") with {}"],
-    );
+    let empty = parse_block(&lang, &[decls[0], "x := handle print(\"x\") with {}"]);
     let result = typecheck(&lang, empty);
     assert!(
         has_error(&result),
@@ -1619,10 +1707,7 @@ fn perform_mints_io_sig_from_op_name() {
 #[test]
 fn perform_wrong_sig_entry_errors() {
     let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &["x : IO<{ puts: Nat }> = perform(puts, \"hi\")"],
-    );
+    let ast = parse_block(&lang, &["x : IO<{ puts: Nat }> = perform(puts, \"hi\")"]);
     let result = typecheck(&lang, ast);
     assert!(
         has_error(&result),
@@ -1662,16 +1747,11 @@ fn perform_through_handle_checks_sig_coverage() {
     );
     let result = typecheck(&lang, spurious);
     assert!(
-        diags_of(&result)
-            .iter()
-            .any(|d| d.contains("never names")),
+        diags_of(&result).iter().any(|d| d.contains("never names")),
         "spurious impl should diagnose, got {:?}",
         diags_of(&result)
     );
-    let none = parse_block(
-        &lang,
-        &["z := handle perform(puts, \"hi\") with {}"],
-    );
+    let none = parse_block(&lang, &["z := handle perform(puts, \"hi\") with {}"]);
     let result = typecheck(&lang, none);
     assert!(
         diags_of(&result)
@@ -1687,10 +1767,7 @@ fn perform_through_handle_checks_sig_coverage() {
 #[test]
 fn perform_computed_op_operand_errors() {
     let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &["x := perform(1 + 2, \"hi\")"],
-    );
+    let ast = parse_block(&lang, &["x := perform(1 + 2, \"hi\")"]);
     let result = typecheck(&lang, ast);
     assert!(
         has_error(&result),
@@ -1793,7 +1870,9 @@ fn instance_missing_produces_named_error() {
     assert!(has_error(&result), "Eq Bool should be a missing instance");
     let diags = diags_of(&result);
     assert!(
-        diags.iter().any(|d| d.contains("no instance") && d.contains("Eq")),
+        diags
+            .iter()
+            .any(|d| d.contains("no instance") && d.contains("Eq")),
         "diagnostics should name the constraint, got {:?}",
         diags
     );

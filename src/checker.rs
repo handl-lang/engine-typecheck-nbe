@@ -234,7 +234,8 @@ impl Checker {
         c.declare_hom();
         c.declare_cell_formers();
         // `IO(sig)` — the typed-effect former (ADR-0153 §4).
-        c.formers.insert(type_sym("type.io").handle(), FormerSig::Io);
+        c.formers
+            .insert(type_sym("type.io").handle(), FormerSig::Io);
         c
     }
 
@@ -395,8 +396,7 @@ impl Checker {
             // `IO(⊤)`) accepts any signature; an arity-0 actual is ⊤
             // itself and only satisfies ⊤.
             (Val::Former { head: ha, args: aa }, Val::Former { head: hb, args: ab })
-                if ha.handle() == hb.handle()
-                    && ha.handle() == type_sym("type.io").handle() =>
+                if ha.handle() == hb.handle() && ha.handle() == type_sym("type.io").handle() =>
             {
                 match (aa.first(), ab.first()) {
                     (_, None) => true,
@@ -420,14 +420,13 @@ impl Checker {
         let w = self.metas.force_head_rc(wider);
         let n = self.metas.force_head_rc(narrower);
         match (w.as_val(), n.as_val()) {
-            (
-                Val::Const(TaggedValue::Obj(wm)),
-                Val::Const(TaggedValue::Obj(nm)),
-            ) => nm.iter().all(|(k, v)| {
-                wm.get(k).is_some_and(|wv| {
-                    self.conv(&Val::Const(wv.clone()), &Val::Const(v.clone()))
+            (Val::Const(TaggedValue::Obj(wm)), Val::Const(TaggedValue::Obj(nm))) => {
+                nm.iter().all(|(k, v)| {
+                    wm.get(k).is_some_and(|wv| {
+                        self.conv(&Val::Const(wv.clone()), &Val::Const(v.clone()))
+                    })
                 })
-            }),
+            }
             _ => self.conv(w.as_val(), n.as_val()),
         }
     }
@@ -579,7 +578,7 @@ impl Checker {
                 [x] => self.infer_id(None, x),
                 [k, x] => self.infer_id(Some(k), x),
                 _ => {
-                    return Err(TcError::Arity {
+                    Err(TcError::Arity {
                         former: head.name().to_string(),
                         want: 2,
                         got: args.len(),
@@ -670,14 +669,9 @@ impl Checker {
     /// `Hom(?m, ·, ·)` dimension or an open endpoint type — store,
     /// don't decide (the open-cell convention). `Err` is a decided
     /// non-cell.
-    fn cell_faces_at(
-        &mut self,
-        v: &Val,
-        vt: &Val,
-        j: u64,
-    ) -> Result<Option<(Val, Val)>, TcError> {
-        if let Val::Former { head, args } = self.metas.force_head(vt) {
-            if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+    fn cell_faces_at(&mut self, v: &Val, vt: &Val, j: u64) -> Result<Option<(Val, Val)>, TcError> {
+        if let Val::Former { head, args } = self.metas.force_head(vt)
+            && head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
                 return match self.metas.force_head(&args[0]) {
                     Val::Const(TaggedValue::Int(m)) => {
                         let Ok(m) = u64::try_from(*m) else {
@@ -707,7 +701,6 @@ impl Checker {
                     _ => Ok(None),
                 };
             }
-        }
         match self.metas.force_head(vt) {
             Val::Universe(_) | Val::Nominal(_) => Ok(Some((v.clone(), v.clone()))),
             Val::Flex { .. } | Val::Unfold { .. } => Ok(None),
@@ -735,11 +728,10 @@ impl Checker {
     /// `(s, t)`; an object (`vt` a `Universe`/nominal type) reads as a
     /// degenerate cell — `(v, v)`. `None` when `vt` is neither.
     fn cell_boundaries(&mut self, v: &Val, vt: &Val) -> Result<(Val, Val), TcError> {
-        if let Val::Former { head, args } = self.metas.force_head(vt) {
-            if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+        if let Val::Former { head, args } = self.metas.force_head(vt)
+            && head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
                 return Ok((args[1].clone(), args[2].clone()));
             }
-        }
         // Objects are degenerate cells: `a` is its own boundary.
         if matches!(
             self.metas.force_head(vt),
@@ -753,13 +745,11 @@ impl Checker {
     /// The literal dimension of a `Hom(m, ·, ·)` former application —
     /// `None` for non-`Hom` types or non-literal `m`.
     fn hom_dim(&self, vt: &Val) -> Option<u64> {
-        if let Val::Former { head, args } = self.metas.force_head(vt) {
-            if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
-                if let Val::Const(TaggedValue::Int(m)) = self.metas.force_head(&args[0]) {
+        if let Val::Former { head, args } = self.metas.force_head(vt)
+            && head.handle() == type_sym("type.hom").handle() && args.len() == 3
+                && let Val::Const(TaggedValue::Int(m)) = self.metas.force_head(&args[0]) {
                     return u64::try_from(*m).ok();
                 }
-            }
-        }
         None
     }
 
@@ -820,7 +810,7 @@ impl Checker {
             Val::Const(TaggedValue::Int(n)) => u64::try_from(*n).ok(),
             _ => None,
         };
-        let (ma, mb) = (self.hom_dim(&ta), self.hom_dim(&tb));
+        let (ma, mb) = (self.hom_dim(ta), self.hom_dim(tb));
         // Effective dimension: a cell is at least its declared `Hom`
         // level; an object is a degenerate 1-cell.
         let d = ma.into_iter().chain(mb).max().unwrap_or(1).max(1);
@@ -828,20 +818,18 @@ impl Checker {
         // faces; a lower-dimension cell (or object) promotes to the
         // degenerate `d`-cell `id` — faces are the operand itself.
         let face = |v: &Val, vt: &Val, lvl: Option<u64>| -> (Val, Val) {
-            if lvl == Some(d) {
-                if let Val::Former { args, .. } = self.metas.force_head(vt) {
+            if lvl == Some(d)
+                && let Val::Former { args, .. } = self.metas.force_head(vt) {
                     return (args[1].clone(), args[2].clone());
                 }
-            }
             (v.clone(), v.clone())
         };
-        let (sa, ta_b) = face(a, &ta, ma);
-        let (sb, tb_b) = face(b, &tb, mb);
+        let (sa, ta_b) = face(a, ta, ma);
+        let (sb, tb_b) = face(b, tb, mb);
         // Non-cell operands: `infer` gave neither a `Hom` nor a type —
         // only the unchecked regime tolerates that.
-        let cells_ok = matches!(ma, Some(_)) || self.cell_boundaries(a, &ta).is_ok();
-        let cells_ok = cells_ok
-            && (matches!(mb, Some(_)) || self.cell_boundaries(b, &tb).is_ok());
+        let cells_ok = ma.is_some() || self.cell_boundaries(a, ta).is_ok();
+        let cells_ok = cells_ok && (mb.is_some() || self.cell_boundaries(b, tb).is_ok());
         let k = match axis {
             Some(k) => k,
             // Non-literal axis: store the composite unchecked at the
@@ -862,24 +850,23 @@ impl Checker {
             if m.is_some() {
                 return None;
             }
-            if let Val::Former { head, args } = self.metas.force_head(vt) {
-                if head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
+            if let Val::Former { head, args } = self.metas.force_head(vt)
+                && head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
                     return Some(args[0].clone());
                 }
-            }
             None
         };
-        if let Some(dv) = open_dim(&ta, ma).or_else(|| open_dim(&tb, mb)) {
+        if let Some(dv) = open_dim(ta, ma).or_else(|| open_dim(tb, mb)) {
             return Ok(Val::Former {
                 head: type_sym("type.hom"),
                 args: vec![dv, sa, tb_b],
             });
         }
         if !cells_ok {
-            let bad = if self.cell_boundaries(a, &ta).is_err() && ma.is_none() {
-                self.show(&ta)
+            let bad = if self.cell_boundaries(a, ta).is_err() && ma.is_none() {
+                self.show(ta)
             } else {
-                self.show(&tb)
+                self.show(tb)
             };
             return Err(TcError::NotACell(bad));
         }
@@ -908,8 +895,8 @@ impl Checker {
             // `Hom(2, f, g) ∘ Hom(2, f', g')` pastes along the shared
             // object `tgt_0 = src_0` and gives `Hom(2, f ∘₀ f', g ∘₀
             // g')`; the composite's own (d-1)-faces compose pointwise.
-            let tk = self.cell_face_at(a, &ta, k, true)?;
-            let sk = self.cell_face_at(b, &tb, k, false)?;
+            let tk = self.cell_face_at(a, ta, k, true)?;
+            let sk = self.cell_face_at(b, tb, k, false)?;
             let (Some(tk), Some(sk)) = (tk, sk) else {
                 // Open k-faces — stuck; store the composite at the
                 // operand dimension (the honest bound).
@@ -1122,11 +1109,11 @@ impl Checker {
 pub fn subst(map: &[Val], v: &Val) -> Val {
     match v {
         Val::Rigid { lvl, spine } => {
-            let head = map
-                .get(*lvl as usize)
-                .cloned()
-                .unwrap_or_else(|| v.clone());
-            spine.0.iter().fold(head, |f, a| spine_push(f, subst(map, a)))
+            let head = map.get(*lvl as usize).cloned().unwrap_or_else(|| v.clone());
+            spine
+                .0
+                .iter()
+                .fold(head, |f, a| spine_push(f, subst(map, a)))
         }
         Val::Flex { meta, spine } => Val::Flex {
             meta: *meta,
@@ -1225,11 +1212,7 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                 // `type.universe{level}` is `Type(i)` — a domain
                 // universe, not a former application.
                 if tag.as_ref() == "type.universe" {
-                    let i = m
-                        .get("level")
-                        .and_then(|l| l.as_i64())
-                        .unwrap_or(0)
-                        .max(0) as u32;
+                    let i = m.get("level").and_then(|l| l.as_i64()).unwrap_or(0).max(0) as u32;
                     return Val::Universe(i);
                 }
                 let mut keyed: Vec<(&Rc<str>, &TaggedValue)> = m
@@ -1257,8 +1240,8 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                 // Two spellings: `{"__former__": {"sym": <sym>, "args":
                 // [...]}}` (quote's encoding) and `{"__former__": <sym>,
                 // "indices": [...]}` (0152's surface object).
-                if let TaggedValue::Obj(fm) = f {
-                    if let Some(TaggedValue::Sym(head)) = fm.get("sym") {
+                if let TaggedValue::Obj(fm) = f
+                    && let Some(TaggedValue::Sym(head)) = fm.get("sym") {
                         let args = fm
                             .get("args")
                             .or_else(|| fm.get("indices"))
@@ -1269,7 +1252,6 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                             args,
                         };
                     }
-                }
                 if let TaggedValue::Sym(head) = f {
                     let args = m
                         .get("indices")
@@ -1282,11 +1264,10 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                     };
                 }
             }
-            if let Some(t) = m.get("__type__") {
-                if let TaggedValue::Int(i) = t {
+            if let Some(t) = m.get("__type__")
+                && let TaggedValue::Int(i) = t {
                     return Val::Universe((*i).max(0) as u32);
                 }
-            }
             if let Some(TaggedValue::Int(id)) = m.get("__meta__") {
                 return Val::Flex {
                     meta: *id as MetaId,
@@ -1301,30 +1282,18 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                 );
                 match n.get("head").and_then(|h| h.as_str()) {
                     Some("rigid") => {
-                        let i = n
-                            .get("index")
-                            .and_then(|i| i.as_i64())
-                            .unwrap_or(0)
-                            .max(0) as u32;
+                        let i = n.get("index").and_then(|i| i.as_i64()).unwrap_or(0).max(0) as u32;
                         return Val::Rigid {
                             lvl: lvl.saturating_sub(i + 1),
                             spine,
                         };
                     }
                     Some("meta") => {
-                        let id = n
-                            .get("id")
-                            .and_then(|i| i.as_i64())
-                            .unwrap_or(0)
-                            .max(0) as MetaId;
+                        let id = n.get("id").and_then(|i| i.as_i64()).unwrap_or(0).max(0) as MetaId;
                         return Val::Flex { meta: id, spine };
                     }
                     Some("unfold") => {
-                        let name = n
-                            .get("name")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("_")
-                            .into();
+                        let name = n.get("name").and_then(|s| s.as_str()).unwrap_or("_").into();
                         return Val::Unfold {
                             name,
                             spine,
@@ -1382,9 +1351,7 @@ mod tests {
             .infer_pi(&Val::Nominal(int()), &Val::Nominal(int()))
             .unwrap();
         assert!(matches!(p0, Val::Universe(0)));
-        let p1 = c
-            .infer_pi(&Val::Universe(0), &Val::Nominal(int()))
-            .unwrap();
+        let p1 = c.infer_pi(&Val::Universe(0), &Val::Nominal(int())).unwrap();
         assert!(matches!(p1, Val::Universe(1)));
     }
 
@@ -1398,9 +1365,10 @@ mod tests {
             .unwrap();
         // `1 : Str` fails — `type.Str` is not a number descendant.
         let strs = Sym::seeded("type.Str");
-        assert!(c
-            .check(&Val::Const(TaggedValue::Int(1)), &Val::Nominal(strs))
-            .is_err());
+        assert!(
+            c.check(&Val::Const(TaggedValue::Int(1)), &Val::Nominal(strs))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1545,14 +1513,8 @@ mod tests {
         // Nat <: Int <: Number on the `parent` link.
         nat();
         assert!(c.subtype(&Val::Nominal(nat()), &Val::Nominal(int())));
-        assert!(c.subtype(
-            &Val::Nominal(nat()),
-            &Val::Nominal(number())
-        ));
-        assert!(!c.subtype(
-            &Val::Nominal(number()),
-            &Val::Nominal(int())
-        ));
+        assert!(c.subtype(&Val::Nominal(nat()), &Val::Nominal(number())));
+        assert!(!c.subtype(&Val::Nominal(number()), &Val::Nominal(int())));
     }
 
     #[test]
@@ -1616,10 +1578,7 @@ mod tests {
         };
         assert!(matches!(c.infer(&h2).unwrap(), Val::Universe(0)));
         // Mismatched boundaries reject: g : Hom(1, Nat, Int).
-        let z = c.bind(
-            "h",
-            f(Val::Nominal(nat()), Val::Nominal(int())),
-        );
+        let z = c.bind("h", f(Val::Nominal(nat()), Val::Nominal(int())));
         let x0 = Val::Rigid {
             lvl: 1,
             spine: Spine::default(),
@@ -1650,10 +1609,7 @@ mod tests {
                 Val::Nominal(nat()),
             ],
         };
-        assert!(matches!(
-            c.infer(&h3_bad),
-            Err(TcError::Mismatch { .. })
-        ));
+        assert!(matches!(c.infer(&h3_bad), Err(TcError::Mismatch { .. })));
         // n ≥ 4: the generic boundary law decides too (phase-3 WS-B —
         // no cap). `Hom(4, Int, Int)` is the iterated refl — endpoints
         // are objects, so their (n-2)-faces are self-pairs and
@@ -1677,10 +1633,7 @@ mod tests {
                 Val::Nominal(nat()),
             ],
         };
-        assert!(matches!(
-            c.infer(&h4),
-            Err(TcError::Mismatch { .. })
-        ));
+        assert!(matches!(c.infer(&h4), Err(TcError::Mismatch { .. })));
     }
 
     #[test]
@@ -1844,10 +1797,7 @@ mod tests {
         // boundary on a 2-cell (same law as `>>>[2]` on 1-cells).
         let e = c.bind("e", hom(2, f.clone(), g.clone()));
         let e2 = c.bind("e2", hom(2, g.clone(), f.clone()));
-        assert!(matches!(
-            c.infer(&comp(3, e, e2)),
-            Err(TcError::Dim { .. })
-        ));
+        assert!(matches!(c.infer(&comp(3, e, e2)), Err(TcError::Dim { .. })));
         // `>>>[2]` on 1-cells stays a dimension error.
         assert!(matches!(
             c.infer(&comp(2, f.clone(), g.clone())),
@@ -1871,23 +1821,21 @@ mod tests {
         assert!(c.conv(&t, &hom(2, Val::Nominal(int()), Val::Nominal(int()))));
         // And that Hom(2, Int, Int) itself now *checks* as a type —
         // the degenerate-endpoint reading; `Hom(2, Int, Nat)` rejects.
-        assert!(c.infer(&hom(2, Val::Nominal(int()), Val::Nominal(int()))).is_ok());
+        assert!(
+            c.infer(&hom(2, Val::Nominal(int()), Val::Nominal(int())))
+                .is_ok()
+        );
         nat();
-        assert!(c
-            .infer(&hom(2, Val::Nominal(int()), Val::Nominal(nat())))
-            .is_err());
+        assert!(
+            c.infer(&hom(2, Val::Nominal(int()), Val::Nominal(nat())))
+                .is_err()
+        );
         // id₁ on a 1-cell is a dimension error (id of a 1-cell is a 2-cell).
-        assert!(matches!(
-            c.infer(&idf(1, f)),
-            Err(TcError::Dim { .. })
-        ));
+        assert!(matches!(c.infer(&idf(1, f)), Err(TcError::Dim { .. })));
         // id₃ on an object: refl² — `Hom(3, Int, Int)`, itself a
         // checked type under the n = 3 boundary law.
         let t = c.infer(&idf(3, Val::Nominal(int()))).unwrap();
-        assert!(c.conv(
-            &t,
-            &hom(3, Val::Nominal(int()), Val::Nominal(int()))
-        ));
+        assert!(c.conv(&t, &hom(3, Val::Nominal(int()), Val::Nominal(int()))));
         // id₃ on a 1-cell promotes: `Hom(3, f, f)`; on a 2-cell:
         // `Hom(3, e, e)`; on a 3-cell it is a dimension error; id₄
         // stores unchecked.
@@ -1898,10 +1846,7 @@ mod tests {
         let t = c.infer(&idf(3, e.clone())).unwrap();
         assert!(c.conv(&t, &hom(3, e.clone(), e.clone())));
         let x3 = c.bind("x3", hom(3, e.clone(), e.clone()));
-        assert!(matches!(
-            c.infer(&idf(3, x3)),
-            Err(TcError::Dim { .. })
-        ));
+        assert!(matches!(c.infer(&idf(3, x3)), Err(TcError::Dim { .. })));
         let t = c.infer(&idf(4, e.clone())).unwrap();
         assert!(c.conv(&t, &hom(4, e.clone(), e.clone())));
     }
@@ -1972,7 +1917,11 @@ mod tests {
         let al2 = c.bind("al2", hom(2, f2.clone(), g2.clone()));
         let be = c.bind("be", hom(2, g1.clone(), g3.clone()));
         let be2 = c.bind("be2", hom(2, g2.clone(), g4.clone()));
-        let lhs = comp(2, comp(0, al.clone(), al2.clone()), comp(0, be.clone(), be2.clone()));
+        let lhs = comp(
+            2,
+            comp(0, al.clone(), al2.clone()),
+            comp(0, be.clone(), be2.clone()),
+        );
         let rhs = comp(0, comp(2, al, be), comp(2, al2, be2));
         // Both sides type to the same `Hom(2)` — parallel 2-cells —
         // so `Hom(3, lhs, rhs)` checks.
@@ -2052,7 +2001,11 @@ mod tests {
         // at operand dimension 3 (no cap).
         let lhs = comp(3, x.clone(), x_inv.clone());
         let tl = c.infer(&lhs).unwrap();
-        assert!(c.conv(&tl, &hom(3, p.clone(), p.clone())), "{}", c.show(&tl));
+        assert!(
+            c.conv(&tl, &hom(3, p.clone(), p.clone())),
+            "{}",
+            c.show(&tl)
+        );
         // `id_3(p) : Hom(3, p, p)` — `id_k` checked at k = 3 on 2-cells.
         let id_p = idf(3, p.clone());
         assert!(matches!(

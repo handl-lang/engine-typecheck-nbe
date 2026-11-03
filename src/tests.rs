@@ -6,11 +6,11 @@
 use super::*;
 use handl_language::fragments::{AstShapeDef, ChildRoleSpec, EvalSchemeDef, TypeRuleDef};
 use handl_language::{ArrSource, Ast, AstNode, Language, Term, Value};
-use hnl_engine::TermData;
 use handl_platform::ModuleLookup;
+use handl_plugin_module::ModuleRegistry;
+use hnl_engine::TermData;
 use hnl_engine_exec_tree_walk::TreeWalkEngine;
 use hnl_engine_typecheck::{TypecheckEngine, TypecheckRequest};
-use handl_plugin_module::ModuleRegistry;
 use serde_json::json;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -109,9 +109,10 @@ fn typecheck_no_rule_errors() {
         .typecheck(&lang, &req)
         .expect("no-rule kind degrades to type.unknown");
     assert!(
-        result.diagnostics.iter().any(|d| d
-            .message
-            .contains("no type rule for kind 'lit'")),
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("no type rule for kind 'lit'")),
         "expected no-rule warning, got {:?}",
         result.diagnostics
     );
@@ -129,7 +130,11 @@ fn typecheck_lit_synth_type_number() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -152,7 +157,11 @@ fn node_types_populated_after_typecheck() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     lang.types
@@ -219,7 +228,11 @@ fn typecheck_seq_threading() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // Rule for "wrap": synth = synth_child(0) >>> bind("t") >>> result("t")
@@ -358,7 +371,11 @@ fn typecheck_box_clone() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -382,7 +399,11 @@ fn typecheck_with_modules() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -450,7 +471,11 @@ fn typecheck_check_node_fallback() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // wrap rule: check_child(0, construct(type.number))
@@ -460,9 +485,11 @@ fn typecheck_check_node_fallback() {
             TypeRuleDef::new(
                 "type.wrap",
                 "wrap",
-                td(// synth: just return type.number (not used in this test path,
-                // but required for the rule to be valid)
-                arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+                td(
+                    // synth: just return type.number (not used in this test path,
+                    // but required for the rule to be valid)
+                    arr_judgment_lit("construct", vec![], Value::from("type.number")),
+                ),
             )
             .with_check(td(arr_judgment_lit(
                 "check_child",
@@ -498,7 +525,11 @@ fn typecheck_with_registry_id() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -841,7 +872,11 @@ fn typecheck_eval_child_delegates_to_eval() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // wrap type rule: synth = eval_child(0) >>> construct(type.string)
@@ -974,7 +1009,11 @@ fn eval_child_pure_succeeds() {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // wrap type rule: synth = eval_child(0) >>> construct(type.string)
@@ -1223,7 +1262,11 @@ fn payload_field_extracts_name() {
         .merge(TypeRuleDef::new(
             "type.test",
             "test",
-            td(arr_judgment_lit("payload_field", vec![], Value::from("name"))),
+            td(arr_judgment_lit(
+                "payload_field",
+                vec![],
+                Value::from("name"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -1378,11 +1421,7 @@ fn let_rule_extends_gamma_and_synths_body() {
                         TermData::seq(
                             arr_judgment(
                                 "extend",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("vartype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("vartype"))],
                             ),
                             arr_judgment_lit("synth_child", vec![], Value::from(1u64)),
                         ),
@@ -1845,22 +1884,14 @@ fn call_rule_returns_body_type() {
                             "check_child",
                             vec![arr_judgment_lit(
                                 "type_field",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("funtype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                                 Value::from("param"),
                             )],
                             Value::from(1u64),
                         ),
                         arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("funtype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                             Value::from("body"),
                         ),
                     ),
@@ -1977,7 +2008,11 @@ fn check_json_value_matches_number() {
             TypeRuleDef::new(
                 "type.value",
                 "value",
-                td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+                td(arr_judgment_lit(
+                    "construct",
+                    vec![],
+                    Value::from("type.number"),
+                )),
             )
             .with_check(td(arr_judgment("check_json_value", vec![]))),
         )
@@ -2028,7 +2063,11 @@ fn check_json_value_mismatch() {
             TypeRuleDef::new(
                 "type.value",
                 "value",
-                td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+                td(arr_judgment_lit(
+                    "construct",
+                    vec![],
+                    Value::from("type.number"),
+                )),
             )
             .with_check(td(arr_judgment("check_json_value", vec![]))),
         )
@@ -2079,7 +2118,11 @@ fn check_json_value_matches_string() {
             TypeRuleDef::new(
                 "type.value",
                 "value",
-                td(arr_judgment_lit("construct", vec![], Value::from("type.string"))),
+                td(arr_judgment_lit(
+                    "construct",
+                    vec![],
+                    Value::from("type.string"),
+                )),
             )
             .with_check(td(arr_judgment("check_json_value", vec![]))),
         )
@@ -2266,58 +2309,60 @@ fn check_if_rule_checks_both_branches() {
             TypeRuleDef::new(
                 "type.if",
                 "if",
-                td(// synth: synth_child(0) >>> bind("tcond")
-                //   >>> unify(result("tcond"), construct(type.bool))
-                //   >>> synth_child(1) >>> bind("tthen")
-                //   >>> unify(result("tthen"), synth_child(2))
-                //   >>> result("tthen")
-                TermData::seq(
-                    arr_judgment_lit("synth_child", vec![], Value::from(0u64)),
+                td(
+                    // synth: synth_child(0) >>> bind("tcond")
+                    //   >>> unify(result("tcond"), construct(type.bool))
+                    //   >>> synth_child(1) >>> bind("tthen")
+                    //   >>> unify(result("tthen"), synth_child(2))
+                    //   >>> result("tthen")
                     TermData::seq(
-                        arr_judgment_lit("bind", vec![], Value::from("tcond")),
+                        arr_judgment_lit("synth_child", vec![], Value::from(0u64)),
                         TermData::seq(
-                            arr_judgment(
-                                "unify",
-                                vec![
-                                    arr_judgment_lit("result", vec![], Value::from("tcond")),
-                                    arr_judgment_lit(
-                                        "construct",
-                                        vec![],
-                                        Value::from("type.bool"),
-                                    ),
-                                ],
-                            ),
+                            arr_judgment_lit("bind", vec![], Value::from("tcond")),
                             TermData::seq(
-                                arr_judgment_lit("synth_child", vec![], Value::from(1u64)),
-                                TermData::seq(
-                                    arr_judgment_lit("bind", vec![], Value::from("tthen")),
-                                    TermData::seq(
-                                        arr_judgment(
-                                            "unify",
-                                            vec![
-                                                arr_judgment_lit(
-                                                    "result",
-                                                    vec![],
-                                                    Value::from("tthen"),
-                                                ),
-                                                arr_judgment_lit(
-                                                    "synth_child",
-                                                    vec![],
-                                                    Value::from(2u64),
-                                                ),
-                                            ],
-                                        ),
+                                arr_judgment(
+                                    "unify",
+                                    vec![
+                                        arr_judgment_lit("result", vec![], Value::from("tcond")),
                                         arr_judgment_lit(
-                                            "result",
+                                            "construct",
                                             vec![],
-                                            Value::from("tthen"),
+                                            Value::from("type.bool"),
+                                        ),
+                                    ],
+                                ),
+                                TermData::seq(
+                                    arr_judgment_lit("synth_child", vec![], Value::from(1u64)),
+                                    TermData::seq(
+                                        arr_judgment_lit("bind", vec![], Value::from("tthen")),
+                                        TermData::seq(
+                                            arr_judgment(
+                                                "unify",
+                                                vec![
+                                                    arr_judgment_lit(
+                                                        "result",
+                                                        vec![],
+                                                        Value::from("tthen"),
+                                                    ),
+                                                    arr_judgment_lit(
+                                                        "synth_child",
+                                                        vec![],
+                                                        Value::from(2u64),
+                                                    ),
+                                                ],
+                                            ),
+                                            arr_judgment_lit(
+                                                "result",
+                                                vec![],
+                                                Value::from("tthen"),
+                                            ),
                                         ),
                                     ),
                                 ),
                             ),
                         ),
                     ),
-                )),
+                ),
             )
             .with_check(td(TermData::seq(
                 arr_judgment_lit("bind", vec![], Value::from("expected")),
@@ -2334,20 +2379,12 @@ fn check_if_rule_checks_both_branches() {
                     TermData::seq(
                         arr_judgment_lit(
                             "check_child",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from(1u64),
                         ),
                         arr_judgment_lit(
                             "check_child",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from(2u64),
                         ),
                     ),
@@ -2453,7 +2490,11 @@ fn template_rule_returns_type_string() {
         .merge(TypeRuleDef::new(
             "type.template",
             "template",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.string"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.string"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -2476,7 +2517,11 @@ fn assign_rule_returns_type_unit() {
         .merge(TypeRuleDef::new(
             "type.assign",
             "assign",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.unit"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.unit"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -2499,7 +2544,11 @@ fn loop_rule_returns_type_unit() {
         .merge(TypeRuleDef::new(
             "type.loop",
             "loop",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.unit"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.unit"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -2590,22 +2639,14 @@ fn pipe_rule_returns_body_type() {
                             "check_child",
                             vec![arr_judgment_lit(
                                 "type_field",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("funtype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                                 Value::from("param"),
                             )],
                             Value::from(0u64),
                         ),
                         arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("funtype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                             Value::from("body"),
                         ),
                     ),
@@ -3529,8 +3570,12 @@ fn check_unary_neg_against_number_succeeds() {
     merge_value_rule(&mut lang);
     lang.types
         .merge(
-            TypeRuleDef::new("type.unary.neg", "unary.neg", td(unary_synth("type.number")))
-                .with_check(td(unary_check("type.number"))),
+            TypeRuleDef::new(
+                "type.unary.neg",
+                "unary.neg",
+                td(unary_synth("type.number")),
+            )
+            .with_check(td(unary_check("type.number"))),
         )
         .unwrap();
     merge_wrapper_rule(&mut lang, "type.number");
@@ -3651,22 +3696,14 @@ fn flow_rule_returns_body_type() {
                             "check_child",
                             vec![arr_judgment_lit(
                                 "type_field",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("funtype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                                 Value::from("param"),
                             )],
                             Value::from(0u64),
                         ),
                         arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("funtype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                             Value::from("body"),
                         ),
                     ),
@@ -3769,22 +3806,14 @@ fn mood_int_rule_returns_body_type() {
                             "check_child",
                             vec![arr_judgment_lit(
                                 "type_field",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("funtype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                                 Value::from("param"),
                             )],
                             Value::from(0u64),
                         ),
                         arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("funtype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                             Value::from("body"),
                         ),
                     ),
@@ -4127,11 +4156,7 @@ fn check_function_rule_checks_both_children() {
                         "check_child",
                         vec![arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from("param"),
                         )],
                         Value::from(0u64),
@@ -4140,11 +4165,7 @@ fn check_function_rule_checks_both_children() {
                         "check_child",
                         vec![arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from("body"),
                         )],
                         Value::from(1u64),
@@ -4262,11 +4283,7 @@ fn check_function_rule_fails_on_param_mismatch() {
                         "check_child",
                         vec![arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from("param"),
                         )],
                         Value::from(0u64),
@@ -4275,11 +4292,7 @@ fn check_function_rule_fails_on_param_mismatch() {
                         "check_child",
                         vec![arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from("body"),
                         )],
                         Value::from(1u64),
@@ -4385,11 +4398,7 @@ fn array_check_lang() -> Language {
                     "check_all_children",
                     vec![arr_judgment(
                         "array_element_type",
-                        vec![arr_judgment_lit(
-                            "result",
-                            vec![],
-                            Value::from("expected"),
-                        )],
+                        vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                     )],
                 ),
             ))),
@@ -4460,11 +4469,7 @@ fn check_all_children_checks_all_elements() {
             td(TermData::seq(
                 arr_judgment_lit(
                     "check_child",
-                    vec![arr_native_lit(
-                        "const",
-                        vec![],
-                        type_array(type_number()),
-                    )],
+                    vec![arr_native_lit("const", vec![], type_array(type_number()))],
                     Value::from(0u64),
                 ),
                 arr_judgment_lit("construct", vec![], Value::from("type.string")),
@@ -4499,11 +4504,7 @@ fn check_all_children_fails_on_mismatch() {
             td(TermData::seq(
                 arr_judgment_lit(
                     "check_child",
-                    vec![arr_native_lit(
-                        "const",
-                        vec![],
-                        type_array(type_string()),
-                    )],
+                    vec![arr_native_lit("const", vec![], type_array(type_string()))],
                     Value::from(0u64),
                 ),
                 arr_judgment_lit("construct", vec![], Value::from("type.string")),
@@ -4546,11 +4547,7 @@ fn check_array_rule_against_matching_array_type() {
             td(TermData::seq(
                 arr_judgment_lit(
                     "check_child",
-                    vec![arr_native_lit(
-                        "const",
-                        vec![],
-                        type_array(type_number()),
-                    )],
+                    vec![arr_native_lit("const", vec![], type_array(type_number()))],
                     Value::from(0u64),
                 ),
                 arr_judgment_lit("construct", vec![], Value::from("type.unit")),
@@ -4590,11 +4587,7 @@ fn check_array_rule_fails_on_element_mismatch() {
             td(TermData::seq(
                 arr_judgment_lit(
                     "check_child",
-                    vec![arr_native_lit(
-                        "const",
-                        vec![],
-                        type_array(type_number()),
-                    )],
+                    vec![arr_native_lit("const", vec![], type_array(type_number()))],
                     Value::from(0u64),
                 ),
                 arr_judgment_lit("construct", vec![], Value::from("type.string")),
@@ -4894,11 +4887,7 @@ fn merge_pi_rule(lang: &mut Language) {
                 "pi",
                 td(arr_judgment_lit(
                     "construct_pi",
-                    vec![arr_judgment_lit(
-                        "synth_child",
-                        vec![],
-                        Value::from(0u64),
-                    )],
+                    vec![arr_judgment_lit("synth_child", vec![], Value::from(0u64))],
                     Value::from("x"),
                 )),
             )
@@ -4909,22 +4898,14 @@ fn merge_pi_rule(lang: &mut Language) {
                         "check_child",
                         vec![arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("expected"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                             Value::from("param"),
                         )],
                         Value::from(0u64),
                     ),
                     arr_judgment_lit(
                         "check_pi_body",
-                        vec![arr_judgment_lit(
-                            "result",
-                            vec![],
-                            Value::from("expected"),
-                        )],
+                        vec![arr_judgment_lit("result", vec![], Value::from("expected"))],
                         Value::Null,
                     ),
                 ),
@@ -4941,11 +4922,7 @@ fn merge_sigma_rule(lang: &mut Language) {
             "sigma",
             td(arr_judgment_lit(
                 "construct_sigma",
-                vec![arr_judgment_lit(
-                    "synth_child",
-                    vec![],
-                    Value::from(0u64),
-                )],
+                vec![arr_judgment_lit("synth_child", vec![], Value::from(0u64))],
                 Value::from("x"),
             )),
         ))
@@ -4960,11 +4937,7 @@ fn merge_forall_rule(lang: &mut Language) {
             "forall",
             td(arr_judgment_lit(
                 "construct_forall",
-                vec![arr_judgment_lit(
-                    "synth_child",
-                    vec![],
-                    Value::from(0u64),
-                )],
+                vec![arr_judgment_lit("synth_child", vec![], Value::from(0u64))],
                 Value::from("x"),
             )),
         ))
@@ -4979,11 +4952,7 @@ fn merge_vau_rule(lang: &mut Language) {
             "vau",
             td(arr_judgment_lit(
                 "construct_vau_type",
-                vec![arr_judgment_lit(
-                    "synth_child",
-                    vec![],
-                    Value::from(0u64),
-                )],
+                vec![arr_judgment_lit("synth_child", vec![], Value::from(0u64))],
                 Value::from("x"),
             )),
         ))
@@ -5189,11 +5158,7 @@ fn unify_pi_succeeds_on_matching_types() {
                                     ],
                                     Value::Null,
                                 ),
-                                arr_judgment_lit(
-                                    "construct",
-                                    vec![],
-                                    Value::from("type.string"),
-                                ),
+                                arr_judgment_lit("construct", vec![], Value::from("type.string")),
                             ),
                         ),
                     ),
@@ -5249,11 +5214,7 @@ fn unify_pi_fails_on_mismatched_params() {
                                     ],
                                     Value::Null,
                                 ),
-                                arr_judgment_lit(
-                                    "construct",
-                                    vec![],
-                                    Value::from("type.string"),
-                                ),
+                                arr_judgment_lit("construct", vec![], Value::from("type.string")),
                             ),
                         ),
                     ),
@@ -5316,11 +5277,7 @@ fn unify_skips_body_closure_for_pi() {
                                     ],
                                     Value::Null,
                                 ),
-                                arr_judgment_lit(
-                                    "construct",
-                                    vec![],
-                                    Value::from("type.string"),
-                                ),
+                                arr_judgment_lit("construct", vec![], Value::from("type.string")),
                             ),
                         ),
                     ),
@@ -5372,11 +5329,7 @@ fn context_mark_restore_works() {
                             "pi_apply",
                             vec![
                                 arr_judgment_lit("result", vec![], Value::from("pitype")),
-                                arr_judgment_lit(
-                                    "construct",
-                                    vec![],
-                                    Value::from("type.number"),
-                                ),
+                                arr_judgment_lit("construct", vec![], Value::from("type.number")),
                             ],
                             Value::Null,
                         ),
@@ -5429,11 +5382,7 @@ fn check_pi_body_succeeds() {
                     TermData::seq(
                         arr_judgment_lit(
                             "check_child",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("pitype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("pitype"))],
                             Value::from(1u64),
                         ),
                         arr_judgment_lit("construct", vec![], Value::from("type.string")),
@@ -5480,11 +5429,7 @@ fn check_pi_body_fails_on_mismatched_body() {
                     TermData::seq(
                         arr_judgment_lit(
                             "check_child",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("pitype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("pitype"))],
                             Value::from(1u64),
                         ),
                         arr_judgment_lit("construct", vec![], Value::from("type.string")),
@@ -6439,7 +6384,11 @@ fn construct_universe_creates_type_universe() {
         .merge(TypeRuleDef::new(
             "type.test",
             "test",
-            td(arr_judgment_lit("construct_universe", vec![], Value::from(0u64))),
+            td(arr_judgment_lit(
+                "construct_universe",
+                vec![],
+                Value::from(0u64),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -6463,7 +6412,11 @@ fn construct_universe_with_level() {
         .merge(TypeRuleDef::new(
             "type.test",
             "test",
-            td(arr_judgment_lit("construct_universe", vec![], Value::from(3u64))),
+            td(arr_judgment_lit(
+                "construct_universe",
+                vec![],
+                Value::from(3u64),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -7103,7 +7056,11 @@ fn construct_collection_creates_type_collection() {
         .merge(TypeRuleDef::new(
             "type.test",
             "test",
-            td(arr_judgment_lit("construct_collection", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct_collection",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -7211,10 +7168,7 @@ fn check_refl_succeeds_when_sides_equal() {
             "type.test",
             "test",
             td(TermData::seq(
-                arr_judgment(
-                    "check_refl",
-                    vec![arr_native_lit("const", vec![], eq_type)],
-                ),
+                arr_judgment("check_refl", vec![arr_native_lit("const", vec![], eq_type)]),
                 arr_judgment_lit("construct", vec![], Value::from("type.number")),
             )),
         ))
@@ -8126,22 +8080,14 @@ fn row_poly_function_call_subsumption() {
                             "check_child",
                             vec![arr_judgment_lit(
                                 "type_field",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("funtype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                                 Value::from("param"),
                             )],
                             Value::from(1u64),
                         ),
                         arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("funtype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                             Value::from("body"),
                         ),
                     ),
@@ -8214,22 +8160,14 @@ fn row_poly_function_call_closed_rejects_extra() {
                             "check_child",
                             vec![arr_judgment_lit(
                                 "type_field",
-                                vec![arr_judgment_lit(
-                                    "result",
-                                    vec![],
-                                    Value::from("funtype"),
-                                )],
+                                vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                                 Value::from("param"),
                             )],
                             Value::from(1u64),
                         ),
                         arr_judgment_lit(
                             "type_field",
-                            vec![arr_judgment_lit(
-                                "result",
-                                vec![],
-                                Value::from("funtype"),
-                            )],
+                            vec![arr_judgment_lit("result", vec![], Value::from("funtype"))],
                             Value::from("body"),
                         ),
                     ),
@@ -8378,11 +8316,7 @@ fn rec_test_lang() -> Language {
                             "unify",
                             vec![
                                 arr_judgment_lit("result", vec![], Value::from("tcond")),
-                                arr_judgment_lit(
-                                    "construct",
-                                    vec![],
-                                    Value::from("type.bool"),
-                                ),
+                                arr_judgment_lit("construct", vec![], Value::from("type.bool")),
                             ],
                         ),
                         TermData::seq(
@@ -8441,11 +8375,7 @@ fn rec_test_lang() -> Language {
                                 arr_judgment(
                                     "unify",
                                     vec![
-                                        arr_judgment_lit(
-                                            "synth_child",
-                                            vec![],
-                                            Value::from(1u64),
-                                        ),
+                                        arr_judgment_lit("synth_child", vec![], Value::from(1u64)),
                                         arr_judgment_lit(
                                             "construct",
                                             vec![],
@@ -8453,11 +8383,7 @@ fn rec_test_lang() -> Language {
                                         ),
                                     ],
                                 ),
-                                arr_judgment_lit(
-                                    "construct",
-                                    vec![],
-                                    Value::from("type.number"),
-                                ),
+                                arr_judgment_lit("construct", vec![], Value::from("type.number")),
                             ),
                         ),
                     ),
@@ -8481,11 +8407,7 @@ fn rec_test_lang() -> Language {
                                 "unify",
                                 vec![
                                     arr_judgment_lit("result", vec![], Value::from("a")),
-                                    arr_judgment_lit(
-                                        "synth_child",
-                                        vec![],
-                                        Value::from(1u64),
-                                    ),
+                                    arr_judgment_lit("synth_child", vec![], Value::from(1u64)),
                                 ],
                             ),
                             arr_judgment_lit("construct", vec![], Value::from("type.bool")),
@@ -9204,11 +9126,7 @@ fn predicate_lang() -> Language {
             "call",
             td(TermData::app(
                 arr_native_lit("proj_child", vec![], Value::from(0u64)),
-                vec![arr_native_lit(
-                    "proj_child",
-                    vec![],
-                    Value::from(1u64),
-                )],
+                vec![arr_native_lit("proj_child", vec![], Value::from(1u64))],
             )),
         ))
         .unwrap();
@@ -9247,7 +9165,11 @@ fn predicate_lang() -> Language {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // var → lookup from Γ
@@ -9271,7 +9193,11 @@ fn predicate_lang() -> Language {
         .merge(TypeRuleDef::new(
             "type.binary.mod",
             "binary.mod",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // binary.eq → type.bool
@@ -9279,7 +9205,11 @@ fn predicate_lang() -> Language {
         .merge(TypeRuleDef::new(
             "type.binary.eq",
             "binary.eq",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.bool"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.bool"),
+            )),
         ))
         .unwrap();
     // type-annot → synth_type_annot
@@ -9494,7 +9424,11 @@ fn foreign_type_looks_up_signature_from_module_registry() {
         .merge(TypeRuleDef::new(
             "type.ffi_call",
             "ffi_call",
-            td(arr_judgment_lit("foreign_type", vec![], Value::from("ffi.puts"))),
+            td(arr_judgment_lit(
+                "foreign_type",
+                vec![],
+                Value::from("ffi.puts"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -9519,7 +9453,11 @@ fn foreign_type_errors_when_op_has_no_signature() {
         .merge(TypeRuleDef::new(
             "type.ffi_call",
             "ffi_call",
-            td(arr_judgment_lit("foreign_type", vec![], Value::from("ffi.plain"))),
+            td(arr_judgment_lit(
+                "foreign_type",
+                vec![],
+                Value::from("ffi.plain"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -9579,7 +9517,11 @@ fn foreign_type_errors_without_module_registry() {
         .merge(TypeRuleDef::new(
             "type.ffi_call",
             "ffi_call",
-            td(arr_judgment_lit("foreign_type", vec![], Value::from("ffi.puts"))),
+            td(arr_judgment_lit(
+                "foreign_type",
+                vec![],
+                Value::from("ffi.puts"),
+            )),
         ))
         .unwrap();
     let mut ast = Ast::new();
@@ -9898,7 +9840,12 @@ fn b2_parametric_predicate_call_disproved() {
     let ast = divisible_by_call_ast(7);
     let proof =
         engine.check_predicate_symbolic(&lang, &ast, AstRef::new(8), AstRef::new(9), 100_000);
-    assert_eq!(proof.verdict, Verdict::Disproved, "reason: {}", proof.reason);
+    assert_eq!(
+        proof.verdict,
+        Verdict::Disproved,
+        "reason: {}",
+        proof.reason
+    );
 }
 
 #[test]
@@ -10236,7 +10183,11 @@ fn b1_b2_fallback_b1_blocked_b2_proven() {
         .merge(TypeRuleDef::new(
             "type.binary.neq",
             "binary.neq",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.bool"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.bool"),
+            )),
         ))
         .unwrap();
 
@@ -10593,7 +10544,11 @@ fn meta_predicate_lang() -> Language {
         .merge(TypeRuleDef::new(
             "type.lit",
             "lit",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // var → lookup from Γ
@@ -10617,7 +10572,11 @@ fn meta_predicate_lang() -> Language {
         .merge(TypeRuleDef::new(
             "type.binary.add",
             "binary.add",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.number"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.number"),
+            )),
         ))
         .unwrap();
     // type-annot → synth_type_annot
@@ -10633,7 +10592,11 @@ fn meta_predicate_lang() -> Language {
         .merge(TypeRuleDef::new(
             "type.assign",
             "assign",
-            td(arr_judgment_lit("construct", vec![], Value::from("type.unit"))),
+            td(arr_judgment_lit(
+                "construct",
+                vec![],
+                Value::from("type.unit"),
+            )),
         ))
         .unwrap();
 
@@ -11156,8 +11119,6 @@ fn marshalable_predicate_for_each_ffi_type() {
 // Frontier Term variants
 // ---------------------------------------------------------------------------
 
-
-
 #[test]
 fn type_cobind_runs_body() {
     let engine = engine();
@@ -11190,8 +11151,6 @@ fn type_cobind_runs_body() {
         })
     );
 }
-
-
 
 #[test]
 fn cobind_adds_coeffect() {
@@ -11376,7 +11335,10 @@ fn veval_normalizes_indices() {
         vec![
             arr_judgment(
                 "add",
-                vec![TermData::const_value(json!(1)), TermData::const_value(json!(1))],
+                vec![
+                    TermData::const_value(json!(1)),
+                    TermData::const_value(json!(1)),
+                ],
             ),
             int(),
         ],
@@ -11387,10 +11349,7 @@ fn veval_normalizes_indices() {
         vec![TermData::const_value(json!(2)), int()],
         json!("vec.Vec"),
     );
-    let scheme = Term::arr_judgment(
-        "veval",
-        vec![td(arr_judgment("unify", vec![vec_a, vec_b]))],
-    );
+    let scheme = Term::arr_judgment("veval", vec![td(arr_judgment("unify", vec![vec_a, vec_b]))]);
     assert_eq!(vscheme(scheme), json!(true));
 }
 
@@ -11414,7 +11373,10 @@ fn vbind_vlookup_roundtrip() {
 fn vinfer_literal_mints_constrained_meta() {
     // `vinfer(42)` — a numeric literal synthesizes a constrained meta
     // (ADR-0154 §5), quoted as a `__neutral__` meta.
-    let scheme = td(arr_judgment("vinfer", vec![TermData::const_value(json!(42))]));
+    let scheme = td(arr_judgment(
+        "vinfer",
+        vec![TermData::const_value(json!(42))],
+    ));
     let result = vscheme(scheme);
     assert_eq!(result["__neutral__"]["head"], json!("meta"));
 }

@@ -92,13 +92,13 @@ use std::rc::Rc;
 use handl_language::{
     ArrSource, Ast, AstNode, AstRef, LangError, Language, Proof, Term, Value, Verdict,
 };
+use handl_plugin_lib_tag::TypeRegistry;
+use handl_value::{TaggedValue, nbe::Val};
+use hnl_engine::TermData;
 use hnl_engine_exec::{EvalEngine, EvalRequest};
 use hnl_engine_typecheck::{
     TypecheckDiagnostic, TypecheckEngine, TypecheckRequest, TypecheckResult,
 };
-use handl_plugin_lib_tag::TypeRegistry;
-use handl_value::{TaggedValue, nbe::Val};
-use hnl_engine::TermData;
 
 pub mod checker;
 mod dependent;
@@ -246,50 +246,50 @@ impl NbeTypecheckEngine {
         use serde_json::json;
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        match val {
-            Value::Null => self
-                .registry
-                .construct("type.null", &Value::Null)
-                .unwrap_or(Value::Null),
-            Value::Bool(_) => self
-                .registry
-                .construct("type.bool", &Value::Null)
-                .unwrap_or(Value::Null),
-            Value::Number(_) => self
-                .registry
-                .construct("type.number", &Value::Null)
-                .unwrap_or(Value::Null),
-            Value::String(s) => self
-                .modules
-                .as_ref()
-                .and_then(|m| m.lookup_type_signature(s))
-                .or_else(|| self.registry.construct("type.string", &Value::Null))
-                .unwrap_or_else(|| Value::String(s.clone())),
-            Value::Array(_) => self
-                .registry
-                .construct(
-                    "type.array",
-                    &json!({"element": self.value_to_type(&Value::Null)}),
-                )
-                .unwrap_or(Value::Null),
-            Value::Object(o) => {
-                // Tagged engine/runtime values (e.g. `self`) are not record
-                // types; treat them as unknown.
-                if o.keys().any(|k| k.starts_with("__")) {
-                    self.registry
-                        .construct("type.unknown", &Value::Null)
-                        .unwrap_or(Value::Null)
-                } else {
-                    let fields: serde_json::Map<String, Value> = o
-                        .iter()
-                        .map(|(k, v)| (k.clone(), self.value_to_type(v)))
-                        .collect();
-                    self.registry
-                        .construct("type.record", &json!({"fields": fields}))
-                        .unwrap_or(Value::Null)
+            match val {
+                Value::Null => self
+                    .registry
+                    .construct("type.null", &Value::Null)
+                    .unwrap_or(Value::Null),
+                Value::Bool(_) => self
+                    .registry
+                    .construct("type.bool", &Value::Null)
+                    .unwrap_or(Value::Null),
+                Value::Number(_) => self
+                    .registry
+                    .construct("type.number", &Value::Null)
+                    .unwrap_or(Value::Null),
+                Value::String(s) => self
+                    .modules
+                    .as_ref()
+                    .and_then(|m| m.lookup_type_signature(s))
+                    .or_else(|| self.registry.construct("type.string", &Value::Null))
+                    .unwrap_or_else(|| Value::String(s.clone())),
+                Value::Array(_) => self
+                    .registry
+                    .construct(
+                        "type.array",
+                        &json!({"element": self.value_to_type(&Value::Null)}),
+                    )
+                    .unwrap_or(Value::Null),
+                Value::Object(o) => {
+                    // Tagged engine/runtime values (e.g. `self`) are not record
+                    // types; treat them as unknown.
+                    if o.keys().any(|k| k.starts_with("__")) {
+                        self.registry
+                            .construct("type.unknown", &Value::Null)
+                            .unwrap_or(Value::Null)
+                    } else {
+                        let fields: serde_json::Map<String, Value> = o
+                            .iter()
+                            .map(|(k, v)| (k.clone(), self.value_to_type(v)))
+                            .collect();
+                        self.registry
+                            .construct("type.record", &json!({"fields": fields}))
+                            .unwrap_or(Value::Null)
+                    }
                 }
             }
-        }
         })
     }
 
@@ -312,37 +312,37 @@ impl NbeTypecheckEngine {
         // failures surface with this node's source span (`with_node`
         // only fills an empty span, so an inner node's position wins).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        let Some(rule) = lang.types.get_by_identity(&node.kind) else {
-            // A kind with no declared type rule degrades to `type.unknown`
-            // with a warning — the documented driver fallback (e.g.
-            // `fanout`'s rule is intentionally unwritten in types.yaml).
-            ctx.diagnostics.push(TypecheckDiagnostic {
-                severity: "warning".to_string(),
-                message: format!(
-                    "typecheck: no type rule for kind '{}' — treating as type.unknown",
-                    node.kind
-                ),
-                span: node.span,
-            });
-            let typ = ctx
-                .registry
-                .construct("type.unknown", &Value::Null)
-                .ok_or_else(|| {
-                    LangError::engine_node(
-                        "typecheck: construct failed for type.unknown fallback",
-                        node,
-                    )
-                })?;
+            let Some(rule) = lang.types.get_by_identity(&node.kind) else {
+                // A kind with no declared type rule degrades to `type.unknown`
+                // with a warning — the documented driver fallback (e.g.
+                // `fanout`'s rule is intentionally unwritten in types.yaml).
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "typecheck: no type rule for kind '{}' — treating as type.unknown",
+                        node.kind
+                    ),
+                    span: node.span,
+                });
+                let typ = ctx
+                    .registry
+                    .construct("type.unknown", &Value::Null)
+                    .ok_or_else(|| {
+                        LangError::engine_node(
+                            "typecheck: construct failed for type.unknown fallback",
+                            node,
+                        )
+                    })?;
+                ctx.node_types.insert(node_ref.index(), typ.clone());
+                return Ok(typ);
+            };
+            // `rule.synth` is lang-owned — the `scheme_td` cache key is
+            // stable for the ctx's lifetime, so the `Term`→`TermData`
+            // conversion runs once per kind, not once per node (WS-H).
+            let td = ctx.scheme_td(&rule.synth);
+            let typ = self.eval_type_scheme_td(lang, ast, node_ref, &td, ctx, None)?;
             ctx.node_types.insert(node_ref.index(), typ.clone());
-            return Ok(typ);
-        };
-        // `rule.synth` is lang-owned — the `scheme_td` cache key is
-        // stable for the ctx's lifetime, so the `Term`→`TermData`
-        // conversion runs once per kind, not once per node (WS-H).
-        let td = ctx.scheme_td(&rule.synth);
-        let typ = self.eval_type_scheme_td(lang, ast, node_ref, &td, ctx, None)?;
-        ctx.node_types.insert(node_ref.index(), typ.clone());
-        Ok(typ)
+            Ok(typ)
         })
         .map_err(|e: LangError| e.with_node(node))
     }
@@ -368,116 +368,108 @@ impl NbeTypecheckEngine {
         // failures surface with this node's source span (`with_node`
         // only fills an empty span, so an inner node's position wins).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        let Some(rule) = lang.types.get_by_identity(&node.kind) else {
-            // No declared rule — the synth fallback mints `type.unknown`
-            // (with a warning); an unknown-typed node accepts any
-            // expected type.
-            self.synth_node(lang, ast, node_ref, ctx)?;
-            return Ok(());
-        };
-        // Dependent introduction (ADR-0152/0120): checking an arrow
-        // against `type.pi`/`type.family`, a pair against `type.sigma`,
-        // or `refl`/a witness against `Path` goes through the dependent
-        // introduction rules rather than synth-then-unify.
-        if let Some(res) = self.dep_check_intro(lang, ast, node_ref, expected, ctx) {
-            // Record the *returned* type, not `expected`: the dependent
-            // intro may carry extra fields the expected type lacks (e.g.
-            // a transport node's `via` Path witness — proof-relevant).
-            let ty = res?;
-            ctx.node_types.insert(node_ref.index(), ty);
-            return Ok(());
-        }
-        // `x : Type` — a *type expression* is a term inhabiting
-        // `type.universe` (types are values, ADR-0032): `Bool`,
-        // `Vec(2, Bool)`, `Nat` as second-round index arguments of an
-        // `F.rec` call read as their type values. Fall through to the
-        // ordinary path when the node isn't a type expression at all.
-        if expected.get("__tag__").and_then(|t| t.as_str()) == Some("type.universe") {
-            if self
-                .dep_synth_type(lang, ast, node_ref.index(), ctx)
-                .is_ok()
-            {
-                ctx.node_types.insert(node_ref.index(), expected.clone());
+            let Some(rule) = lang.types.get_by_identity(&node.kind) else {
+                // No declared rule — the synth fallback mints `type.unknown`
+                // (with a warning); an unknown-typed node accepts any
+                // expected type.
+                self.synth_node(lang, ast, node_ref, ctx)?;
+                return Ok(());
+            };
+            // Dependent introduction (ADR-0152/0120): checking an arrow
+            // against `type.pi`/`type.family`, a pair against `type.sigma`,
+            // or `refl`/a witness against `Path` goes through the dependent
+            // introduction rules rather than synth-then-unify.
+            if let Some(res) = self.dep_check_intro(lang, ast, node_ref, expected, ctx) {
+                // Record the *returned* type, not `expected`: the dependent
+                // intro may carry extra fields the expected type lacks (e.g.
+                // a transport node's `via` Path witness — proof-relevant).
+                let ty = res?;
+                ctx.node_types.insert(node_ref.index(), ty);
                 return Ok(());
             }
-        }
-        // An unsolved metavariable carries no structure to check
-        // against — synthesize and let unification solve it. (The
-        // `check` schemes are directed: `type_field` of a meta yields
-        // `null`, so checking e.g. a `function` literal against `?t`
-        // would check its params against `null` and never bind them.)
-        if extract_meta_id(expected).is_some() {
-            // A meta already solved by earlier work has real
-            // structure — check against the solution, not the stale
-            // cell.
-            let resolved = self.zonk(expected, ctx);
-            if extract_meta_id(&resolved).is_none() {
-                return self.check_node(lang, ast, node_ref, &resolved, ctx);
+            // `x : Type` — a *type expression* is a term inhabiting
+            // `type.universe` (types are values, ADR-0032): `Bool`,
+            // `Vec(2, Bool)`, `Nat` as second-round index arguments of an
+            // `F.rec` call read as their type values. Fall through to the
+            // ordinary path when the node isn't a type expression at all.
+            if expected.get("__tag__").and_then(|t| t.as_str()) == Some("type.universe")
+                && self
+                    .dep_synth_type(lang, ast, node_ref.index(), ctx)
+                    .is_ok()
+                {
+                    ctx.node_types.insert(node_ref.index(), expected.clone());
+                    return Ok(());
+                }
+            // An unsolved metavariable carries no structure to check
+            // against — synthesize and let unification solve it. (The
+            // `check` schemes are directed: `type_field` of a meta yields
+            // `null`, so checking e.g. a `function` literal against `?t`
+            // would check its params against `null` and never bind them.)
+            if extract_meta_id(expected).is_some() {
+                // A meta already solved by earlier work has real
+                // structure — check against the solution, not the stale
+                // cell.
+                let resolved = self.zonk(expected, ctx);
+                if extract_meta_id(&resolved).is_none() {
+                    return self.check_node(lang, ast, node_ref, &resolved, ctx);
+                }
+                let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+                // The meta may have been solved *while* the node
+                // synthesized (nested applications share the callee's
+                // metas) — unify against the current solution, not the
+                // stale cell (a re-solve would fail occurs on the
+                // structure the nested call stored).
+                let resolved = self.zonk(expected, ctx);
+                self.dep_unify(&ty, &resolved, ctx)?;
+                ctx.node_types.insert(node_ref.index(), ty);
+                return Ok(());
             }
-            let ty = self.synth_node(lang, ast, node_ref, ctx)?;
-            // The meta may have been solved *while* the node
-            // synthesized (nested applications share the callee's
-            // metas) — unify against the current solution, not the
-            // stale cell (a re-solve would fail occurs on the
-            // structure the nested call stored).
-            let resolved = self.zonk(expected, ctx);
-            self.dep_unify(&ty, &resolved, ctx)?;
-            ctx.node_types.insert(node_ref.index(), ty);
-            return Ok(());
-        }
-        // `LOOSE_TOP` as the expected type — an *internal* sentinel
-        // (`{"__tag__": "type.__loose_top__"}`) minted only by
-        // `synth_while` for loop bodies: the node is accepted, but not
-        // silently — it is loose-synthesized so internal errors (unbound
-        // vars, arity, `if` conditions, match coverage) still report
-        // while cross-branch joins are suspended. This is what lets
-        // `while` step bodies typecheck: the loop-step protocol's
-        // `{state: …}`/`{out: …}` records legitimately differ per
-        // control-flow path and can never unify. Deliberately NOT
-        // `type.unknown`: annotations like `x : Unknown = v` keep their
-        // strict semantics, and annotation evaluation's error-driven
-        // fallbacks (`eval_ann_node`) still see real failures.
-        if expected.get("__tag__").and_then(|t| t.as_str()) == Some(LOOSE_TOP_TAG) {
-            ctx.loose += 1;
-            let ty = self.loose_synth_node(lang, ast, node_ref, ctx);
-            ctx.loose -= 1;
-            let ty = ty?;
-            ctx.node_types.insert(node_ref.index(), ty);
-            return Ok(());
-        }
-        // `type.unknown` as the expected type is the dynamic TOP: every
-        // node is accepted (`unify`/`dep_unify`/`conv`/`subtype` all
-        // accept `unknown` on either side). Unlike LOOSE_TOP the node is
-        // *strictly* synthesized — internal errors still report and the
-        // real type is recorded — so annotations like
-        // `x : type.unknown = v` keep their meaning and `eval_ann_node`'s
-        // error-driven fallbacks still see real failures. This is the
-        // directed-check half of the top rule: without it, `check`
-        // schemes that read the expected tag (e.g. `check_json_value`)
-        // reject `unknown` where conv would accept.
-        if dependent::is_unknown_ty(expected) {
-            let ty = self.synth_node(lang, ast, node_ref, ctx)?;
-            ctx.node_types.insert(node_ref.index(), ty);
-            return Ok(());
-        }
-        if let Some(check_scheme) = &rule.check {
-            let td = ctx.scheme_td(check_scheme);
-            self.eval_type_scheme_td(
-                lang,
-                ast,
-                node_ref,
-                &td,
-                ctx,
-                Some(expected.clone()),
-            )?;
-            ctx.node_types.insert(node_ref.index(), expected.clone());
-            Ok(())
-        } else {
-            let ty = self.synth_node(lang, ast, node_ref, ctx)?;
-            self.dep_unify(&ty, expected, ctx)?;
-            ctx.node_types.insert(node_ref.index(), ty);
-            Ok(())
-        }
+            // `LOOSE_TOP` as the expected type — an *internal* sentinel
+            // (`{"__tag__": "type.__loose_top__"}`) minted only by
+            // `synth_while` for loop bodies: the node is accepted, but not
+            // silently — it is loose-synthesized so internal errors (unbound
+            // vars, arity, `if` conditions, match coverage) still report
+            // while cross-branch joins are suspended. This is what lets
+            // `while` step bodies typecheck: the loop-step protocol's
+            // `{state: …}`/`{out: …}` records legitimately differ per
+            // control-flow path and can never unify. Deliberately NOT
+            // `type.unknown`: annotations like `x : Unknown = v` keep their
+            // strict semantics, and annotation evaluation's error-driven
+            // fallbacks (`eval_ann_node`) still see real failures.
+            if expected.get("__tag__").and_then(|t| t.as_str()) == Some(LOOSE_TOP_TAG) {
+                ctx.loose += 1;
+                let ty = self.loose_synth_node(lang, ast, node_ref, ctx);
+                ctx.loose -= 1;
+                let ty = ty?;
+                ctx.node_types.insert(node_ref.index(), ty);
+                return Ok(());
+            }
+            // `type.unknown` as the expected type is the dynamic TOP: every
+            // node is accepted (`unify`/`dep_unify`/`conv`/`subtype` all
+            // accept `unknown` on either side). Unlike LOOSE_TOP the node is
+            // *strictly* synthesized — internal errors still report and the
+            // real type is recorded — so annotations like
+            // `x : type.unknown = v` keep their meaning and `eval_ann_node`'s
+            // error-driven fallbacks still see real failures. This is the
+            // directed-check half of the top rule: without it, `check`
+            // schemes that read the expected tag (e.g. `check_json_value`)
+            // reject `unknown` where conv would accept.
+            if dependent::is_unknown_ty(expected) {
+                let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+                ctx.node_types.insert(node_ref.index(), ty);
+                return Ok(());
+            }
+            if let Some(check_scheme) = &rule.check {
+                let td = ctx.scheme_td(check_scheme);
+                self.eval_type_scheme_td(lang, ast, node_ref, &td, ctx, Some(expected.clone()))?;
+                ctx.node_types.insert(node_ref.index(), expected.clone());
+                Ok(())
+            } else {
+                let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+                self.dep_unify(&ty, expected, ctx)?;
+                ctx.node_types.insert(node_ref.index(), ty);
+                Ok(())
+            }
         })
         .map_err(|e: LangError| e.with_node(node))
     }
@@ -527,297 +519,321 @@ impl NbeTypecheckEngine {
         let _t = crate::stats::timer(&crate::stats::T_EVAL_SCHEME);
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        match scheme.tag() {
-            "Arr" => Ok(scheme.get("value").cloned().unwrap_or(Value::Null)),
-            "Op" => {
-                let op = scheme.get_str("name").unwrap_or("");
-                let source = scheme.arr_source().ok_or_else(|| {
-                    LangError::engine("typecheck: Op term missing 'source' field")
-                })?;
-                // `lit` is stored as `null` when absent; treat null as None
-                // (semantically equivalent for the judgment/native consumers,
-                // which both collapse Some(Null)/None to the same result).
-                let lit = scheme.get("lit").filter(|v| !v.is_null());
-                match source {
-                    ArrSource::Judgment => {
-                        // `eval_judgment` now takes `&[TermData]`; no
-                        // `Term`-enum conversion is needed at this seam.
-                        let args = scheme.get_term_view_list("args");
-                        self.eval_judgment(op, &args, lit, lang, ast, node_ref, ctx, incoming)
-                    }
-                    ArrSource::Native | ArrSource::DynamicForeign => {
-                        self.eval_native_arr(op, lit, incoming)
-                    }
-                    ArrSource::Foreign(name) => {
-                        // ADR-0054 pure-eval path: type rules themselves must
-                        // never contain `Foreign` ops — they are effectful host
-                        // calls and have no place in a pure typecheck scheme.
-                        // This is enforced unconditionally (regardless of the
-                        // `pure` flag), since type rules are static data, not
-                        // user programs.
-                        Err(LangError::engine(format!(
-                            "typecheck: foreign op '{}' is not allowed in type rules (pure-eval path, ADR-0054)",
-                            name
-                        )))
-                    }
-                }
-            }
-            "Seq" => {
-                let fst = scheme.get_term_view("fst").ok_or_else(|| {
-                    LangError::engine("typecheck: Seq missing 'fst' field")
-                })?;
-                let snd = scheme.get_term_view("snd").ok_or_else(|| {
-                    LangError::engine("typecheck: Seq missing 'snd' field")
-                })?;
-                let fst_val = self.eval_type_scheme_td(lang, ast, node_ref, fst, ctx, incoming)?;
-                self.eval_type_scheme_td(lang, ast, node_ref, snd, ctx, Some(fst_val))
-            }
-            "First" => {
-                let inner = scheme.get_term_view("inner").ok_or_else(|| {
-                    LangError::engine("typecheck: First missing 'inner' field")
-                })?;
-                let inc = incoming
-                    .ok_or_else(|| LangError::engine("typecheck: First: missing incoming value"))?;
-                let pair = inc.as_array().ok_or_else(|| {
-                    LangError::engine("typecheck: First: incoming is not an array")
-                })?;
-                if pair.len() != 2 {
-                    return Err(LangError::engine(
-                        "typecheck: First: incoming pair must have 2 elements",
-                    ));
-                }
-                let a = pair[0].clone();
-                let b = pair[1].clone();
-                let result = self.eval_type_scheme_td(lang, ast, node_ref, inner, ctx, Some(a))?;
-                Ok(Value::Array(vec![result, b]))
-            }
-            "Choice" => {
-                let l = scheme.get_term_view("l").ok_or_else(|| {
-                    LangError::engine("typecheck: Choice missing 'l' field")
-                })?;
-                let r = scheme.get_term_view("r").ok_or_else(|| {
-                    LangError::engine("typecheck: Choice missing 'r' field")
-                })?;
-                let inc = incoming.ok_or_else(|| {
-                    LangError::engine("typecheck: Choice: missing incoming value")
-                })?;
-                let obj = inc.as_object().ok_or_else(|| {
-                    LangError::engine("typecheck: Choice: incoming is not an object")
-                })?;
-                let side = obj
-                    .get(CHOICE_KEY)
-                    .and_then(|s| s.as_str())
-                    .ok_or_else(|| {
-                        LangError::engine("typecheck: Choice: incoming missing __choice__ key")
+            match scheme.tag() {
+                "Arr" => Ok(scheme.get("value").cloned().unwrap_or(Value::Null)),
+                "Op" => {
+                    let op = scheme.get_str("name").unwrap_or("");
+                    let source = scheme.arr_source().ok_or_else(|| {
+                        LangError::engine("typecheck: Op term missing 'source' field")
                     })?;
-                let value = obj.get(CHOICE_VALUE_KEY).cloned().ok_or_else(|| {
-                    LangError::engine("typecheck: Choice: incoming missing value key")
-                })?;
-                match side {
-                    "left" => self.eval_type_scheme_td(lang, ast, node_ref, l, ctx, Some(value)),
-                    "right" => self.eval_type_scheme_td(lang, ast, node_ref, r, ctx, Some(value)),
-                    other => Err(LangError::engine(format!(
-                        "typecheck: Choice: unknown side '{}'",
-                        other
-                    ))),
+                    // `lit` is stored as `null` when absent; treat null as None
+                    // (semantically equivalent for the judgment/native consumers,
+                    // which both collapse Some(Null)/None to the same result).
+                    let lit = scheme.get("lit").filter(|v| !v.is_null());
+                    match source {
+                        ArrSource::Judgment => {
+                            // `eval_judgment` now takes `&[TermData]`; no
+                            // `Term`-enum conversion is needed at this seam.
+                            let args = scheme.get_term_view_list("args");
+                            self.eval_judgment(op, &args, lit, lang, ast, node_ref, ctx, incoming)
+                        }
+                        ArrSource::Native | ArrSource::DynamicForeign => {
+                            self.eval_native_arr(op, lit, incoming)
+                        }
+                        ArrSource::Foreign(name) => {
+                            // ADR-0054 pure-eval path: type rules themselves must
+                            // never contain `Foreign` ops — they are effectful host
+                            // calls and have no place in a pure typecheck scheme.
+                            // This is enforced unconditionally (regardless of the
+                            // `pure` flag), since type rules are static data, not
+                            // user programs.
+                            Err(LangError::engine(format!(
+                                "typecheck: foreign op '{}' is not allowed in type rules (pure-eval path, ADR-0054)",
+                                name
+                            )))
+                        }
+                    }
                 }
-            }
-            // Minimal rule (ADR-0098): `iter` returns the state, which
-            // has the same type as `initial`. The full rule (fuel : A ~>
-            // Nat, predicate : A ~> Bool, step : A ~> A) is deferred.
-            "Iter" => {
-                let initial = scheme.get_term_view("initial").ok_or_else(|| {
-                    LangError::engine("typecheck: Iter missing 'initial' field")
-                })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, initial, ctx, incoming)
-            }
-            "Child" => Err(LangError::NotImplemented),
-            "Loop" => Err(LangError::NotImplemented),
-            "App" => Err(LangError::NotImplemented),
-            "Rewrite" => Err(LangError::NotImplemented),
-            "Path" => Ok(incoming.unwrap_or(Value::Null)),
-            "Equiv" => Ok(self
-                .registry
-                .construct("type.bool", &Value::Null)
-                .unwrap_or(Value::Null)),
-            // ADR-0104b minimal core: conservative/identity-like type rules.
-            "Const" => Ok(scheme.get("value").cloned().unwrap_or(Value::Null)),
-            "Src" => {
-                let cell = scheme.get_term_view("cell").ok_or_else(|| {
-                    LangError::engine("typecheck: Src missing 'cell' field")
-                })?;
-                let cell_val = self.eval_type_scheme_td(lang, ast, node_ref, cell, ctx, incoming)?;
-                Ok(cell_val.get("__src__").cloned().unwrap_or(Value::Null))
-            }
-            "Tgt" => {
-                let cell = scheme.get_term_view("cell").ok_or_else(|| {
-                    LangError::engine("typecheck: Tgt missing 'cell' field")
-                })?;
-                let cell_val = self.eval_type_scheme_td(lang, ast, node_ref, cell, ctx, incoming)?;
-                Ok(cell_val.get("__tgt__").cloned().unwrap_or(Value::Null))
-            }
-            "RecordProj" => {
-                let record = scheme.get_term_view("record").ok_or_else(|| {
-                    LangError::engine("typecheck: RecordProj missing 'record' field")
-                })?;
-                let field = scheme.get_str("field").unwrap_or("");
-                let record_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, record, ctx, incoming)?;
-                Ok(record_val.get(field).cloned().unwrap_or(Value::Null))
-            }
-            "RecordWith" => {
-                let record = scheme.get_term_view("record").ok_or_else(|| {
-                    LangError::engine("typecheck: RecordWith missing 'record' field")
-                })?;
-                let field = scheme.get_str("field").unwrap_or("").to_string();
-                let value = scheme.get_term_view("value").ok_or_else(|| {
-                    LangError::engine("typecheck: RecordWith missing 'value' field")
-                })?;
-                let record_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, record, ctx, incoming.clone())?;
-                let value_val = self.eval_type_scheme_td(lang, ast, node_ref, value, ctx, incoming)?;
-                let mut map = match record_val {
-                    Value::Object(m) => m.clone(),
-                    _ => serde_json::Map::new(),
-                };
-                map.insert(field, value_val);
-                Ok(Value::Object(map))
-            }
-            "Tag" => {
-                let tag = scheme.get_str("tag").unwrap_or("").to_string();
-                let value = scheme.get_term_view("value").ok_or_else(|| {
-                    LangError::engine("typecheck: Tag missing 'value' field")
-                })?;
-                let val = self.eval_type_scheme_td(lang, ast, node_ref, value, ctx, incoming)?;
-                // Mirror `handl_language::tag_value` (ADR-0055): an untagged
-                // object payload spreads and gains `__tag__`; anything else
-                // wraps under `value`. Unlike `tag_value` — which *rejects*
-                // an already-tagged payload to prevent `__tag__` forgery —
-                // a scheme tagging an existing tag value (e.g. wrapping
-                // `type.number` in a data-constructor tag) wraps it under
-                // `value` so the inner tag is preserved rather than
-                // clobbered by the outer insert.
-                let mut map = match val {
-                    Value::Object(m) if !m.contains_key("__tag__") => m.clone(),
-                    other => {
-                        let mut m = serde_json::Map::new();
-                        m.insert("value".to_string(), other);
-                        m
+                "Seq" => {
+                    let fst = scheme
+                        .get_term_view("fst")
+                        .ok_or_else(|| LangError::engine("typecheck: Seq missing 'fst' field"))?;
+                    let snd = scheme
+                        .get_term_view("snd")
+                        .ok_or_else(|| LangError::engine("typecheck: Seq missing 'snd' field"))?;
+                    let fst_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, fst, ctx, incoming)?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, snd, ctx, Some(fst_val))
+                }
+                "First" => {
+                    let inner = scheme.get_term_view("inner").ok_or_else(|| {
+                        LangError::engine("typecheck: First missing 'inner' field")
+                    })?;
+                    let inc = incoming.ok_or_else(|| {
+                        LangError::engine("typecheck: First: missing incoming value")
+                    })?;
+                    let pair = inc.as_array().ok_or_else(|| {
+                        LangError::engine("typecheck: First: incoming is not an array")
+                    })?;
+                    if pair.len() != 2 {
+                        return Err(LangError::engine(
+                            "typecheck: First: incoming pair must have 2 elements",
+                        ));
                     }
-                };
-                map.insert("__tag__".to_string(), Value::String(tag));
-                Ok(Value::Object(map))
-            }
-            // `handle body with target = impl_` (ADR-0076): eliminate the
-            // handler at compile time (rewriting every bare arr(target) in
-            // the body to the impl graph), then evaluate the resulting
-            // handler-free scheme.
-            //
-            // NOTE (ADR-0125, reverting an ADR-0076 extra): this arm used to
-            // also infer the scheme's *effect row* (`handl_language::
-            // infer_effect_row`) and attach it as an `effects` field on a
-            // resulting `type.function`. That API was removed from
-            // `handl-language` when the grade slot became the kernel `dim`
-            // field (ADR-0119); `type.effects` is also not part of the rule
-            // data — `types.yaml`'s `handle` rule is a bare `synth_child(0)` —
-            // and the Handl model (the ADR-0125 parity oracle) does no effect
-            // inference at all. So the row is gone; elimination uses
-            // `Term::eliminate_handlers`, the same primitive the current exec
-            // engines use.
-            "Handle" => {
-                let scheme_term = scheme.to_term().map_err(LangError::engine)?;
-                let eliminated = scheme_term.eliminate_handlers();
-                let eliminated_td = TermData::from_term(&eliminated);
-                self.eval_type_scheme_td(lang, ast, node_ref, &eliminated_td, ctx, incoming)
-            }
-            "CellId" => {
-                let arrow = scheme.get_term_view("arrow").ok_or_else(|| {
-                    LangError::engine("typecheck: CellId missing 'arrow' field")
-                })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, arrow, ctx, incoming)
-            }
-            "Refine" => {
-                let sort = scheme.get_term_view("sort").ok_or_else(|| {
-                    LangError::engine("typecheck: Refine missing 'sort' field")
-                })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, sort, ctx, incoming)
-            }
-            "Cobind" => {
-                let grade = scheme.get_term_view("grade").ok_or_else(|| {
-                    LangError::engine("typecheck: Cobind missing 'grade' field")
-                })?;
-                let body = scheme.get_term_view("body").ok_or_else(|| {
-                    LangError::engine("typecheck: Cobind missing 'body' field")
-                })?;
-                let grade_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, grade, ctx, incoming.clone())?;
-                let body_val = self.eval_type_scheme_td(lang, ast, node_ref, body, ctx, incoming)?;
-                let grade = self.grade_string(&grade_val);
-                let mut result = match body_val {
-                    Value::Object(m) => m,
-                    other => {
-                        let mut m = serde_json::Map::new();
-                        m.insert("__type__".to_string(), other);
-                        m
+                    let a = pair[0].clone();
+                    let b = pair[1].clone();
+                    let result =
+                        self.eval_type_scheme_td(lang, ast, node_ref, inner, ctx, Some(a))?;
+                    Ok(Value::Array(vec![result, b]))
+                }
+                "Choice" => {
+                    let l = scheme
+                        .get_term_view("l")
+                        .ok_or_else(|| LangError::engine("typecheck: Choice missing 'l' field"))?;
+                    let r = scheme
+                        .get_term_view("r")
+                        .ok_or_else(|| LangError::engine("typecheck: Choice missing 'r' field"))?;
+                    let inc = incoming.ok_or_else(|| {
+                        LangError::engine("typecheck: Choice: missing incoming value")
+                    })?;
+                    let obj = inc.as_object().ok_or_else(|| {
+                        LangError::engine("typecheck: Choice: incoming is not an object")
+                    })?;
+                    let side = obj
+                        .get(CHOICE_KEY)
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| {
+                            LangError::engine("typecheck: Choice: incoming missing __choice__ key")
+                        })?;
+                    let value = obj.get(CHOICE_VALUE_KEY).cloned().ok_or_else(|| {
+                        LangError::engine("typecheck: Choice: incoming missing value key")
+                    })?;
+                    match side {
+                        "left" => {
+                            self.eval_type_scheme_td(lang, ast, node_ref, l, ctx, Some(value))
+                        }
+                        "right" => {
+                            self.eval_type_scheme_td(lang, ast, node_ref, r, ctx, Some(value))
+                        }
+                        other => Err(LangError::engine(format!(
+                            "typecheck: Choice: unknown side '{}'",
+                            other
+                        ))),
                     }
-                };
-                result.insert(
-                    "__coeffects__".to_string(),
-                    serde_json::json!([{ "grade": grade }]),
-                );
-                Ok(Value::Object(result))
-            }
-            "Univalence" => {
-                let equiv = scheme.get_term_view("equiv").ok_or_else(|| {
-                    LangError::engine("typecheck: Univalence missing 'equiv' field")
-                })?;
-                let _ = self.eval_type_scheme_td(lang, ast, node_ref, equiv, ctx, incoming)?;
-                Ok(self
+                }
+                // Minimal rule (ADR-0098): `iter` returns the state, which
+                // has the same type as `initial`. The full rule (fuel : A ~>
+                // Nat, predicate : A ~> Bool, step : A ~> A) is deferred.
+                "Iter" => {
+                    let initial = scheme.get_term_view("initial").ok_or_else(|| {
+                        LangError::engine("typecheck: Iter missing 'initial' field")
+                    })?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, initial, ctx, incoming)
+                }
+                "Child" => Err(LangError::NotImplemented),
+                "Loop" => Err(LangError::NotImplemented),
+                "App" => Err(LangError::NotImplemented),
+                "Rewrite" => Err(LangError::NotImplemented),
+                "Path" => Ok(incoming.unwrap_or(Value::Null)),
+                "Equiv" => Ok(self
                     .registry
                     .construct("type.bool", &Value::Null)
-                    .unwrap_or(Value::Null))
-            }
-            "Glue" => {
-                let family = scheme.get_term_view("family").ok_or_else(|| {
-                    LangError::engine("typecheck: Glue missing 'family' field")
-                })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, family, ctx, incoming)
-            }
-            "Fibrant" => {
-                let base = scheme.get_term_view("base").ok_or_else(|| {
-                    LangError::engine("typecheck: Fibrant missing 'base' field")
-                })?;
-                self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)
-            }
-            "JElim" => {
-                let path = scheme.get_term_view("path").ok_or_else(|| {
-                    LangError::engine("typecheck: JElim missing 'path' field")
-                })?;
-                let motive = scheme.get_term_view("motive").ok_or_else(|| {
-                    LangError::engine("typecheck: JElim missing 'motive' field")
-                })?;
-                let base = scheme.get_term_view("base").ok_or_else(|| {
-                    LangError::engine("typecheck: JElim missing 'base' field")
-                })?;
-                let path_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, path, ctx, incoming.clone())?;
-                let base_val = self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)?;
-                if let Some(tag) = path_val.get("__tag__").and_then(Value::as_str) {
-                    if tag == "Path" || tag == "Rewrite" {
-                        return self.eval_type_scheme_td(
-                            lang,
-                            ast,
-                            node_ref,
-                            &motive,
-                            ctx,
-                            Some(base_val),
-                        );
-                    }
+                    .unwrap_or(Value::Null)),
+                // ADR-0104b minimal core: conservative/identity-like type rules.
+                "Const" => Ok(scheme.get("value").cloned().unwrap_or(Value::Null)),
+                "Src" => {
+                    let cell = scheme
+                        .get_term_view("cell")
+                        .ok_or_else(|| LangError::engine("typecheck: Src missing 'cell' field"))?;
+                    let cell_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, cell, ctx, incoming)?;
+                    Ok(cell_val.get("__src__").cloned().unwrap_or(Value::Null))
                 }
-                Ok(base_val)
+                "Tgt" => {
+                    let cell = scheme
+                        .get_term_view("cell")
+                        .ok_or_else(|| LangError::engine("typecheck: Tgt missing 'cell' field"))?;
+                    let cell_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, cell, ctx, incoming)?;
+                    Ok(cell_val.get("__tgt__").cloned().unwrap_or(Value::Null))
+                }
+                "RecordProj" => {
+                    let record = scheme.get_term_view("record").ok_or_else(|| {
+                        LangError::engine("typecheck: RecordProj missing 'record' field")
+                    })?;
+                    let field = scheme.get_str("field").unwrap_or("");
+                    let record_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, record, ctx, incoming)?;
+                    Ok(record_val.get(field).cloned().unwrap_or(Value::Null))
+                }
+                "RecordWith" => {
+                    let record = scheme.get_term_view("record").ok_or_else(|| {
+                        LangError::engine("typecheck: RecordWith missing 'record' field")
+                    })?;
+                    let field = scheme.get_str("field").unwrap_or("").to_string();
+                    let value = scheme.get_term_view("value").ok_or_else(|| {
+                        LangError::engine("typecheck: RecordWith missing 'value' field")
+                    })?;
+                    let record_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        record,
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let value_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, value, ctx, incoming)?;
+                    let mut map = match record_val {
+                        Value::Object(m) => m.clone(),
+                        _ => serde_json::Map::new(),
+                    };
+                    map.insert(field, value_val);
+                    Ok(Value::Object(map))
+                }
+                "Tag" => {
+                    let tag = scheme.get_str("tag").unwrap_or("").to_string();
+                    let value = scheme
+                        .get_term_view("value")
+                        .ok_or_else(|| LangError::engine("typecheck: Tag missing 'value' field"))?;
+                    let val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, value, ctx, incoming)?;
+                    // Mirror `handl_language::tag_value` (ADR-0055): an untagged
+                    // object payload spreads and gains `__tag__`; anything else
+                    // wraps under `value`. Unlike `tag_value` — which *rejects*
+                    // an already-tagged payload to prevent `__tag__` forgery —
+                    // a scheme tagging an existing tag value (e.g. wrapping
+                    // `type.number` in a data-constructor tag) wraps it under
+                    // `value` so the inner tag is preserved rather than
+                    // clobbered by the outer insert.
+                    let mut map = match val {
+                        Value::Object(m) if !m.contains_key("__tag__") => m.clone(),
+                        other => {
+                            let mut m = serde_json::Map::new();
+                            m.insert("value".to_string(), other);
+                            m
+                        }
+                    };
+                    map.insert("__tag__".to_string(), Value::String(tag));
+                    Ok(Value::Object(map))
+                }
+                // `handle body with target = impl_` (ADR-0076): eliminate the
+                // handler at compile time (rewriting every bare arr(target) in
+                // the body to the impl graph), then evaluate the resulting
+                // handler-free scheme.
+                //
+                // NOTE (ADR-0125, reverting an ADR-0076 extra): this arm used to
+                // also infer the scheme's *effect row* (`handl_language::
+                // infer_effect_row`) and attach it as an `effects` field on a
+                // resulting `type.function`. That API was removed from
+                // `handl-language` when the grade slot became the kernel `dim`
+                // field (ADR-0119); `type.effects` is also not part of the rule
+                // data — `types.yaml`'s `handle` rule is a bare `synth_child(0)` —
+                // and the Handl model (the ADR-0125 parity oracle) does no effect
+                // inference at all. So the row is gone; elimination uses
+                // `Term::eliminate_handlers`, the same primitive the current exec
+                // engines use.
+                "Handle" => {
+                    let scheme_term = scheme.to_term().map_err(LangError::engine)?;
+                    let eliminated = scheme_term.eliminate_handlers();
+                    let eliminated_td = TermData::from_term(&eliminated);
+                    self.eval_type_scheme_td(lang, ast, node_ref, &eliminated_td, ctx, incoming)
+                }
+                "CellId" => {
+                    let arrow = scheme.get_term_view("arrow").ok_or_else(|| {
+                        LangError::engine("typecheck: CellId missing 'arrow' field")
+                    })?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, arrow, ctx, incoming)
+                }
+                "Refine" => {
+                    let sort = scheme.get_term_view("sort").ok_or_else(|| {
+                        LangError::engine("typecheck: Refine missing 'sort' field")
+                    })?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, sort, ctx, incoming)
+                }
+                "Cobind" => {
+                    let grade = scheme.get_term_view("grade").ok_or_else(|| {
+                        LangError::engine("typecheck: Cobind missing 'grade' field")
+                    })?;
+                    let body = scheme.get_term_view("body").ok_or_else(|| {
+                        LangError::engine("typecheck: Cobind missing 'body' field")
+                    })?;
+                    let grade_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        grade,
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let body_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, body, ctx, incoming)?;
+                    let grade = self.grade_string(&grade_val);
+                    let mut result = match body_val {
+                        Value::Object(m) => m,
+                        other => {
+                            let mut m = serde_json::Map::new();
+                            m.insert("__type__".to_string(), other);
+                            m
+                        }
+                    };
+                    result.insert(
+                        "__coeffects__".to_string(),
+                        serde_json::json!([{ "grade": grade }]),
+                    );
+                    Ok(Value::Object(result))
+                }
+                "Univalence" => {
+                    let equiv = scheme.get_term_view("equiv").ok_or_else(|| {
+                        LangError::engine("typecheck: Univalence missing 'equiv' field")
+                    })?;
+                    let _ = self.eval_type_scheme_td(lang, ast, node_ref, equiv, ctx, incoming)?;
+                    Ok(self
+                        .registry
+                        .construct("type.bool", &Value::Null)
+                        .unwrap_or(Value::Null))
+                }
+                "Glue" => {
+                    let family = scheme.get_term_view("family").ok_or_else(|| {
+                        LangError::engine("typecheck: Glue missing 'family' field")
+                    })?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, family, ctx, incoming)
+                }
+                "Fibrant" => {
+                    let base = scheme.get_term_view("base").ok_or_else(|| {
+                        LangError::engine("typecheck: Fibrant missing 'base' field")
+                    })?;
+                    self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)
+                }
+                "JElim" => {
+                    let path = scheme.get_term_view("path").ok_or_else(|| {
+                        LangError::engine("typecheck: JElim missing 'path' field")
+                    })?;
+                    let motive = scheme.get_term_view("motive").ok_or_else(|| {
+                        LangError::engine("typecheck: JElim missing 'motive' field")
+                    })?;
+                    let base = scheme.get_term_view("base").ok_or_else(|| {
+                        LangError::engine("typecheck: JElim missing 'base' field")
+                    })?;
+                    let path_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, path, ctx, incoming.clone())?;
+                    let base_val =
+                        self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)?;
+                    if let Some(tag) = path_val.get("__tag__").and_then(Value::as_str)
+                        && (tag == "Path" || tag == "Rewrite") {
+                            return self.eval_type_scheme_td(
+                                lang,
+                                ast,
+                                node_ref,
+                                motive,
+                                ctx,
+                                Some(base_val),
+                            );
+                        }
+                    Ok(base_val)
+                }
+                _ => Ok(incoming.unwrap_or(Value::Null)),
             }
-            _ => Ok(incoming.unwrap_or(Value::Null)),
-        }
         })
     }
 
@@ -874,104 +890,162 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        match op {
-            "synth_child" | "synth_type_child" => {
-                let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: {} requires a u64 lit (child index)",
-                        op
-                    ))
-                })?;
-                let child = child_ref(ast, node_ref, idx)?;
-                self.synth_node(lang, ast, child, ctx)
-            }
-            "synth_child_or" => {
-                // Like `synth_child`, but tolerates an absent child (e.g.
-                // the missing `else` of an else-less `if`, produced by an
-                // `optional_children` grammar row): when the child index is
-                // out of range, the fallback sub-scheme `args[0]` is
-                // evaluated instead.
-                let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: {} requires a u64 lit (child index)",
-                        op
-                    ))
-                })?;
-                match try_child_ref(ast, node_ref, idx)? {
-                    Some(child) => self.synth_node(lang, ast, child, ctx),
-                    None => {
-                        let fallback = args.first().copied().ok_or_else(|| {
-                            LangError::engine(format!(
-                                "typecheck: {} requires a fallback scheme arg",
-                                op
-                            ))
-                        })?;
-                        self.eval_type_scheme_td(lang, ast, node_ref, fallback, ctx, incoming)
+            match op {
+                "synth_child" | "synth_type_child" => {
+                    let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: {} requires a u64 lit (child index)",
+                            op
+                        ))
+                    })?;
+                    let child = child_ref(ast, node_ref, idx)?;
+                    self.synth_node(lang, ast, child, ctx)
+                }
+                "synth_child_or" => {
+                    // Like `synth_child`, but tolerates an absent child (e.g.
+                    // the missing `else` of an else-less `if`, produced by an
+                    // `optional_children` grammar row): when the child index is
+                    // out of range, the fallback sub-scheme `args[0]` is
+                    // evaluated instead.
+                    let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: {} requires a u64 lit (child index)",
+                            op
+                        ))
+                    })?;
+                    match try_child_ref(ast, node_ref, idx)? {
+                        Some(child) => self.synth_node(lang, ast, child, ctx),
+                        None => {
+                            let fallback = args.first().copied().ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "typecheck: {} requires a fallback scheme arg",
+                                    op
+                                ))
+                            })?;
+                            self.eval_type_scheme_td(lang, ast, node_ref, fallback, ctx, incoming)
+                        }
                     }
                 }
-            }
-            "check_child_or" => {
-                // Like `check_child`, but tolerates an absent child: when
-                // the child index is out of range the check is a no-op.
-                let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: {} requires a u64 lit (child index)",
-                        op
-                    ))
-                })?;
-                match try_child_ref(ast, node_ref, idx)? {
-                    Some(child) => {
-                        let expected = if args.is_empty() {
-                            incoming.clone().unwrap_or(Value::Null)
-                        } else {
-                            self.eval_type_scheme_td(
-                                lang,
-                                ast,
-                                node_ref,
-                                args[0],
-                                ctx,
-                                incoming.clone(),
-                            )?
-                        };
-                        self.check_node(lang, ast, child, &expected, ctx)?;
-                        Ok(Value::Null)
+                "check_child_or" => {
+                    // Like `check_child`, but tolerates an absent child: when
+                    // the child index is out of range the check is a no-op.
+                    let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: {} requires a u64 lit (child index)",
+                            op
+                        ))
+                    })?;
+                    match try_child_ref(ast, node_ref, idx)? {
+                        Some(child) => {
+                            let expected = if args.is_empty() {
+                                incoming.clone().unwrap_or(Value::Null)
+                            } else {
+                                self.eval_type_scheme_td(
+                                    lang,
+                                    ast,
+                                    node_ref,
+                                    args[0],
+                                    ctx,
+                                    incoming.clone(),
+                                )?
+                            };
+                            self.check_node(lang, ast, child, &expected, ctx)?;
+                            Ok(Value::Null)
+                        }
+                        None => Ok(Value::Null),
                     }
-                    None => Ok(Value::Null),
                 }
-            }
-            "check_child" => {
-                let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine("typecheck: check_child requires a u64 lit (child index)")
-                })?;
-                let expected = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let child = child_ref(ast, node_ref, idx)?;
-                self.check_node(lang, ast, child, &expected, ctx)?;
-                Ok(Value::Null)
-            }
-            "eval_child" | "proj_child" => {
-                let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: {} requires a u64 lit (child index)",
-                        op
-                    ))
-                })?;
-                let child = child_ref(ast, node_ref, idx)?;
-                // ADR-0054 pure-eval path: reject effectful `Foreign` ops in
-                // the child's AST subtree before delegating to the eval
-                // engine. The host may opt out via `with_pure(false)`.
-                if self.pure {
-                    check_pure(lang, ast, child)?;
+                "check_child" => {
+                    let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine("typecheck: check_child requires a u64 lit (child index)")
+                    })?;
+                    let expected = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let child = child_ref(ast, node_ref, idx)?;
+                    self.check_node(lang, ast, child, &expected, ctx)?;
+                    Ok(Value::Null)
                 }
-                let sub = ast.subtree(child)?;
-                let req = EvalRequest::new(sub);
-                self.eval_engine.eval(lang, &req)
-            }
-            "unify" => {
-                if args.len() == 2 {
+                "eval_child" | "proj_child" => {
+                    let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: {} requires a u64 lit (child index)",
+                            op
+                        ))
+                    })?;
+                    let child = child_ref(ast, node_ref, idx)?;
+                    // ADR-0054 pure-eval path: reject effectful `Foreign` ops in
+                    // the child's AST subtree before delegating to the eval
+                    // engine. The host may opt out via `with_pure(false)`.
+                    if self.pure {
+                        check_pure(lang, ast, child)?;
+                    }
+                    let sub = ast.subtree(child)?;
+                    let req = EvalRequest::new(sub);
+                    self.eval_engine.eval(lang, &req)
+                }
+                "unify" => {
+                    if args.len() == 2 {
+                        let a = self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?;
+                        let b =
+                            self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                        self.unify(&a, &b, ctx)?;
+                    } else {
+                        let inc = incoming.unwrap_or(Value::Null);
+                        let expected = lit.cloned().unwrap_or(Value::Null);
+                        self.unify(&inc, &expected, ctx)?;
+                    }
+                    Ok(Value::Null)
+                }
+                "subtype" => {
+                    // Check if type `a` (sub) is a subtype of type `b` (super).
+                    // Supports universe cumulativity: `Type_n ⊆ Type_m` if `n ≤ m`
+                    // (ADR-0054). `args[0]` is the sub-type sub-scheme; `args[1]`
+                    // is the super-type sub-scheme.
+                    if args.len() < 2 {
+                        return Err(LangError::engine("subtype: requires 2 args (sub, super)"));
+                    }
+                    let sub = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let sup =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    self.check_subtype(&sub, &sup, ctx)?;
+                    Ok(Value::Null)
+                }
+                // --- `Val`-domain ops (phase-1 spec WS-B) ----------------------
+                // The `v*` ops are the migration seam toward domain-native
+                // checking (ADR-0154 §7): argument schemes evaluate in the
+                // legacy tagged encoding, `checker::lift` reifies them into
+                // `Val` (`{"__tag__":"type.X"}` → `Nominal`, `{"__tag__":t,
+                // …}` → `Former`), and `ctx.vcheck` judges. `veval` runs a
+                // whole sub-scheme inside the domain through
+                // `hnl_engine::nbe::eval` + `JudgmentOps`.
+                "vconv" | "vunify" => {
+                    if args.len() != 2 {
+                        return Err(LangError::engine("vconv: requires 2 args (a, b)"));
+                    }
                     let a = self.eval_type_scheme_td(
                         lang,
                         ast,
@@ -980,112 +1054,85 @@ impl NbeTypecheckEngine {
                         ctx,
                         incoming.clone(),
                     )?;
-                    let b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                    self.unify(&a, &b, ctx)?;
-                } else {
-                    let inc = incoming.unwrap_or(Value::Null);
-                    let expected = lit.cloned().unwrap_or(Value::Null);
-                    self.unify(&inc, &expected, ctx)?;
+                    let b =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    let lvl = ctx.vcheck.lvl();
+                    let va = checker::lift(lvl, &handl_value::TaggedValue::from(a));
+                    let vb = checker::lift(lvl, &handl_value::TaggedValue::from(b));
+                    Ok(Value::Bool(ctx.vcheck.conv(&va, &vb)))
                 }
-                Ok(Value::Null)
-            }
-            "subtype" => {
-                // Check if type `a` (sub) is a subtype of type `b` (super).
-                // Supports universe cumulativity: `Type_n ⊆ Type_m` if `n ≤ m`
-                // (ADR-0054). `args[0]` is the sub-type sub-scheme; `args[1]`
-                // is the super-type sub-scheme.
-                if args.len() < 2 {
-                    return Err(LangError::engine("subtype: requires 2 args (sub, super)"));
+                "vsubtype" => {
+                    if args.len() != 2 {
+                        return Err(LangError::engine("vsubtype: requires 2 args (sub, super)"));
+                    }
+                    let sub = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let sup =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    let lvl = ctx.vcheck.lvl();
+                    let va = checker::lift(lvl, &handl_value::TaggedValue::from(sub));
+                    let vb = checker::lift(lvl, &handl_value::TaggedValue::from(sup));
+                    Ok(Value::Bool(ctx.vcheck.subtype(&va, &vb)))
                 }
-                let sub =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let sup = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                self.check_subtype(&sub, &sup, ctx)?;
-                Ok(Value::Null)
-            }
-            // --- `Val`-domain ops (phase-1 spec WS-B) ----------------------
-            // The `v*` ops are the migration seam toward domain-native
-            // checking (ADR-0154 §7): argument schemes evaluate in the
-            // legacy tagged encoding, `checker::lift` reifies them into
-            // `Val` (`{"__tag__":"type.X"}` → `Nominal`, `{"__tag__":t,
-            // …}` → `Former`), and `ctx.vcheck` judges. `veval` runs a
-            // whole sub-scheme inside the domain through
-            // `hnl_engine::nbe::eval` + `JudgmentOps`.
-            "vconv" | "vunify" => {
-                if args.len() != 2 {
-                    return Err(LangError::engine("vconv: requires 2 args (a, b)"));
+                "vinfer" => {
+                    let v = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let lvl = ctx.vcheck.lvl();
+                    let vv = checker::lift(lvl, &handl_value::TaggedValue::from(v));
+                    let ty = ctx
+                        .vcheck
+                        .infer(&vv)
+                        .map_err(|e| LangError::engine(format!("typecheck: vinfer: {e}")))?;
+                    Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
+                        &ctx.vcheck.metas,
+                        ctx.vcheck.lvl(),
+                        &ty,
+                    )))
                 }
-                let a = self.eval_type_scheme_td(
-                    lang,
-                    ast,
-                    node_ref,
-                    args[0],
-                    ctx,
-                    incoming.clone(),
-                )?;
-                let b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                let lvl = ctx.vcheck.lvl();
-                let va = checker::lift(lvl, &handl_value::TaggedValue::from(a));
-                let vb = checker::lift(lvl, &handl_value::TaggedValue::from(b));
-                Ok(Value::Bool(ctx.vcheck.conv(&va, &vb)))
-            }
-            "vsubtype" => {
-                if args.len() != 2 {
-                    return Err(LangError::engine("vsubtype: requires 2 args (sub, super)"));
+                "vbind" => {
+                    // `vbind("x", <type-scheme>)` — extend the domain Γ;
+                    // returns `incoming` (the `extend` convention).
+                    let name = lit
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            LangError::engine("typecheck: vbind: lit must be a string (name)")
+                        })?
+                        .to_string();
+                    let ty = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let lvl = ctx.vcheck.lvl();
+                    let vt = checker::lift(lvl, &handl_value::TaggedValue::from(ty));
+                    ctx.vcheck.bind(name, vt);
+                    Ok(incoming.unwrap_or(Value::Null))
                 }
-                let sub = self.eval_type_scheme_td(
-                    lang,
-                    ast,
-                    node_ref,
-                    args[0],
-                    ctx,
-                    incoming.clone(),
-                )?;
-                let sup = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                let lvl = ctx.vcheck.lvl();
-                let va = checker::lift(lvl, &handl_value::TaggedValue::from(sub));
-                let vb = checker::lift(lvl, &handl_value::TaggedValue::from(sup));
-                Ok(Value::Bool(ctx.vcheck.subtype(&va, &vb)))
-            }
-            "vinfer" => {
-                let v = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let lvl = ctx.vcheck.lvl();
-                let vv = checker::lift(lvl, &handl_value::TaggedValue::from(v));
-                let ty = ctx
-                    .vcheck
-                    .infer(&vv)
-                    .map_err(|e| LangError::engine(format!("typecheck: vinfer: {e}")))?;
-                Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
-                    &ctx.vcheck.metas,
-                    ctx.vcheck.lvl(),
-                    &ty,
-                )))
-            }
-            "vbind" => {
-                // `vbind("x", <type-scheme>)` — extend the domain Γ;
-                // returns `incoming` (the `extend` convention).
-                let name = lit
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        LangError::engine("typecheck: vbind: lit must be a string (name)")
-                    })?
-                    .to_string();
-                let ty = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let lvl = ctx.vcheck.lvl();
-                let vt = checker::lift(lvl, &handl_value::TaggedValue::from(ty));
-                ctx.vcheck.bind(name, vt);
-                Ok(incoming.unwrap_or(Value::Null))
-            }
-            "vlookup" => {
-                let name = lit
+                "vlookup" => {
+                    let name = lit
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .or_else(|| {
@@ -1099,49 +1146,51 @@ impl NbeTypecheckEngine {
                             "typecheck: vlookup: requires a string lit or string incoming (name)",
                         )
                     })?;
-                match ctx.vcheck.lookup_name(&name).cloned() {
-                    Some(ty) => Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
+                    match ctx.vcheck.lookup_name(&name).cloned() {
+                        Some(ty) => Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
+                            &ctx.vcheck.metas,
+                            ctx.vcheck.lvl(),
+                            &ty,
+                        ))),
+                        None => Ok(Value::Null),
+                    }
+                }
+                "veval" => {
+                    // Evaluate a whole sub-scheme inside the domain:
+                    // `TermData` → `Term` → `hnl_engine::nbe::eval` under
+                    // `JudgmentOps` over `ctx.vcheck` (moved out for the
+                    // `&dyn OpHandler` call and moved back).
+                    let td = args.first().copied().ok_or_else(|| {
+                        LangError::engine("typecheck: veval: requires a scheme arg")
+                    })?;
+                    let term = td.to_term().map_err(|e| {
+                        LangError::engine(format!("typecheck: veval: bad scheme: {e}"))
+                    })?;
+                    let inc = incoming
+                        .map(|v| {
+                            checker::lift(ctx.vcheck.lvl(), &handl_value::TaggedValue::from(v))
+                        })
+                        .unwrap_or(Val::Const(TaggedValue::Null));
+                    let ops = judgments::JudgmentOps::over(std::mem::take(&mut ctx.vcheck))
+                        .with_lang(Rc::new(lang.clone()));
+                    let r = hnl_engine::nbe::eval(&term, inc, &ops);
+                    ctx.vcheck = ops.checker.into_inner();
+                    let v = r.map_err(|e| LangError::engine(format!("typecheck: veval: {e}")))?;
+                    Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
                         &ctx.vcheck.metas,
                         ctx.vcheck.lvl(),
-                        &ty,
-                    ))),
-                    None => Ok(Value::Null),
+                        &v,
+                    )))
                 }
-            }
-            "veval" => {
-                // Evaluate a whole sub-scheme inside the domain:
-                // `TermData` → `Term` → `hnl_engine::nbe::eval` under
-                // `JudgmentOps` over `ctx.vcheck` (moved out for the
-                // `&dyn OpHandler` call and moved back).
-                let td = args.first().copied().ok_or_else(|| {
-                    LangError::engine("typecheck: veval: requires a scheme arg")
-                })?;
-                let term = td.to_term().map_err(|e| {
-                    LangError::engine(format!("typecheck: veval: bad scheme: {e}"))
-                })?;
-                let inc = incoming
-                    .map(|v| checker::lift(ctx.vcheck.lvl(), &handl_value::TaggedValue::from(v)))
-                    .unwrap_or(Val::Const(TaggedValue::Null));
-                let ops = judgments::JudgmentOps::over(std::mem::take(&mut ctx.vcheck))
-                    .with_lang(Rc::new(lang.clone()));
-                let r = hnl_engine::nbe::eval(&term, inc, &ops);
-                ctx.vcheck = ops.checker.into_inner();
-                let v = r.map_err(|e| LangError::engine(format!("typecheck: veval: {e}")))?;
-                Ok(handl_value::tagged_to_value(&handl_value::nbe::quote(
-                    &ctx.vcheck.metas,
-                    ctx.vcheck.lvl(),
-                    &v,
-                )))
-            }
-            "extend" => {
-                // Read the name from `lit` when a non-null literal is present;
-                // otherwise read from `incoming` (a string `Value`), mirroring
-                // the `lookup` pattern. When the name comes from `incoming`,
-                // the type MUST come from `args[0]` (otherwise `incoming`
-                // would be used as both the name and the type). When the name
-                // comes from `lit`, `args` may be empty (type from `incoming`).
-                let (name, name_from_incoming) = match lit
-                    .and_then(|v| if v.is_null() { None } else { Some(v) })
+                "extend" => {
+                    // Read the name from `lit` when a non-null literal is present;
+                    // otherwise read from `incoming` (a string `Value`), mirroring
+                    // the `lookup` pattern. When the name comes from `incoming`,
+                    // the type MUST come from `args[0]` (otherwise `incoming`
+                    // would be used as both the name and the type). When the name
+                    // comes from `lit`, `args` may be empty (type from `incoming`).
+                    let (name, name_from_incoming) = match lit
+                    .filter(|&v| !v.is_null())
                 {
                     Some(v) => (
                         v.as_str()
@@ -1164,27 +1213,34 @@ impl NbeTypecheckEngine {
                         true,
                     ),
                 };
-                let ty = if args.is_empty() {
-                    if name_from_incoming {
-                        return Err(LangError::engine(
-                            "typecheck: extend: when name comes from incoming, args must be \
+                    let ty = if args.is_empty() {
+                        if name_from_incoming {
+                            return Err(LangError::engine(
+                                "typecheck: extend: when name comes from incoming, args must be \
                              non-empty (type sub-scheme)",
-                        ));
-                    }
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                ctx.extend(name, ty);
-                Ok(incoming.unwrap_or(Value::Null))
-            }
-            "lookup" => {
-                // Read the name from `lit` when a non-null literal is
-                // present; otherwise read from `incoming` (a string
-                // `Value`). The `incoming` path enables `var` rules that
-                // thread the node's payload (the variable name) via
-                // `node_payload >>> lookup` (ADR-0054 task 4).
-                let name = match lit.and_then(|v| if v.is_null() { None } else { Some(v) }) {
+                            ));
+                        }
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    ctx.extend(name, ty);
+                    Ok(incoming.unwrap_or(Value::Null))
+                }
+                "lookup" => {
+                    // Read the name from `lit` when a non-null literal is
+                    // present; otherwise read from `incoming` (a string
+                    // `Value`). The `incoming` path enables `var` rules that
+                    // thread the node's payload (the variable name) via
+                    // `node_payload >>> lookup` (ADR-0054 task 4).
+                    let name = match lit.filter(|&v| !v.is_null()) {
                     Some(v) => v.as_str().ok_or_else(|| {
                         LangError::engine("typecheck: lookup: lit must be a string (name)")
                     })?,
@@ -1194,118 +1250,188 @@ impl NbeTypecheckEngine {
                         )
                     })?,
                 };
-                match ctx.lookup(name).cloned() {
-                    // A constructor name instantiates its `type.ctor_sig`
-                    // telescope on read — `Succ` is a `type.function`
-                    // ending in the family application (ADR-0152 §2).
-                    Some(ty)
-                        if ty.get("__tag__").and_then(Value::as_str)
-                            == Some("type.ctor_sig") =>
-                    {
-                        self.instantiate_ctor_full(lang, ast, &ty, ctx)
-                    }
-                    // An injected `type.unknown` global is a *placeholder*
-                    // for a wire name the source-only check cannot see —
-                    // `hnl typecheck`/`hnl run` seed the whole prelude name
-                    // set, which covers the `bool` module's `true`/`false`
-                    // value exports. It must not shadow an ambient
-                    // `lang.globals` binding whose JSON type is known
-                    // (mirroring the builtin-name precedence in
-                    // `dep_synth_var_type`). A Γ binding still wins, even
-                    // when it is itself `type.unknown` — source-level
-                    // bindings are real, not placeholders.
-                    Some(ty)
-                        if ty.get("__tag__").and_then(Value::as_str)
-                            == Some("type.unknown")
-                            && ctx.lookup_gamma(name).is_none()
-                            && lang.globals.contains_key(name) =>
-                    {
-                        self.construct_json_type(&lang.globals[name], ctx)
-                    }
-                    Some(ty) => Ok(ty),
-                    // `refl` — the canonical `Path` introduction (ADR-0120):
-                    // it inhabits `Path(a, a)` — checking routes through
-                    // `dep_check_intro`; synthesizing it yields the Refl
-                    // marker so `transport`/`j` can resolve it.
-                    None if name == "refl" => ctx
-                        .registry
-                        .construct("Refl", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine("lookup: construct Refl failed")
-                        }),
-                    // Ambient globals (`Language::globals`, globals.yaml)
-                    // are ordinary identifiers bound to *values* — e.g.
-                    // `true`/`false` are the canonical booleans, not
-                    // keywords — so a name absent from Γ but present in
-                    // the globals table synthesizes the global value's
-                    // JSON type (the same dispatch `json_type_construct`
-                    // applies to literal `value` nodes).
-                    None if lang.globals.contains_key(name) => {
-                        self.construct_json_type(&lang.globals[name], ctx)
-                    }
-                    None => {
-                        // Fall back to the host-function namespace: a bare
-                        // name that resolves via the module chain (e.g.
-                        // `eval`/`lex`/`parse` meta functions) is a callable
-                        // host op — give it an opaque `type.function` with
-                        // fresh metas so `call` unification succeeds without
-                        // knowing the op's signature. Genuinely unbound
-                        // names still error.
-                        let is_host_fn =
-                            self.modules.as_ref().and_then(|m| m.lookup(name)).is_some();
-                        if is_host_fn {
-                            let param = meta_value(ctx.fresh_meta());
-                            let body = meta_value(ctx.fresh_meta());
-                            ctx.registry
-                                .construct(
-                                    "type.function",
-                                    &serde_json::json!({"param": param, "body": body}),
-                                )
-                                .ok_or_else(|| {
-                                    LangError::engine(
-                                        "typecheck: lookup: failed to construct type.function",
+                    match ctx.lookup(name).cloned() {
+                        // A constructor name instantiates its `type.ctor_sig`
+                        // telescope on read — `Succ` is a `type.function`
+                        // ending in the family application (ADR-0152 §2).
+                        Some(ty)
+                            if ty.get("__tag__").and_then(Value::as_str)
+                                == Some("type.ctor_sig") =>
+                        {
+                            self.instantiate_ctor_full(lang, ast, &ty, ctx)
+                        }
+                        // An injected `type.unknown` global is a *placeholder*
+                        // for a wire name the source-only check cannot see —
+                        // `hnl typecheck`/`hnl run` seed the whole prelude name
+                        // set, which covers the `bool` module's `true`/`false`
+                        // value exports. It must not shadow an ambient
+                        // `lang.globals` binding whose JSON type is known
+                        // (mirroring the builtin-name precedence in
+                        // `dep_synth_var_type`). A Γ binding still wins, even
+                        // when it is itself `type.unknown` — source-level
+                        // bindings are real, not placeholders.
+                        Some(ty)
+                            if ty.get("__tag__").and_then(Value::as_str)
+                                == Some("type.unknown")
+                                && ctx.lookup_gamma(name).is_none()
+                                && lang.globals.contains_key(name) =>
+                        {
+                            self.construct_json_type(&lang.globals[name], ctx)
+                        }
+                        Some(ty) => Ok(ty),
+                        // `refl` — the canonical `Path` introduction (ADR-0120):
+                        // it inhabits `Path(a, a)` — checking routes through
+                        // `dep_check_intro`; synthesizing it yields the Refl
+                        // marker so `transport`/`j` can resolve it.
+                        None if name == "refl" => ctx
+                            .registry
+                            .construct("Refl", &Value::Null)
+                            .ok_or_else(|| LangError::engine("lookup: construct Refl failed")),
+                        // Ambient globals (`Language::globals`, globals.yaml)
+                        // are ordinary identifiers bound to *values* — e.g.
+                        // `true`/`false` are the canonical booleans, not
+                        // keywords — so a name absent from Γ but present in
+                        // the globals table synthesizes the global value's
+                        // JSON type (the same dispatch `json_type_construct`
+                        // applies to literal `value` nodes).
+                        None if lang.globals.contains_key(name) => {
+                            self.construct_json_type(&lang.globals[name], ctx)
+                        }
+                        None => {
+                            // Fall back to the host-function namespace: a bare
+                            // name that resolves via the module chain (e.g.
+                            // `eval`/`lex`/`parse` meta functions) is a callable
+                            // host op — give it an opaque `type.function` with
+                            // fresh metas so `call` unification succeeds without
+                            // knowing the op's signature. Genuinely unbound
+                            // names still error.
+                            let is_host_fn =
+                                self.modules.as_ref().and_then(|m| m.lookup(name)).is_some();
+                            if is_host_fn {
+                                let param = meta_value(ctx.fresh_meta());
+                                let body = meta_value(ctx.fresh_meta());
+                                ctx.registry
+                                    .construct(
+                                        "type.function",
+                                        &serde_json::json!({"param": param, "body": body}),
                                     )
-                                })
-                        } else {
-                            Err(LangError::engine(format!(
-                                "typecheck: lookup: unbound variable '{}'",
-                                name
-                            )))
+                                    .ok_or_else(|| {
+                                        LangError::engine(
+                                            "typecheck: lookup: failed to construct type.function",
+                                        )
+                                    })
+                            } else {
+                                Err(LangError::engine(format!(
+                                    "typecheck: lookup: unbound variable '{}'",
+                                    name
+                                )))
+                            }
                         }
                     }
                 }
-            }
-            "lookup_var" => {
-                let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine("typecheck: lookup_var requires a u64 lit (index)")
-                })?;
-                ctx.lookup_index(idx as usize).cloned().ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: lookup_var: no binding at index {}",
-                        idx
-                    ))
-                })
-            }
-            "fresh_meta" => {
-                let id = ctx.fresh_meta();
-                Ok(meta_value(id))
-            }
-            "fresh_row_meta" => {
-                // ADR-0074 ID.7: allocate a fresh metavariable for use as a
-                // row variable in open record types (`type.record{fields:
-                // {...}, rest: <row_meta>}`). Functionally identical to
-                // `fresh_meta` — the separate op documents intent and leaves
-                // room for row-specific constraints in the future.
-                let id = ctx.fresh_meta();
-                Ok(meta_value(id))
-            }
-            "solve_meta" => {
-                let id = if args.is_empty() {
-                    lit.and_then(|v| v.as_u64()).ok_or_else(|| {
-                        LangError::engine("typecheck: solve_meta requires a u64 id (lit or arg)")
-                    })?
-                } else {
-                    let id_val = self.eval_type_scheme_td(
+                "lookup_var" => {
+                    let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine("typecheck: lookup_var requires a u64 lit (index)")
+                    })?;
+                    ctx.lookup_index(idx as usize).cloned().ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: lookup_var: no binding at index {}",
+                            idx
+                        ))
+                    })
+                }
+                "fresh_meta" => {
+                    let id = ctx.fresh_meta();
+                    Ok(meta_value(id))
+                }
+                "fresh_row_meta" => {
+                    // ADR-0074 ID.7: allocate a fresh metavariable for use as a
+                    // row variable in open record types (`type.record{fields:
+                    // {...}, rest: <row_meta>}`). Functionally identical to
+                    // `fresh_meta` — the separate op documents intent and leaves
+                    // room for row-specific constraints in the future.
+                    let id = ctx.fresh_meta();
+                    Ok(meta_value(id))
+                }
+                "solve_meta" => {
+                    let id = if args.is_empty() {
+                        lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                            LangError::engine(
+                                "typecheck: solve_meta requires a u64 id (lit or arg)",
+                            )
+                        })?
+                    } else {
+                        let id_val = self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?;
+                        id_val.as_u64().ok_or_else(|| {
+                            LangError::engine("typecheck: solve_meta: id arg is not a u64")
+                        })?
+                    };
+                    let val = if args.len() >= 2 {
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?
+                    } else {
+                        incoming.unwrap_or(Value::Null)
+                    };
+                    ctx.solve_meta(id, val);
+                    Ok(Value::Null)
+                }
+                "quote" | "normalize" => {
+                    if args.is_empty() {
+                        Ok(incoming.unwrap_or(Value::Null))
+                    } else {
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming)
+                    }
+                }
+                "construct" => {
+                    let tag = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine("typecheck: construct requires a string lit (tag name)")
+                    })?;
+                    let mut payload = serde_json::Map::new();
+                    for &arg in args {
+                        let val = self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            arg,
+                            ctx,
+                            incoming.clone(),
+                        )?;
+                        if let Value::Object(map) = val {
+                            for (k, v) in map {
+                                payload.insert(k, v);
+                            }
+                        } else if val != Value::Null {
+                            return Err(LangError::engine(format!(
+                                "typecheck: construct: arg produced a non-object value: {:?}",
+                                val
+                            )));
+                        }
+                    }
+                    let payload_val = if payload.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Object(payload)
+                    };
+                    ctx.registry.construct(tag, &payload_val).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: construct: failed to mint type value for tag '{}'",
+                            tag
+                        ))
+                    })
+                }
+                "match_type" => {
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "typecheck: match_type requires 2 args (value, cases)",
+                        ));
+                    }
+                    let value = self.eval_type_scheme_td(
                         lang,
                         ast,
                         node_ref,
@@ -1313,1186 +1439,1121 @@ impl NbeTypecheckEngine {
                         ctx,
                         incoming.clone(),
                     )?;
-                    id_val.as_u64().ok_or_else(|| {
-                        LangError::engine("typecheck: solve_meta: id arg is not a u64")
-                    })?
-                };
-                let val = if args.len() >= 2 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?
-                } else {
-                    incoming.unwrap_or(Value::Null)
-                };
-                ctx.solve_meta(id, val);
-                Ok(Value::Null)
-            }
-            "quote" | "normalize" => {
-                if args.is_empty() {
-                    Ok(incoming.unwrap_or(Value::Null))
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming)
+                    let cases =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    Ok(ctx
+                        .registry
+                        .match_type(&value, &cases)
+                        .unwrap_or(Value::Null))
                 }
-            }
-            "construct" => {
-                let tag = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("typecheck: construct requires a string lit (tag name)")
-                })?;
-                let mut payload = serde_json::Map::new();
-                for &arg in args {
-                    let val =
-                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?;
-                    if let Value::Object(map) = val {
-                        for (k, v) in map {
-                            payload.insert(k, v);
-                        }
-                    } else if val != Value::Null {
-                        return Err(LangError::engine(format!(
-                            "typecheck: construct: arg produced a non-object value: {:?}",
-                            val
-                        )));
+                "bind" => {
+                    let name = lit
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            LangError::engine("typecheck: bind requires a string lit (name)")
+                        })?
+                        .to_string();
+                    let val = incoming.unwrap_or(Value::Null);
+                    ctx.bind_result(name, val.clone());
+                    Ok(val)
+                }
+                "result" => {
+                    let name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine("typecheck: result requires a string lit (name)")
+                    })?;
+                    ctx.lookup_result(name).cloned().ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: result: no stored result for '{}'",
+                            name
+                        ))
+                    })
+                }
+                "node_payload" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: node_payload: node index {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    Ok(node.payload.clone())
+                }
+                "json_type_construct" => {
+                    // Dispatch on the JSON type of `incoming` (any JSON value,
+                    // typically from `node_payload`) and mint the appropriate
+                    // type value via the host type registry.
+                    let inc = incoming.as_ref().ok_or_else(|| {
+                        LangError::engine(
+                            "typecheck: json_type_construct requires an incoming value",
+                        )
+                    })?;
+                    self.construct_json_type(inc, ctx)
+                }
+                "payload_field" => {
+                    // Extract a field from the current node's payload. `lit` is
+                    // the field name (string). Returns `Value::Null` if the field
+                    // is absent. This lets rules extract the `name` field from
+                    // `let`/`bind` nodes.
+                    let field = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine(
+                            "typecheck: payload_field requires a string lit (field name)",
+                        )
+                    })?;
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: payload_field: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    Ok(node.payload.get(field).cloned().unwrap_or(Value::Null))
+                }
+                "field" => {
+                    // Build a single-field object `{"<field_name>": value}` for
+                    // use as an arg to `construct`. `lit` is the field name
+                    // (string); `args[0]` is a sub-scheme producing the value.
+                    let field_name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine("typecheck: field requires a string lit (field name)")
+                    })?;
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "typecheck: field requires one arg (value sub-scheme)",
+                        ));
                     }
-                }
-                let payload_val = if payload.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Object(payload)
-                };
-                ctx.registry.construct(tag, &payload_val).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: construct: failed to mint type value for tag '{}'",
-                        tag
-                    ))
-                })
-            }
-            "match_type" => {
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "typecheck: match_type requires 2 args (value, cases)",
-                    ));
-                }
-                let value =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let cases = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                Ok(ctx
-                    .registry
-                    .match_type(&value, &cases)
-                    .unwrap_or(Value::Null))
-            }
-            "bind" => {
-                let name = lit
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        LangError::engine("typecheck: bind requires a string lit (name)")
-                    })?
-                    .to_string();
-                let val = incoming.unwrap_or(Value::Null);
-                ctx.bind_result(name, val.clone());
-                Ok(val)
-            }
-            "result" => {
-                let name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("typecheck: result requires a string lit (name)")
-                })?;
-                ctx.lookup_result(name).cloned().ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: result: no stored result for '{}'",
-                        name
-                    ))
-                })
-            }
-            "node_payload" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: node_payload: node index {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                Ok(node.payload.clone())
-            }
-            "json_type_construct" => {
-                // Dispatch on the JSON type of `incoming` (any JSON value,
-                // typically from `node_payload`) and mint the appropriate
-                // type value via the host type registry.
-                let inc = incoming.as_ref().ok_or_else(|| {
-                    LangError::engine("typecheck: json_type_construct requires an incoming value")
-                })?;
-                self.construct_json_type(inc, ctx)
-            }
-            "payload_field" => {
-                // Extract a field from the current node's payload. `lit` is
-                // the field name (string). Returns `Value::Null` if the field
-                // is absent. This lets rules extract the `name` field from
-                // `let`/`bind` nodes.
-                let field = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("typecheck: payload_field requires a string lit (field name)")
-                })?;
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: payload_field: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                Ok(node.payload.get(field).cloned().unwrap_or(Value::Null))
-            }
-            "field" => {
-                // Build a single-field object `{"<field_name>": value}` for
-                // use as an arg to `construct`. `lit` is the field name
-                // (string); `args[0]` is a sub-scheme producing the value.
-                let field_name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("typecheck: field requires a string lit (field name)")
-                })?;
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "typecheck: field requires one arg (value sub-scheme)",
-                    ));
-                }
-                let val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let mut m = serde_json::Map::new();
-                m.insert(field_name.to_string(), val);
-                Ok(Value::Object(m))
-            }
-            "make_array" => {
-                // Build a JSON array from the evaluated `args`, in order.
-                // Used to construct positional tuple/sum payloads (e.g. the
-                // `elements` field of a product type `(A, C)` or the
-                // `variants` field of a sum type `(A | B)`) for arrow kind
-                // signatures (ADR-0074 follow-up #3). Each arg is a sub-scheme
-                // producing one element.
-                let mut out = Vec::with_capacity(args.len());
-                for &arg in args {
-                    let val =
-                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?;
-                    out.push(val);
-                }
-                Ok(Value::Array(out))
-            }
-            "type_field" => {
-                // Extract a field from a type value (a tagged value).
-                // `lit` is the field name (string); `args[0]` is a sub-scheme
-                // that produces the type value. Returns `Value::Null` if the
-                // field is absent. Unlike `payload_field` (which reads from
-                // the current AST node's payload), `type_field` operates on
-                // an arbitrary type value passed as a sub-scheme arg — this
-                // lets rules extract `param`/`body` fields from a
-                // `type.function` value (ADR-0054 legacy migration).
-                let field_name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("typecheck: type_field requires a string lit (field name)")
-                })?;
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "typecheck: type_field requires one arg (type value sub-scheme)",
-                    ));
-                }
-                let type_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                Ok(type_val.get(field_name).cloned().unwrap_or(Value::Null))
-            }
-            "synth_last_child" => {
-                // Synthesize the type of the last child of the current node.
-                // If the node has no children (empty block), returns
-                // `type.unit`. This supports `block` type rules where the
-                // block's type is the type of its last statement
-                // (ADR-0054 legacy migration).
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: synth_last_child: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            "typecheck: synth_last_child: node has no children array",
-                            node,
-                        )
-                    })?;
-                if children.is_empty() {
-                    // Empty block → type.unit
-                    return ctx
-                        .registry
-                        .construct("type.unit", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                "typecheck: construct failed for type.unit",
-                                node,
-                            )
-                        });
-                }
-                let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine_node(
-                        "typecheck: synth_last_child: last child index is not a u64",
-                        node,
-                    )
-                })?;
-                let child = AstRef::new(last_idx as usize);
-                self.synth_node(lang, ast, child, ctx)
-            }
-            "synth_block" => {
-                // Synthesize the type of a graph block (ADR-0079). Iterates
-                // through the block's children: each `assign` child binds a
-                // local variable in Γ (synthing its value type, or unifying
-                // with a type annotation if present); non-assign children are
-                // synthed for effect. Returns the type of the last child. An
-                // empty block returns `type.unit`.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: synth_block: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            "typecheck: synth_block: node has no children array",
-                            node,
-                        )
-                    })?;
-                if children.is_empty() {
-                    return ctx
-                        .registry
-                        .construct("type.unit", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine(
-                                "typecheck: synth_block: construct failed for type.unit",
-                            )
-                        });
-                }
-                // Object-literal blocks (ADR-0079 contextual braces):
-                // `{ "k": v, "k2": w }` in a `block_children` position
-                // (e.g. an arrow body — `grammar.arrow.infix` declares
-                // `block_children: [1]`) parses as a `block` of
-                // `type-annot` children rather than an `object` of
-                // `entry` pairs. Each `type-annot` whose `name` payload
-                // echoes a string-*literal* subject is a record entry,
-                // not an annotation — when every child is entry-shaped
-                // the block denotes object *data*, so synthesize the
-                // record exactly as `synth_object_record` does (a
-                // `__tag__` entry mints the tagged type — dependent.hnl's
-                // `Sigma := (A, F) ~> {"__tag__": "type.sigma", "param":
-                // A, "body": F}` yields `type.sigma{param, body}`).
-                let object_literal = children.iter().all(|c| {
-                    c.as_u64()
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .map(|n| is_record_entry_annot(lang, ast, n))
-                        .unwrap_or(false)
-                });
-                if object_literal {
-                    return self.eval_judgment(
-                        "synth_object_record",
-                        args,
-                        lit,
+                    let val = self.eval_type_scheme_td(
                         lang,
                         ast,
                         node_ref,
+                        args[0],
                         ctx,
-                        incoming,
-                    );
+                        incoming.clone(),
+                    )?;
+                    let mut m = serde_json::Map::new();
+                    m.insert(field_name.to_string(), val);
+                    Ok(Value::Object(m))
                 }
-                // A standalone `assign` node (e.g. the last child of a
-                // block, where the block does not bind it) typechecks
-                // through `synth_assign`: bind the target, synth the
-                // value, and check it against any annotation — the
-                // `construct type.unit` legacy rule never evaluated the
-                // assign's children.
-                let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine_node(
-                        "typecheck: synth_block: last child index is not a u64",
-                        node,
-                    )
-                })? as usize;
-                // Bind each assign child (all children except the last, which
-                // is the block's result expression).
-                for (i, entry) in children.iter().enumerate() {
-                    if i == children.len() - 1 {
-                        break;
+                "make_array" => {
+                    // Build a JSON array from the evaluated `args`, in order.
+                    // Used to construct positional tuple/sum payloads (e.g. the
+                    // `elements` field of a product type `(A, C)` or the
+                    // `variants` field of a sum type `(A | B)`) for arrow kind
+                    // signatures (ADR-0074 follow-up #3). Each arg is a sub-scheme
+                    // producing one element.
+                    let mut out = Vec::with_capacity(args.len());
+                    for &arg in args {
+                        let val = self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            arg,
+                            ctx,
+                            incoming.clone(),
+                        )?;
+                        out.push(val);
                     }
-                    let child_idx = entry.as_u64().ok_or_else(|| {
-                        LangError::engine_node(
-                            "typecheck: synth_block: child index is not a u64",
-                            node,
-                        )
-                    })? as usize;
-                    let child_node = ast.get(AstRef::new(child_idx)).ok_or_else(|| {
-                        LangError::engine(format!(
-                            "typecheck: synth_block: child node {} out of bounds",
-                            child_idx
-                        ))
-                    })?;
-                    if !is_assign_node(lang, &child_node) {
-                        // Non-assign child: synth for effect (type errors still
-                        // surface). The result is discarded.
-                        let _ = self.synth_node(lang, ast, AstRef::new(child_idx), ctx)?;
-                        continue;
-                    }
-                    // `synth_assign` owns the assign judgment: it extracts
-                    // (name, value, annot) across the payload-name /
-                    // 2-child / 3-child / arrow-annot (`f : A ~> B`)
-                    // shapes and — for dependent annotations — checks the
-                    // value *against* the former without a pre-synth
-                    // (ADR-0152: a pre-synth would check `match` arms under
-                    // an unsolved-meta scrutinee with empty `results`).
-                    self.synth_assign_judgment(lang, ast, &child_node, ctx)?;
+                    Ok(Value::Array(out))
                 }
-                self.synth_node(lang, ast, AstRef::new(last_idx), ctx)
-            }
-            "check_json_value" => {
-                // Check the current node's JSON payload against an expected
-                // collection type (type.number, type.string, type.bool,
-                // type.null). The expected type is in `incoming` (threaded by
-                // the `check` scheme) or `args[0]`. Returns `Null` on success,
-                // errors on mismatch (ADR-0054 directed checking for `value`).
-                let expected = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let expected_tag = ctx.registry.as_type_tag(&expected).ok_or_else(|| {
-                    LangError::engine("check_json_value: expected type is not a tagged type value")
-                })?;
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "check_json_value: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let payload = &node.payload;
-                let matches = match expected_tag {
-                    "type.number" => payload.is_number(),
-                    "type.string" => payload.is_string(),
-                    "type.bool" => payload.is_boolean(),
-                    "type.null" => payload.is_null(),
-                    _ => false,
-                };
-                if matches {
-                    Ok(Value::Null)
-                } else {
-                    Err(LangError::engine(format!(
-                        "typecheck: value {:?} does not match expected type {}",
-                        payload, expected_tag
-                    )))
-                }
-            }
-            "check_last_child" => {
-                // Check the last child of the current node against the expected
-                // type (incoming or args[0]). Supports directed checking for
-                // `block` nodes: the block's type is the type of its last
-                // statement (ADR-0054).
-                let expected = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "check_last_child: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node("check_last_child: node has no children array", node)
-                    })?;
-                if children.is_empty() {
-                    // Empty block — accept any expected type (the block is
-                    // vacuously well-typed; a precise check would unify with
-                    // type.unit).
-                    return Ok(Value::Null);
-                }
-                let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine_node("check_last_child: last child index is not a u64", node)
-                })?;
-                let child = AstRef::new(last_idx as usize);
-                self.check_node(lang, ast, child, &expected, ctx)?;
-                Ok(Value::Null)
-            }
-            "check_block" => {
-                // Directed checking for a graph block (ADR-0079). Binds
-                // assign children in Γ (same as `synth_block`), then checks
-                // the last child against the expected type. An empty block
-                // is vacuously well-typed.
-                let expected = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "check_block: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node("check_block: node has no children array", node)
-                    })?;
-                if children.is_empty() {
-                    return Ok(Value::Null);
-                }
-                let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
-                    LangError::engine_node("check_block: last child index is not a u64", node)
-                })? as usize;
-                // Bind each assign child (all children except the last).
-                for (i, entry) in children.iter().enumerate() {
-                    if i == children.len() - 1 {
-                        break;
-                    }
-                    let child_idx = entry.as_u64().ok_or_else(|| {
-                        LangError::engine_node("check_block: child index is not a u64", node)
-                    })? as usize;
-                    let child_node = ast.get(AstRef::new(child_idx)).ok_or_else(|| {
-                        LangError::engine(format!(
-                            "check_block: child node {} out of bounds",
-                            child_idx
-                        ))
-                    })?;
-                    if !is_assign_node(lang, &child_node) {
-                        let _ = self.synth_node(lang, ast, AstRef::new(child_idx), ctx)?;
-                        continue;
-                    }
-                    // Same judgment as `synth_block` — `synth_assign` owns
-                    // (name, value, annot) extraction and the check-against-
-                    // annotation ordering (no pre-synth for dependent
-                    // formers, ADR-0152).
-                    self.synth_assign_judgment(lang, ast, &child_node, ctx)?;
-                }
-                self.check_node(lang, ast, AstRef::new(last_idx), &expected, ctx)?;
-                Ok(Value::Null)
-            }
-            "check_all_children" => {
-                // Check all children of the current node against a single
-                // expected type (useful for checking array elements against a
-                // uniform element type). The expected type comes from
-                // `incoming` (threaded by the `check` scheme) or `args[0]`
-                // (ADR-0054 — Term lacks iteration, so this is a judgment op).
-                let expected = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "check_all_children: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            "check_all_children: node has no children array",
-                            node,
+                "type_field" => {
+                    // Extract a field from a type value (a tagged value).
+                    // `lit` is the field name (string); `args[0]` is a sub-scheme
+                    // that produces the type value. Returns `Value::Null` if the
+                    // field is absent. Unlike `payload_field` (which reads from
+                    // the current AST node's payload), `type_field` operates on
+                    // an arbitrary type value passed as a sub-scheme arg — this
+                    // lets rules extract `param`/`body` fields from a
+                    // `type.function` value (ADR-0054 legacy migration).
+                    let field_name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine(
+                            "typecheck: type_field requires a string lit (field name)",
                         )
                     })?;
-                for child_entry in children {
-                    let child_idx = child_entry.as_u64().ok_or_else(|| {
-                        LangError::engine_node("check_all_children: child index is not a u64", node)
-                    })? as usize;
-                    let child_ref = AstRef::new(child_idx);
-                    self.check_node(lang, ast, child_ref, &expected, ctx)?;
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "typecheck: type_field requires one arg (type value sub-scheme)",
+                        ));
+                    }
+                    let type_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    Ok(type_val.get(field_name).cloned().unwrap_or(Value::Null))
                 }
-                Ok(Value::Null)
-            }
-            "synth_match_arms" => {
-                // Dependent elimination (ADR-0152 §3 — WS-C rewrite):
-                // ctor-pattern arms instantiate `type.ctor_sig`s and refine
-                // the scrutinee's family indices (rigid `var` rewrites +
-                // `eq_<name>` `Path` witnesses); decided-impossible arms
-                // auto-discharge (`absurd` remains legal documentation);
-                // the motive, when present, is applied per arm at the
-                // refined indices.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "synth_match_arms: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node("synth_match_arms: node has no children array", node)
+                "synth_last_child" => {
+                    // Synthesize the type of the last child of the current node.
+                    // If the node has no children (empty block), returns
+                    // `type.unit`. This supports `block` type rules where the
+                    // block's type is the type of its last statement
+                    // (ADR-0054 legacy migration).
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: synth_last_child: node {} out of bounds",
+                            node_ref.index()
+                        ))
                     })?;
-                if children.len() < 2 {
-                    // No arms — return type.unknown
-                    return ctx
-                        .registry
-                        .construct("type.unknown", &Value::Null)
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
                         .ok_or_else(|| {
                             LangError::engine_node(
-                                "synth_match_arms: construct failed for type.unknown",
+                                "typecheck: synth_last_child: node has no children array",
                                 node,
                             )
-                        });
+                        })?;
+                    if children.is_empty() {
+                        // Empty block → type.unit
+                        return ctx
+                            .registry
+                            .construct("type.unit", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "typecheck: construct failed for type.unit",
+                                    node,
+                                )
+                            });
+                    }
+                    let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine_node(
+                            "typecheck: synth_last_child: last child index is not a u64",
+                            node,
+                        )
+                    })?;
+                    let child = AstRef::new(last_idx as usize);
+                    self.synth_node(lang, ast, child, ctx)
                 }
-                let scrutinee_idx = children[0].as_u64().ok_or_else(|| {
-                    LangError::engine_node(
-                        "synth_match_arms: scrutinee child index is not a u64",
-                        node,
-                    )
-                })? as usize;
-                // `motive` role (optional middle child of the 3-child
-                // `return … with` form) — resolved by declared role, not
-                // position. `child_role_index_for`/`role_index_of` return
-                // a *child position*; map it through `children` to the
-                // arena index.
-                let motive_idx = if children.len() >= 3 {
-                    lang.child_role_index_for(node, "motive")
-                        .ok()
-                        .flatten()
-                        .or_else(|| role_index_of(lang, &node.kind, "motive"))
-                        .and_then(|pos| {
-                            children
-                                .get(pos)
-                                .and_then(Value::as_u64)
-                                .map(|v| v as usize)
-                        })
-                        .and_then(|i| {
-                            // Guard: a `block`-kinded child is the arms, not
-                            // a motive.
-                            match ast.get(AstRef::new(i)) {
-                                Some(n) if !is_block_node(lang, n) => Some(i),
-                                _ => None,
-                            }
-                        })
-                } else {
-                    None
-                };
-                // The arm block is the last child.
-                let block_idx = children.last().and_then(Value::as_u64).ok_or_else(|| {
-                    LangError::engine_node("synth_match_arms: arm child index is not a u64", node)
-                })? as usize;
-                let block_ref = AstRef::new(block_idx);
-                let arm_indices: Vec<usize> = {
-                    let block_node = ast.get(block_ref).ok_or_else(|| {
+                "synth_block" => {
+                    // Synthesize the type of a graph block (ADR-0079). Iterates
+                    // through the block's children: each `assign` child binds a
+                    // local variable in Γ (synthing its value type, or unifying
+                    // with a type annotation if present); non-assign children are
+                    // synthed for effect. Returns the type of the last child. An
+                    // empty block returns `type.unit`.
+                    let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine(format!(
-                            "synth_match_arms: block node {} out of bounds",
-                            block_idx
+                            "typecheck: synth_block: node {} out of bounds",
+                            node_ref.index()
                         ))
                     })?;
-                    if is_block_node(lang, &block_node) {
-                        block_node
-                            .payload
-                            .get("children")
-                            .and_then(|c| c.as_array())
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "typecheck: synth_block: node has no children array",
+                                node,
+                            )
+                        })?;
+                    if children.is_empty() {
+                        return ctx
+                            .registry
+                            .construct("type.unit", &Value::Null)
                             .ok_or_else(|| {
                                 LangError::engine(
-                                    "synth_match_arms: block node has no children array",
+                                    "typecheck: synth_block: construct failed for type.unit",
                                 )
-                            })?
-                            .iter()
-                            .map(|v| {
-                                v.as_u64().ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "synth_match_arms: arm index is not a u64",
-                                        node,
-                                    )
-                                }) as Result<u64, LangError>
-                            })
-                            .map(|r| r.map(|v| v as usize))
-                            .collect::<Result<Vec<_>, _>>()?
-                    } else {
-                        // Legacy: arms are direct children of match (1..)
-                        children[1..]
-                            .iter()
-                            .map(|v| {
-                                v.as_u64().ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "synth_match_arms: arm index is not a u64",
-                                        node,
-                                    )
-                                }) as Result<u64, LangError>
-                            })
-                            .map(|r| r.map(|v| v as usize))
-                            .collect::<Result<Vec<_>, _>>()?
+                            });
                     }
-                };
-                let scrutinee_ref = AstRef::new(scrutinee_idx);
-                let scrutinee_type = self.synth_node(lang, ast, scrutinee_ref, ctx)?;
-                self.synth_match_dependent(
-                    lang,
-                    ast,
-                    node,
-                    &arm_indices,
-                    scrutinee_idx,
-                    motive_idx,
-                    &scrutinee_type,
-                    ctx,
-                )
-            }
-            "synth_assign" => {
-                // Standalone `assign` — the legacy `type.assign` rule was
-                // a bare `construct type.unit`, so a last-position
-                // `x : T = v` never checked `v`. This op binds the
-                // target, synths the value, and dep-checks annotations.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_assign: node out of bounds".to_string())
-                })?;
-                self.synth_assign_judgment(lang, ast, node, ctx)
-            }
-            "synth_data" => {
-                // ADR-0152 §1: bind `F : type.family` and each ctor a
-                // `type.ctor_sig` — with checker-owned strict positivity.
-                self.synth_data_judgment(lang, ast, node_ref, ctx)
-            }
-            "synth_instance" => {
-                // `instance <C(i⃗)> := <dict>` (phase-3 WS-A): elaborate
-                // the constraint former application, enforce coherence,
-                // check the dict, and register `(head, args) ↦ dict` in
-                // the instance table for call-site dictionary search.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_instance: node out of bounds".to_string())
-                })?;
-                self.synth_instance_judgment(lang, ast, node, ctx)
-            }
-            "synth_call" => {
-                // Curried application: ctor/function/pi chains, dependent
-                // application through `body_closure`s, family_app for
-                // term-position family use.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_call: node out of bounds".to_string())
-                })?;
-                self.synth_call_judgment(lang, ast, node, ctx)
-            }
-            "check_call" => {
-                // The directed `call` check (`type.call`'s `check`):
-                // `perform(op, arg)` intercepts (its op operand is a
-                // name, not a checkable value); every other call runs
-                // the former scheme verbatim — synth the callee, check
-                // the first argument against its `param`, yield `body`.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("check_call: node out of bounds".to_string())
-                })?;
-                self.check_call_judgment(lang, ast, node_ref, node, incoming, ctx)
-            }
-            "synth_import" => {
-                // `stmt.import` binds `m : Sig_m` (the signature record),
-                // named projections, `* as m` (the record), or `*`
-                // (field splice); dynamic specs → `type.unknown`.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_import: node out of bounds".to_string())
-                })?;
-                self.synth_import_judgment(lang, ast, node, ctx)
-            }
-            "synth_export" => {
-                // `stmt.export` records (name, type) into the module's
-                // `Sig_m` signature record (ctx.exports → TypecheckResult
-                // .signature).
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_export: node out of bounds".to_string())
-                })?;
-                self.synth_export_judgment(lang, ast, node, ctx)
-            }
-            "synth_handle" => {
-                // `handle <body> with <h>` (phase-2 WS-F): check `h`'s
-                // declared impls against the body's `IO(S)` op set and
-                // re-wrap the residual — covered entries take the impl's
-                // declared return, uncovered stay `IO` ops.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_handle: node out of bounds".to_string())
-                })?;
-                self.synth_handle_judgment(lang, ast, node, ctx)
-            }
-            "synth_dim_arrow" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_dim_arrow: node out of bounds".to_string())
-                })?;
-                self.synth_dim_arrow_judgment(lang, ast, node, ctx)
-            }
-            "synth_transport" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_transport: node out of bounds".to_string())
-                })?;
-                self.synth_transport_judgment(lang, ast, node, ctx)
-            }
-            "synth_j" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_j: node out of bounds".to_string())
-                })?;
-                self.synth_j_judgment(lang, ast, node, ctx)
-            }
-            "synth_flow" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_flow: node out of bounds".to_string())
-                })?;
-                self.synth_flow_judgment(lang, ast, node, ctx)
-            }
-            "synth_axis_flow" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_axis_flow: node out of bounds".to_string())
-                })?;
-                self.synth_axis_flow_judgment(lang, ast, node, ctx)
-            }
-            "synth_cell_id" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_cell_id: node out of bounds".to_string())
-                })?;
-                self.synth_cell_id_judgment(lang, ast, node, ctx)
-            }
-            "synth_cell_comp_v" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_cell_comp_v: node out of bounds".to_string())
-                })?;
-                self.synth_cell_comp_axis_judgment(lang, ast, node, 2, ctx)
-            }
-            "synth_cell_comp_h" => {
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine("synth_cell_comp_h: node out of bounds".to_string())
-                })?;
-                self.synth_cell_comp_axis_judgment(lang, ast, node, 0, ctx)
-            }
-            "synth_rec" => {
-                // Typecheck a `rec` region (ADR-0074 ID.3 — Paterson loop
-                // fixpoint typing). The `rec` node is a flattened block: its
-                // children are bindings (`assign` nodes) and expressions.
-                // Bindings may reference each other cyclically. The judgment
-                // allocates a fresh metavariable per binding, extends Γ, and
-                // iterates synth+unify until the binding types stabilize
-                // (the fixpoint). A fuel limit prevents divergence. The
-                // result is the type of the last child (or a `return` child's
-                // value). Termination is NOT checked at the type level.
-                self.synth_rec_judgment(lang, ast, node_ref, ctx)
-            }
-            "synth_while" => {
-                // Typecheck a `while` node (ADR-0074 A.1/A.5). The checker
-                // sees the *pre-desugar* AST, so both surface protocols
-                // arrive here:
-                //   * `while <state> { <step-closure> }` — the state-passing
-                //     `loop_step` form (child 1 declares a `params` role —
-                //     the same discriminator `transform.desugar.while.state`
-                //     uses, expressed role-wise): the state child synthesizes,
-                //     the closure's params bind to the state's record fields
-                //     (a single non-pattern param receives the whole state,
-                //     matching `build_loop_step_args`), and the body checks
-                //     against `type.unknown` — internals report, but the
-                //     `{state: …}`/`{out: …}` protocol records on different
-                //     control-flow paths never have to join. Result:
-                //     `type.unknown` (the `{ out: v }` payload type is not
-                //     statically recoverable).
-                //   * `while <cond> { <stmts…> }` — the pre-test form that
-                //     desugars to `rec`: the condition synthesizes and
-                //     unifies with `type.bool` (mirroring `type.if`), and
-                //     the body statements check in a Γ scope that pops on
-                //     exit (matching `eval_block`'s `env_push`/`env_pop` —
-                //     body-local binds do not escape; rebinding an outer
-                //     name shadows in Γ for the body's extent — rebinding
-                //     discipline across iterations is intentionally not
-                //     modeled). Result: `type.unit`.
-                self.synth_while_judgment(lang, ast, node_ref, ctx)
-            }
-            // ADR-0079: `synth_let` removed (let keyword deleted, graph blocks
-            // replace it). The `synth_block` handler handles assign children.
-            "synth_function" => {
-                // Typecheck a `function` node. The node has children
-                // [paren, body] where `paren` has children [var(name)]. We
-                // bind the parameter name to a fresh metavariable (unknown
-                // type) in Γ, synth the body, then construct
-                // type.function{param: meta, body: body-type}
-                // (ADR-0054 — the DSL can't navigate grandchildren or create
-                // metas, so this is a judgment op).
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "synth_function: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node("synth_function: node has no children array", node)
-                    })?;
-                if children.len() < 2 {
-                    return Err(LangError::engine(
-                        "synth_function: node needs at least 2 children (params, body)",
-                    ));
-                }
-                // Resolve params/body by child role (ADR-0081), falling back
-                // to the positional children for role-less shapes.
-                let params_ref = role_child_ref(lang, node, "params").or_else(|| {
-                    children
-                        .first()
-                        .and_then(|v| v.as_u64())
-                        .map(|i| AstRef::new(i as usize))
-                });
-                let body_ref = role_child_ref(lang, node, "body").or_else(|| {
-                    children
-                        .get(1)
-                        .and_then(|v| v.as_u64())
-                        .map(|i| AstRef::new(i as usize))
-                });
-                let params_ref = params_ref.ok_or_else(|| {
-                    LangError::engine_node("synth_function: no params child", node)
-                })?;
-                let body_ref = body_ref
-                    .ok_or_else(|| LangError::engine_node("synth_function: no body child", node))?;
-                let params_node = ast.get(params_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "synth_function: params node {} out of bounds",
-                        params_ref.index()
-                    ))
-                })?;
-                // `param_names` resolves the fixed params and an optional
-                // rest param (`[a, ...rest] ~> body`) data-driven via
-                // `pattern_role`/variadic-role metadata (ADR-0081). A
-                // single param (`x ~> body` or `(x) ~> body`) keeps the
-                // unary `type.function{param: meta, body}` shape; a
-                // multi-param/rest arrow gets a positional
-                // `type.array{elements: [...]}` param (the same encoding
-                // `flow`/`fanout` use for tuples — ADR-0074 §3), with the
-                // rest binding typed `type.array{element: meta}`.
-                //
-                // Array-pattern arrows (`[x, y] ~> body`) consume one array
-                // argument: the param side is a `type.array` whose element
-                // types are the fixed params (and, with a rest binding, an
-                // unknown-length tail).
-                let (param_names, rest_name) = lang
-                    .param_names(ast, &params_node)
-                    .map_err(|e| LangError::engine_node(e.to_string(), node))?;
-                let array_pattern = lang.is_array_pattern(&params_node);
-                if !array_pattern && param_names.len() == 1 && rest_name.is_none() {
-                    let param_meta = ctx.fresh_meta();
-                    let param_type = meta_value(param_meta);
-                    ctx.extend(param_names[0].clone(), param_type.clone());
-                    let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
-                    // Zonk so callers see solved parameter types (e.g. `flow`
-                    // can extract a concrete param type from the function
-                    // value).
-                    let param_type = self.zonk(&param_type, ctx);
-                    let body_type = self.zonk(&body_type, ctx);
-                    let payload = serde_json::json!({"param": param_type, "body": body_type});
-                    ctx.registry
-                        .construct("type.function", &payload)
-                        .ok_or_else(|| {
+                    // Object-literal blocks (ADR-0079 contextual braces):
+                    // `{ "k": v, "k2": w }` in a `block_children` position
+                    // (e.g. an arrow body — `grammar.arrow.infix` declares
+                    // `block_children: [1]`) parses as a `block` of
+                    // `type-annot` children rather than an `object` of
+                    // `entry` pairs. Each `type-annot` whose `name` payload
+                    // echoes a string-*literal* subject is a record entry,
+                    // not an annotation — when every child is entry-shaped
+                    // the block denotes object *data*, so synthesize the
+                    // record exactly as `synth_object_record` does (a
+                    // `__tag__` entry mints the tagged type — dependent.hnl's
+                    // `Sigma := (A, F) ~> {"__tag__": "type.sigma", "param":
+                    // A, "body": F}` yields `type.sigma{param, body}`).
+                    let object_literal = children.iter().all(|c| {
+                        c.as_u64()
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .map(|n| is_record_entry_annot(lang, ast, n))
+                            .unwrap_or(false)
+                    });
+                    if object_literal {
+                        return self.eval_judgment(
+                            "synth_object_record",
+                            args,
+                            lit,
+                            lang,
+                            ast,
+                            node_ref,
+                            ctx,
+                            incoming,
+                        );
+                    }
+                    // A standalone `assign` node (e.g. the last child of a
+                    // block, where the block does not bind it) typechecks
+                    // through `synth_assign`: bind the target, synth the
+                    // value, and check it against any annotation — the
+                    // `construct type.unit` legacy rule never evaluated the
+                    // assign's children.
+                    let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine_node(
+                            "typecheck: synth_block: last child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    // Bind each assign child (all children except the last, which
+                    // is the block's result expression).
+                    for (i, entry) in children.iter().enumerate() {
+                        if i == children.len() - 1 {
+                            break;
+                        }
+                        let child_idx = entry.as_u64().ok_or_else(|| {
                             LangError::engine_node(
-                                "synth_function: construct failed for type.function",
+                                "typecheck: synth_block: child index is not a u64",
                                 node,
                             )
-                        })
-                } else if array_pattern {
-                    // Array-pattern: one array argument whose elements bind
-                    // to the fixed params and (optionally) a rest tail.
-                    let param_type = if let Some(rest_name) = &rest_name {
-                        let elem_meta = meta_value(ctx.fresh_meta());
-                        let rest_ty = ctx
-                            .registry
-                            .construct("type.array", &serde_json::json!({"element": elem_meta}))
-                            .ok_or_else(|| {
-                                LangError::engine_node(
-                                    "synth_function: construct failed for type.array",
-                                    node,
-                                )
-                            })?;
-                        ctx.extend(rest_name.clone(), rest_ty.clone());
-                        for name in &param_names {
-                            ctx.extend(name.clone(), elem_meta.clone());
+                        })? as usize;
+                        let child_node = ast.get(AstRef::new(child_idx)).ok_or_else(|| {
+                            LangError::engine(format!(
+                                "typecheck: synth_block: child node {} out of bounds",
+                                child_idx
+                            ))
+                        })?;
+                        if !is_assign_node(lang, child_node) {
+                            // Non-assign child: synth for effect (type errors still
+                            // surface). The result is discarded.
+                            let _ = self.synth_node(lang, ast, AstRef::new(child_idx), ctx)?;
+                            continue;
                         }
-                        ctx.registry
-                            .construct("type.array", &serde_json::json!({"element": elem_meta}))
+                        // `synth_assign` owns the assign judgment: it extracts
+                        // (name, value, annot) across the payload-name /
+                        // 2-child / 3-child / arrow-annot (`f : A ~> B`)
+                        // shapes and — for dependent annotations — checks the
+                        // value *against* the former without a pre-synth
+                        // (ADR-0152: a pre-synth would check `match` arms under
+                        // an unsolved-meta scrutinee with empty `results`).
+                        self.synth_assign_judgment(lang, ast, child_node, ctx)?;
+                    }
+                    self.synth_node(lang, ast, AstRef::new(last_idx), ctx)
+                }
+                "check_json_value" => {
+                    // Check the current node's JSON payload against an expected
+                    // collection type (type.number, type.string, type.bool,
+                    // type.null). The expected type is in `incoming` (threaded by
+                    // the `check` scheme) or `args[0]`. Returns `Null` on success,
+                    // errors on mismatch (ADR-0054 directed checking for `value`).
+                    let expected = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let expected_tag = ctx.registry.as_type_tag(&expected).ok_or_else(|| {
+                        LangError::engine(
+                            "check_json_value: expected type is not a tagged type value",
+                        )
+                    })?;
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "check_json_value: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let payload = &node.payload;
+                    let matches = match expected_tag {
+                        "type.number" => payload.is_number(),
+                        "type.string" => payload.is_string(),
+                        "type.bool" => payload.is_boolean(),
+                        "type.null" => payload.is_null(),
+                        _ => false,
+                    };
+                    if matches {
+                        Ok(Value::Null)
+                    } else {
+                        Err(LangError::engine(format!(
+                            "typecheck: value {:?} does not match expected type {}",
+                            payload, expected_tag
+                        )))
+                    }
+                }
+                "check_last_child" => {
+                    // Check the last child of the current node against the expected
+                    // type (incoming or args[0]). Supports directed checking for
+                    // `block` nodes: the block's type is the type of its last
+                    // statement (ADR-0054).
+                    let expected = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "check_last_child: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "check_last_child: node has no children array",
+                                node,
+                            )
+                        })?;
+                    if children.is_empty() {
+                        // Empty block — accept any expected type (the block is
+                        // vacuously well-typed; a precise check would unify with
+                        // type.unit).
+                        return Ok(Value::Null);
+                    }
+                    let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine_node(
+                            "check_last_child: last child index is not a u64",
+                            node,
+                        )
+                    })?;
+                    let child = AstRef::new(last_idx as usize);
+                    self.check_node(lang, ast, child, &expected, ctx)?;
+                    Ok(Value::Null)
+                }
+                "check_block" => {
+                    // Directed checking for a graph block (ADR-0079). Binds
+                    // assign children in Γ (same as `synth_block`), then checks
+                    // the last child against the expected type. An empty block
+                    // is vacuously well-typed.
+                    let expected = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "check_block: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node("check_block: node has no children array", node)
+                        })?;
+                    if children.is_empty() {
+                        return Ok(Value::Null);
+                    }
+                    let last_idx = children.last().and_then(|v| v.as_u64()).ok_or_else(|| {
+                        LangError::engine_node("check_block: last child index is not a u64", node)
+                    })? as usize;
+                    // Bind each assign child (all children except the last).
+                    for (i, entry) in children.iter().enumerate() {
+                        if i == children.len() - 1 {
+                            break;
+                        }
+                        let child_idx = entry.as_u64().ok_or_else(|| {
+                            LangError::engine_node("check_block: child index is not a u64", node)
+                        })? as usize;
+                        let child_node = ast.get(AstRef::new(child_idx)).ok_or_else(|| {
+                            LangError::engine(format!(
+                                "check_block: child node {} out of bounds",
+                                child_idx
+                            ))
+                        })?;
+                        if !is_assign_node(lang, child_node) {
+                            let _ = self.synth_node(lang, ast, AstRef::new(child_idx), ctx)?;
+                            continue;
+                        }
+                        // Same judgment as `synth_block` — `synth_assign` owns
+                        // (name, value, annot) extraction and the check-against-
+                        // annotation ordering (no pre-synth for dependent
+                        // formers, ADR-0152).
+                        self.synth_assign_judgment(lang, ast, child_node, ctx)?;
+                    }
+                    self.check_node(lang, ast, AstRef::new(last_idx), &expected, ctx)?;
+                    Ok(Value::Null)
+                }
+                "check_all_children" => {
+                    // Check all children of the current node against a single
+                    // expected type (useful for checking array elements against a
+                    // uniform element type). The expected type comes from
+                    // `incoming` (threaded by the `check` scheme) or `args[0]`
+                    // (ADR-0054 — Term lacks iteration, so this is a judgment op).
+                    let expected = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "check_all_children: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "check_all_children: node has no children array",
+                                node,
+                            )
+                        })?;
+                    for child_entry in children {
+                        let child_idx = child_entry.as_u64().ok_or_else(|| {
+                            LangError::engine_node(
+                                "check_all_children: child index is not a u64",
+                                node,
+                            )
+                        })? as usize;
+                        let child_ref = AstRef::new(child_idx);
+                        self.check_node(lang, ast, child_ref, &expected, ctx)?;
+                    }
+                    Ok(Value::Null)
+                }
+                "synth_match_arms" => {
+                    // Dependent elimination (ADR-0152 §3 — WS-C rewrite):
+                    // ctor-pattern arms instantiate `type.ctor_sig`s and refine
+                    // the scrutinee's family indices (rigid `var` rewrites +
+                    // `eq_<name>` `Path` witnesses); decided-impossible arms
+                    // auto-discharge (`absurd` remains legal documentation);
+                    // the motive, when present, is applied per arm at the
+                    // refined indices.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "synth_match_arms: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "synth_match_arms: node has no children array",
+                                node,
+                            )
+                        })?;
+                    if children.len() < 2 {
+                        // No arms — return type.unknown
+                        return ctx
+                            .registry
+                            .construct("type.unknown", &Value::Null)
                             .ok_or_else(|| {
                                 LangError::engine_node(
-                                    "synth_function: construct failed for type.array",
+                                    "synth_match_arms: construct failed for type.unknown",
                                     node,
                                 )
-                            })?
+                            });
+                    }
+                    let scrutinee_idx = children[0].as_u64().ok_or_else(|| {
+                        LangError::engine_node(
+                            "synth_match_arms: scrutinee child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    // `motive` role (optional middle child of the 3-child
+                    // `return … with` form) — resolved by declared role, not
+                    // position. `child_role_index_for`/`role_index_of` return
+                    // a *child position*; map it through `children` to the
+                    // arena index.
+                    let motive_idx = if children.len() >= 3 {
+                        lang.child_role_index_for(node, "motive")
+                            .ok()
+                            .flatten()
+                            .or_else(|| role_index_of(lang, &node.kind, "motive"))
+                            .and_then(|pos| {
+                                children
+                                    .get(pos)
+                                    .and_then(Value::as_u64)
+                                    .map(|v| v as usize)
+                            })
+                            .and_then(|i| {
+                                // Guard: a `block`-kinded child is the arms, not
+                                // a motive.
+                                match ast.get(AstRef::new(i)) {
+                                    Some(n) if !is_block_node(lang, n) => Some(i),
+                                    _ => None,
+                                }
+                            })
                     } else {
-                        let mut elems: Vec<Value> = Vec::with_capacity(param_names.len());
+                        None
+                    };
+                    // The arm block is the last child.
+                    let block_idx = children.last().and_then(Value::as_u64).ok_or_else(|| {
+                        LangError::engine_node(
+                            "synth_match_arms: arm child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    let block_ref = AstRef::new(block_idx);
+                    let arm_indices: Vec<usize> = {
+                        let block_node = ast.get(block_ref).ok_or_else(|| {
+                            LangError::engine(format!(
+                                "synth_match_arms: block node {} out of bounds",
+                                block_idx
+                            ))
+                        })?;
+                        if is_block_node(lang, block_node) {
+                            block_node
+                                .payload
+                                .get("children")
+                                .and_then(|c| c.as_array())
+                                .ok_or_else(|| {
+                                    LangError::engine(
+                                        "synth_match_arms: block node has no children array",
+                                    )
+                                })?
+                                .iter()
+                                .map(|v| {
+                                    v.as_u64().ok_or_else(|| {
+                                        LangError::engine_node(
+                                            "synth_match_arms: arm index is not a u64",
+                                            node,
+                                        )
+                                    }) as Result<u64, LangError>
+                                })
+                                .map(|r| r.map(|v| v as usize))
+                                .collect::<Result<Vec<_>, _>>()?
+                        } else {
+                            // Legacy: arms are direct children of match (1..)
+                            children[1..]
+                                .iter()
+                                .map(|v| {
+                                    v.as_u64().ok_or_else(|| {
+                                        LangError::engine_node(
+                                            "synth_match_arms: arm index is not a u64",
+                                            node,
+                                        )
+                                    }) as Result<u64, LangError>
+                                })
+                                .map(|r| r.map(|v| v as usize))
+                                .collect::<Result<Vec<_>, _>>()?
+                        }
+                    };
+                    let scrutinee_ref = AstRef::new(scrutinee_idx);
+                    let scrutinee_type = self.synth_node(lang, ast, scrutinee_ref, ctx)?;
+                    self.synth_match_dependent(
+                        lang,
+                        ast,
+                        node,
+                        &arm_indices,
+                        scrutinee_idx,
+                        motive_idx,
+                        &scrutinee_type,
+                        ctx,
+                    )
+                }
+                "synth_assign" => {
+                    // Standalone `assign` — the legacy `type.assign` rule was
+                    // a bare `construct type.unit`, so a last-position
+                    // `x : T = v` never checked `v`. This op binds the
+                    // target, synths the value, and dep-checks annotations.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_assign: node out of bounds".to_string())
+                    })?;
+                    self.synth_assign_judgment(lang, ast, node, ctx)
+                }
+                "synth_data" => {
+                    // ADR-0152 §1: bind `F : type.family` and each ctor a
+                    // `type.ctor_sig` — with checker-owned strict positivity.
+                    self.synth_data_judgment(lang, ast, node_ref, ctx)
+                }
+                "synth_instance" => {
+                    // `instance <C(i⃗)> := <dict>` (phase-3 WS-A): elaborate
+                    // the constraint former application, enforce coherence,
+                    // check the dict, and register `(head, args) ↦ dict` in
+                    // the instance table for call-site dictionary search.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_instance: node out of bounds".to_string())
+                    })?;
+                    self.synth_instance_judgment(lang, ast, node, ctx)
+                }
+                "synth_call" => {
+                    // Curried application: ctor/function/pi chains, dependent
+                    // application through `body_closure`s, family_app for
+                    // term-position family use.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_call: node out of bounds".to_string())
+                    })?;
+                    self.synth_call_judgment(lang, ast, node, ctx)
+                }
+                "check_call" => {
+                    // The directed `call` check (`type.call`'s `check`):
+                    // `perform(op, arg)` intercepts (its op operand is a
+                    // name, not a checkable value); every other call runs
+                    // the former scheme verbatim — synth the callee, check
+                    // the first argument against its `param`, yield `body`.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("check_call: node out of bounds".to_string())
+                    })?;
+                    self.check_call_judgment(lang, ast, node_ref, node, incoming, ctx)
+                }
+                "synth_import" => {
+                    // `stmt.import` binds `m : Sig_m` (the signature record),
+                    // named projections, `* as m` (the record), or `*`
+                    // (field splice); dynamic specs → `type.unknown`.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_import: node out of bounds".to_string())
+                    })?;
+                    self.synth_import_judgment(lang, ast, node, ctx)
+                }
+                "synth_export" => {
+                    // `stmt.export` records (name, type) into the module's
+                    // `Sig_m` signature record (ctx.exports → TypecheckResult
+                    // .signature).
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_export: node out of bounds".to_string())
+                    })?;
+                    self.synth_export_judgment(lang, ast, node, ctx)
+                }
+                "synth_handle" => {
+                    // `handle <body> with <h>` (phase-2 WS-F): check `h`'s
+                    // declared impls against the body's `IO(S)` op set and
+                    // re-wrap the residual — covered entries take the impl's
+                    // declared return, uncovered stay `IO` ops.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_handle: node out of bounds".to_string())
+                    })?;
+                    self.synth_handle_judgment(lang, ast, node, ctx)
+                }
+                "synth_dim_arrow" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_dim_arrow: node out of bounds".to_string())
+                    })?;
+                    self.synth_dim_arrow_judgment(lang, ast, node, ctx)
+                }
+                "synth_transport" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_transport: node out of bounds".to_string())
+                    })?;
+                    self.synth_transport_judgment(lang, ast, node, ctx)
+                }
+                "synth_j" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_j: node out of bounds".to_string())
+                    })?;
+                    self.synth_j_judgment(lang, ast, node, ctx)
+                }
+                "synth_flow" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_flow: node out of bounds".to_string())
+                    })?;
+                    self.synth_flow_judgment(lang, ast, node, ctx)
+                }
+                "synth_axis_flow" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_axis_flow: node out of bounds".to_string())
+                    })?;
+                    self.synth_axis_flow_judgment(lang, ast, node, ctx)
+                }
+                "synth_cell_id" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_cell_id: node out of bounds".to_string())
+                    })?;
+                    self.synth_cell_id_judgment(lang, ast, node, ctx)
+                }
+                "synth_cell_comp_v" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_cell_comp_v: node out of bounds".to_string())
+                    })?;
+                    self.synth_cell_comp_axis_judgment(lang, ast, node, 2, ctx)
+                }
+                "synth_cell_comp_h" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_cell_comp_h: node out of bounds".to_string())
+                    })?;
+                    self.synth_cell_comp_axis_judgment(lang, ast, node, 0, ctx)
+                }
+                "synth_rec" => {
+                    // Typecheck a `rec` region (ADR-0074 ID.3 — Paterson loop
+                    // fixpoint typing). The `rec` node is a flattened block: its
+                    // children are bindings (`assign` nodes) and expressions.
+                    // Bindings may reference each other cyclically. The judgment
+                    // allocates a fresh metavariable per binding, extends Γ, and
+                    // iterates synth+unify until the binding types stabilize
+                    // (the fixpoint). A fuel limit prevents divergence. The
+                    // result is the type of the last child (or a `return` child's
+                    // value). Termination is NOT checked at the type level.
+                    self.synth_rec_judgment(lang, ast, node_ref, ctx)
+                }
+                "synth_while" => {
+                    // Typecheck a `while` node (ADR-0074 A.1/A.5). The checker
+                    // sees the *pre-desugar* AST, so both surface protocols
+                    // arrive here:
+                    //   * `while <state> { <step-closure> }` — the state-passing
+                    //     `loop_step` form (child 1 declares a `params` role —
+                    //     the same discriminator `transform.desugar.while.state`
+                    //     uses, expressed role-wise): the state child synthesizes,
+                    //     the closure's params bind to the state's record fields
+                    //     (a single non-pattern param receives the whole state,
+                    //     matching `build_loop_step_args`), and the body checks
+                    //     against `type.unknown` — internals report, but the
+                    //     `{state: …}`/`{out: …}` protocol records on different
+                    //     control-flow paths never have to join. Result:
+                    //     `type.unknown` (the `{ out: v }` payload type is not
+                    //     statically recoverable).
+                    //   * `while <cond> { <stmts…> }` — the pre-test form that
+                    //     desugars to `rec`: the condition synthesizes and
+                    //     unifies with `type.bool` (mirroring `type.if`), and
+                    //     the body statements check in a Γ scope that pops on
+                    //     exit (matching `eval_block`'s `env_push`/`env_pop` —
+                    //     body-local binds do not escape; rebinding an outer
+                    //     name shadows in Γ for the body's extent — rebinding
+                    //     discipline across iterations is intentionally not
+                    //     modeled). Result: `type.unit`.
+                    self.synth_while_judgment(lang, ast, node_ref, ctx)
+                }
+                // ADR-0079: `synth_let` removed (let keyword deleted, graph blocks
+                // replace it). The `synth_block` handler handles assign children.
+                "synth_function" => {
+                    // Typecheck a `function` node. The node has children
+                    // [paren, body] where `paren` has children [var(name)]. We
+                    // bind the parameter name to a fresh metavariable (unknown
+                    // type) in Γ, synth the body, then construct
+                    // type.function{param: meta, body: body-type}
+                    // (ADR-0054 — the DSL can't navigate grandchildren or create
+                    // metas, so this is a judgment op).
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "synth_function: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "synth_function: node has no children array",
+                                node,
+                            )
+                        })?;
+                    if children.len() < 2 {
+                        return Err(LangError::engine(
+                            "synth_function: node needs at least 2 children (params, body)",
+                        ));
+                    }
+                    // Resolve params/body by child role (ADR-0081), falling back
+                    // to the positional children for role-less shapes.
+                    let params_ref = role_child_ref(lang, node, "params").or_else(|| {
+                        children
+                            .first()
+                            .and_then(|v| v.as_u64())
+                            .map(|i| AstRef::new(i as usize))
+                    });
+                    let body_ref = role_child_ref(lang, node, "body").or_else(|| {
+                        children
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .map(|i| AstRef::new(i as usize))
+                    });
+                    let params_ref = params_ref.ok_or_else(|| {
+                        LangError::engine_node("synth_function: no params child", node)
+                    })?;
+                    let body_ref = body_ref.ok_or_else(|| {
+                        LangError::engine_node("synth_function: no body child", node)
+                    })?;
+                    let params_node = ast.get(params_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "synth_function: params node {} out of bounds",
+                            params_ref.index()
+                        ))
+                    })?;
+                    // `param_names` resolves the fixed params and an optional
+                    // rest param (`[a, ...rest] ~> body`) data-driven via
+                    // `pattern_role`/variadic-role metadata (ADR-0081). A
+                    // single param (`x ~> body` or `(x) ~> body`) keeps the
+                    // unary `type.function{param: meta, body}` shape; a
+                    // multi-param/rest arrow gets a positional
+                    // `type.array{elements: [...]}` param (the same encoding
+                    // `flow`/`fanout` use for tuples — ADR-0074 §3), with the
+                    // rest binding typed `type.array{element: meta}`.
+                    //
+                    // Array-pattern arrows (`[x, y] ~> body`) consume one array
+                    // argument: the param side is a `type.array` whose element
+                    // types are the fixed params (and, with a rest binding, an
+                    // unknown-length tail).
+                    let (param_names, rest_name) = lang
+                        .param_names(ast, params_node)
+                        .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+                    let array_pattern = lang.is_array_pattern(params_node);
+                    if !array_pattern && param_names.len() == 1 && rest_name.is_none() {
+                        let param_meta = ctx.fresh_meta();
+                        let param_type = meta_value(param_meta);
+                        ctx.extend(param_names[0].clone(), param_type.clone());
+                        let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
+                        // Zonk so callers see solved parameter types (e.g. `flow`
+                        // can extract a concrete param type from the function
+                        // value).
+                        let param_type = self.zonk(&param_type, ctx);
+                        let body_type = self.zonk(&body_type, ctx);
+                        let payload = serde_json::json!({"param": param_type, "body": body_type});
+                        ctx.registry
+                            .construct("type.function", &payload)
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "synth_function: construct failed for type.function",
+                                    node,
+                                )
+                            })
+                    } else if array_pattern {
+                        // Array-pattern: one array argument whose elements bind
+                        // to the fixed params and (optionally) a rest tail.
+                        let param_type = if let Some(rest_name) = &rest_name {
+                            let elem_meta = meta_value(ctx.fresh_meta());
+                            let rest_ty = ctx
+                                .registry
+                                .construct("type.array", &serde_json::json!({"element": elem_meta}))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "synth_function: construct failed for type.array",
+                                        node,
+                                    )
+                                })?;
+                            ctx.extend(rest_name.clone(), rest_ty.clone());
+                            for name in &param_names {
+                                ctx.extend(name.clone(), elem_meta.clone());
+                            }
+                            ctx.registry
+                                .construct("type.array", &serde_json::json!({"element": elem_meta}))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "synth_function: construct failed for type.array",
+                                        node,
+                                    )
+                                })?
+                        } else {
+                            let mut elems: Vec<Value> = Vec::with_capacity(param_names.len());
+                            for name in &param_names {
+                                let m = meta_value(ctx.fresh_meta());
+                                ctx.extend(name.clone(), m.clone());
+                                elems.push(m);
+                            }
+                            ctx.registry
+                                .construct("type.array", &serde_json::json!({"elements": elems}))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "synth_function: construct failed for type.array",
+                                        node,
+                                    )
+                                })?
+                        };
+                        let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
+                        let param_type = self.zonk(&param_type, ctx);
+                        let body_type = self.zonk(&body_type, ctx);
+                        let payload = serde_json::json!({"param": param_type, "body": body_type});
+                        ctx.registry
+                            .construct("type.function", &payload)
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "synth_function: construct failed for type.function",
+                                    node,
+                                )
+                            })
+                    } else {
+                        // Multi-param / rest arrow: bind each fixed param to a
+                        // fresh meta and the rest param to
+                        // `type.array{element: meta}`; the arrow's param side
+                        // is the positional `type.array{elements: [...]}`.
+                        let mut elems: Vec<Value> = Vec::with_capacity(param_names.len() + 1);
                         for name in &param_names {
                             let m = meta_value(ctx.fresh_meta());
                             ctx.extend(name.clone(), m.clone());
                             elems.push(m);
                         }
-                        ctx.registry
+                        if let Some(rest_name) = &rest_name {
+                            let elem_meta = meta_value(ctx.fresh_meta());
+                            let rest_ty = ctx
+                                .registry
+                                .construct("type.array", &serde_json::json!({"element": elem_meta}))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "synth_function: construct failed for type.array",
+                                        node,
+                                    )
+                                })?;
+                            ctx.extend(rest_name.clone(), rest_ty.clone());
+                            elems.push(rest_ty);
+                        }
+                        let param_type = ctx
+                            .registry
                             .construct("type.array", &serde_json::json!({"elements": elems}))
                             .ok_or_else(|| {
                                 LangError::engine_node(
                                     "synth_function: construct failed for type.array",
                                     node,
                                 )
-                            })?
-                    };
-                    let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
-                    let param_type = self.zonk(&param_type, ctx);
-                    let body_type = self.zonk(&body_type, ctx);
-                    let payload = serde_json::json!({"param": param_type, "body": body_type});
-                    ctx.registry
-                        .construct("type.function", &payload)
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_function: construct failed for type.function",
-                                node,
-                            )
-                        })
-                } else {
-                    // Multi-param / rest arrow: bind each fixed param to a
-                    // fresh meta and the rest param to
-                    // `type.array{element: meta}`; the arrow's param side
-                    // is the positional `type.array{elements: [...]}`.
-                    let mut elems: Vec<Value> = Vec::with_capacity(param_names.len() + 1);
-                    for name in &param_names {
-                        let m = meta_value(ctx.fresh_meta());
-                        ctx.extend(name.clone(), m.clone());
-                        elems.push(m);
-                    }
-                    if let Some(rest_name) = &rest_name {
-                        let elem_meta = meta_value(ctx.fresh_meta());
-                        let rest_ty = ctx
-                            .registry
-                            .construct("type.array", &serde_json::json!({"element": elem_meta}))
+                            })?;
+                        let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
+                        let param_type = self.zonk(&param_type, ctx);
+                        let body_type = self.zonk(&body_type, ctx);
+                        let payload = serde_json::json!({"param": param_type, "body": body_type});
+                        ctx.registry
+                            .construct("type.function", &payload)
                             .ok_or_else(|| {
                                 LangError::engine_node(
-                                    "synth_function: construct failed for type.array",
+                                    "synth_function: construct failed for type.function",
                                     node,
                                 )
-                            })?;
-                        ctx.extend(rest_name.clone(), rest_ty.clone());
-                        elems.push(rest_ty);
+                            })
                     }
-                    let param_type = ctx
-                        .registry
-                        .construct("type.array", &serde_json::json!({"elements": elems}))
+                }
+                "synth_type_annot" => {
+                    // Typecheck a `type-annot` node (`expr: T`). Child 0 is the
+                    // annotated expression, child 1 is the type expression (e.g.
+                    // `type.number` parses as `field-access(var("type"), "number")`).
+                    //
+                    // ADR-0068 step B1: If the type expression evaluates to a
+                    // predicate (a closure returning `type.bool`), normalize
+                    // `T(e)` via the bound eval engine. `Proven` → accept
+                    // statically (no runtime check); `Disproved` → reject;
+                    // `Blocked` → accept with a runtime backstop. Otherwise, fall
+                    // back to the existing synth-then-unify path.
+                    //
+                    // This branch is data-driven: it inspects the *value's* shape
+                    // (type tag / closure marker), not the AST node kind, per the
+                    // engine-genericity rule.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "synth_type_annot: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
                         .ok_or_else(|| {
                             LangError::engine_node(
-                                "synth_function: construct failed for type.array",
+                                "synth_type_annot: node has no children array",
                                 node,
                             )
                         })?;
-                    let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
-                    let param_type = self.zonk(&param_type, ctx);
-                    let body_type = self.zonk(&body_type, ctx);
-                    let payload = serde_json::json!({"param": param_type, "body": body_type});
-                    ctx.registry
-                        .construct("type.function", &payload)
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_function: construct failed for type.function",
-                                node,
-                            )
-                        })
-                }
-            }
-            "synth_type_annot" => {
-                // Typecheck a `type-annot` node (`expr: T`). Child 0 is the
-                // annotated expression, child 1 is the type expression (e.g.
-                // `type.number` parses as `field-access(var("type"), "number")`).
-                //
-                // ADR-0068 step B1: If the type expression evaluates to a
-                // predicate (a closure returning `type.bool`), normalize
-                // `T(e)` via the bound eval engine. `Proven` → accept
-                // statically (no runtime check); `Disproved` → reject;
-                // `Blocked` → accept with a runtime backstop. Otherwise, fall
-                // back to the existing synth-then-unify path.
-                //
-                // This branch is data-driven: it inspects the *value's* shape
-                // (type tag / closure marker), not the AST node kind, per the
-                // engine-genericity rule.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "synth_type_annot: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node("synth_type_annot: node has no children array", node)
-                    })?;
-                if children.len() < 2 {
-                    return Err(LangError::engine(
-                        "synth_type_annot: node needs 2 children (expr, type)",
-                    ));
-                }
-                let expr_idx = children[0].as_u64().ok_or_else(|| {
-                    LangError::engine_node("synth_type_annot: expr child index is not a u64", node)
-                })? as usize;
-                let type_idx = children[1].as_u64().ok_or_else(|| {
-                    LangError::engine_node("synth_type_annot: type child index is not a u64", node)
-                })? as usize;
-                let expr_type = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx)?;
-                let type_node = ast.get(AstRef::new(type_idx)).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "synth_type_annot: type node {} out of bounds",
-                        type_idx
-                    ))
-                })?;
-
-                // Dependent annotations first (families, `Pi`/`Sigma`/
-                // `Forall`/`Path` formers, index terms — ADR-0120/0152),
-                // then the existing type-syntax path (`type.number`,
-                // `(type.number) -> type.bool`, meta-predicates).
-                let annotation_result = self
-                    .dep_synth_type(lang, ast, type_idx, ctx)
-                    .or_else(|_| {
-                        interpret_type_expr(lang, ast, type_node, &ctx.registry)
-                    });
-
-                match annotation_result {
-                    Ok(annotation_type) => {
-                        // Phase 7: Check for meta-predicate types (Total, Pure).
-                        // These are not regular predicate functions — they
-                        // assert a meta-property of the function itself
-                        // (termination, purity) and require special handling.
-                        let annotation_tag = ctx.registry.as_type_tag(&annotation_type);
-                        match annotation_tag {
-                            Some("type.Total") => {
-                                // Total predicate: check structural recursion.
-                                let proof = totality_check::check_totality(
-                                    ast,
-                                    AstRef::new(expr_idx),
-                                    lang,
-                                );
-                                return self.resolve_predicate_proof(
-                                    proof,
-                                    &expr_type,
-                                    &annotation_type,
-                                    ctx,
-                                );
-                            }
-                            Some("type.Pure") => {
-                                // Pure predicate: check effect row emptiness.
-                                let proof = self.check_purity(&expr_type);
-                                return self.resolve_predicate_proof(
-                                    proof,
-                                    &expr_type,
-                                    &annotation_type,
-                                    ctx,
-                                );
-                            }
-                            Some("type.Marshalable") => {
-                                // Marshalable predicate: check that the type
-                                // carried in the `arg` field is FFI-marshalable
-                                // (ADR-0083). Unlike Total/Pure which inspect
-                                // the expression, Marshalable inspects the
-                                // type argument embedded in the annotation.
-                                let arg_type = annotation_type.get("arg");
-                                let proof = match arg_type {
-                                    Some(ty) => {
-                                        if is_marshalable(&ctx.registry, ty) {
-                                            let tag =
-                                                ctx.registry.as_type_tag(ty).unwrap_or("unknown");
-                                            Proof::ok(format!(
-                                                "type '{}' is FFI-marshalable (ADR-0083)",
-                                                tag
-                                            ))
-                                        } else {
-                                            let tag =
-                                                ctx.registry.as_type_tag(ty).unwrap_or("unknown");
-                                            Proof::no(format!(
-                                                "type '{}' is not FFI-marshalable (ADR-0083)",
-                                                tag
-                                            ))
-                                        }
-                                    }
-                                    None => Proof::no(
-                                        "Marshalable predicate requires a type argument \
-                                         (arg field missing)"
-                                            .to_string(),
-                                    ),
-                                };
-                                return self.resolve_predicate_proof(
-                                    proof,
-                                    &expr_type,
-                                    &annotation_type,
-                                    ctx,
-                                );
-                            }
-                            _ => {}
-                        }
-
-                        // If the annotation is a `type.function` whose body
-                        // is `type.bool`, it is a predicate type: evaluate
-                        // the type expression to get the predicate closure
-                        // and apply it to the expression value.
-                        let body_is_bool = annotation_type
-                            .get("body")
-                            .map(|b| ctx.registry.as_type_tag(b) == Some("type.bool"))
-                            .unwrap_or(false);
-                        let is_predicate = ctx.registry.as_type_tag(&annotation_type)
-                            == Some("type.function")
-                            && body_is_bool;
-
-                        if is_predicate {
-                            let proof = self.check_predicate_application(
-                                lang,
-                                ast,
-                                AstRef::new(type_idx),
-                                AstRef::new(expr_idx),
-                                100_000,
-                            );
-                            // B2: if B1 (concrete eval) is blocked, try
-                            // symbolic normalization — the expression may
-                            // have free variables that B1 can't handle but
-                            // B2 can reason about symbolically.
-                            let proof = if proof.verdict == Verdict::Blocked {
-                                // The type expression is a `function` node
-                                // (predicate). Find it in the AST to pass
-                                // to the symbolic checker.
-                                let sym_proof = self.check_predicate_symbolic(
-                                    lang,
-                                    ast,
-                                    AstRef::new(type_idx),
-                                    AstRef::new(expr_idx),
-                                    100_000,
-                                );
-                                // Only use the symbolic result if it's
-                                // better (Proven or Disproved); otherwise
-                                // keep the original Blocked.
-                                if sym_proof.verdict != Verdict::Blocked {
-                                    sym_proof
-                                } else {
-                                    proof
-                                }
-                            } else {
-                                proof
-                            };
-                            return self.resolve_predicate_proof(
-                                proof,
-                                &expr_type,
-                                &annotation_type,
-                                ctx,
-                            );
-                        }
-
-                        // Not a predicate — use the existing unify path.
-                        self.unify(&expr_type, &annotation_type, ctx)?;
-                        Ok(annotation_type)
+                    if children.len() < 2 {
+                        return Err(LangError::engine(
+                            "synth_type_annot: node needs 2 children (expr, type)",
+                        ));
                     }
-                    Err(interp_err) => {
-                        // `interpret_type_expr` failed — the type expression
-                        // might be a value expression (e.g. `DivisibleBy(3)`
-                        // or `(n) -> n % 3 == 0`). Try evaluating it via the
-                        // eval engine to get a predicate closure.
-                        if self.pure {
-                            if let Err(_e) = check_pure(lang, ast, AstRef::new(type_idx)) {
-                                // Impure type expression — can't evaluate
-                                // safely. Return the original
-                                // `interpret_type_expr` error.
-                                return Err(interp_err);
+                    let expr_idx = children[0].as_u64().ok_or_else(|| {
+                        LangError::engine_node(
+                            "synth_type_annot: expr child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    let type_idx = children[1].as_u64().ok_or_else(|| {
+                        LangError::engine_node(
+                            "synth_type_annot: type child index is not a u64",
+                            node,
+                        )
+                    })? as usize;
+                    let expr_type = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx)?;
+                    let type_node = ast.get(AstRef::new(type_idx)).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "synth_type_annot: type node {} out of bounds",
+                            type_idx
+                        ))
+                    })?;
+
+                    // Dependent annotations first (families, `Pi`/`Sigma`/
+                    // `Forall`/`Path` formers, index terms — ADR-0120/0152),
+                    // then the existing type-syntax path (`type.number`,
+                    // `(type.number) -> type.bool`, meta-predicates).
+                    let annotation_result = self
+                        .dep_synth_type(lang, ast, type_idx, ctx)
+                        .or_else(|_| interpret_type_expr(lang, ast, type_node, &ctx.registry));
+
+                    match annotation_result {
+                        Ok(annotation_type) => {
+                            // Phase 7: Check for meta-predicate types (Total, Pure).
+                            // These are not regular predicate functions — they
+                            // assert a meta-property of the function itself
+                            // (termination, purity) and require special handling.
+                            let annotation_tag = ctx.registry.as_type_tag(&annotation_type);
+                            match annotation_tag {
+                                Some("type.Total") => {
+                                    // Total predicate: check structural recursion.
+                                    let proof = totality_check::check_totality(
+                                        ast,
+                                        AstRef::new(expr_idx),
+                                        lang,
+                                    );
+                                    return self.resolve_predicate_proof(
+                                        proof,
+                                        &expr_type,
+                                        &annotation_type,
+                                        ctx,
+                                    );
+                                }
+                                Some("type.Pure") => {
+                                    // Pure predicate: check effect row emptiness.
+                                    let proof = self.check_purity(&expr_type);
+                                    return self.resolve_predicate_proof(
+                                        proof,
+                                        &expr_type,
+                                        &annotation_type,
+                                        ctx,
+                                    );
+                                }
+                                Some("type.Marshalable") => {
+                                    // Marshalable predicate: check that the type
+                                    // carried in the `arg` field is FFI-marshalable
+                                    // (ADR-0083). Unlike Total/Pure which inspect
+                                    // the expression, Marshalable inspects the
+                                    // type argument embedded in the annotation.
+                                    let arg_type = annotation_type.get("arg");
+                                    let proof = match arg_type {
+                                        Some(ty) => {
+                                            if is_marshalable(&ctx.registry, ty) {
+                                                let tag = ctx
+                                                    .registry
+                                                    .as_type_tag(ty)
+                                                    .unwrap_or("unknown");
+                                                Proof::ok(format!(
+                                                    "type '{}' is FFI-marshalable (ADR-0083)",
+                                                    tag
+                                                ))
+                                            } else {
+                                                let tag = ctx
+                                                    .registry
+                                                    .as_type_tag(ty)
+                                                    .unwrap_or("unknown");
+                                                Proof::no(format!(
+                                                    "type '{}' is not FFI-marshalable (ADR-0083)",
+                                                    tag
+                                                ))
+                                            }
+                                        }
+                                        None => Proof::no(
+                                            "Marshalable predicate requires a type argument \
+                                         (arg field missing)"
+                                                .to_string(),
+                                        ),
+                                    };
+                                    return self.resolve_predicate_proof(
+                                        proof,
+                                        &expr_type,
+                                        &annotation_type,
+                                        ctx,
+                                    );
+                                }
+                                _ => {}
                             }
-                        }
-                        let sub = ast.subtree(AstRef::new(type_idx))?;
-                        let req = EvalRequest::new(sub);
-                        match self.eval_engine.eval(lang, &req) {
-                            Ok(type_val) if Self::is_closure_value(&type_val) => {
-                                // It's a predicate closure. Apply it to the
-                                // expression value.
+
+                            // If the annotation is a `type.function` whose body
+                            // is `type.bool`, it is a predicate type: evaluate
+                            // the type expression to get the predicate closure
+                            // and apply it to the expression value.
+                            let body_is_bool = annotation_type
+                                .get("body")
+                                .map(|b| ctx.registry.as_type_tag(b) == Some("type.bool"))
+                                .unwrap_or(false);
+                            let is_predicate = ctx.registry.as_type_tag(&annotation_type)
+                                == Some("type.function")
+                                && body_is_bool;
+
+                            if is_predicate {
                                 let proof = self.check_predicate_application(
                                     lang,
                                     ast,
@@ -2500,9 +2561,14 @@ impl NbeTypecheckEngine {
                                     AstRef::new(expr_idx),
                                     100_000,
                                 );
-                                // B2: if B1 is blocked, try symbolic
-                                // normalization.
+                                // B2: if B1 (concrete eval) is blocked, try
+                                // symbolic normalization — the expression may
+                                // have free variables that B1 can't handle but
+                                // B2 can reason about symbolically.
                                 let proof = if proof.verdict == Verdict::Blocked {
+                                    // The type expression is a `function` node
+                                    // (predicate). Find it in the AST to pass
+                                    // to the symbolic checker.
                                     let sym_proof = self.check_predicate_symbolic(
                                         lang,
                                         ast,
@@ -2510,6 +2576,9 @@ impl NbeTypecheckEngine {
                                         AstRef::new(expr_idx),
                                         100_000,
                                     );
+                                    // Only use the symbolic result if it's
+                                    // better (Proven or Disproved); otherwise
+                                    // keep the original Blocked.
                                     if sym_proof.verdict != Verdict::Blocked {
                                         sym_proof
                                     } else {
@@ -2518,1193 +2587,1393 @@ impl NbeTypecheckEngine {
                                 } else {
                                     proof
                                 };
-                                // The annotation type for a closure-valued
-                                // predicate is the expression's own type
-                                // (the predicate is a runtime contract, not
-                                // a static type tag).
-                                self.resolve_predicate_proof(proof, &expr_type, &expr_type, ctx)
+                                return self.resolve_predicate_proof(
+                                    proof,
+                                    &expr_type,
+                                    &annotation_type,
+                                    ctx,
+                                );
                             }
-                            Ok(_) => Err(interp_err),
-                            Err(_) => Err(interp_err),
+
+                            // Not a predicate — use the existing unify path.
+                            self.unify(&expr_type, &annotation_type, ctx)?;
+                            Ok(annotation_type)
+                        }
+                        Err(interp_err) => {
+                            // `interpret_type_expr` failed — the type expression
+                            // might be a value expression (e.g. `DivisibleBy(3)`
+                            // or `(n) -> n % 3 == 0`). Try evaluating it via the
+                            // eval engine to get a predicate closure.
+                            if self.pure
+                                && let Err(_e) = check_pure(lang, ast, AstRef::new(type_idx)) {
+                                    // Impure type expression — can't evaluate
+                                    // safely. Return the original
+                                    // `interpret_type_expr` error.
+                                    return Err(interp_err);
+                                }
+                            let sub = ast.subtree(AstRef::new(type_idx))?;
+                            let req = EvalRequest::new(sub);
+                            match self.eval_engine.eval(lang, &req) {
+                                Ok(type_val) if Self::is_closure_value(&type_val) => {
+                                    // It's a predicate closure. Apply it to the
+                                    // expression value.
+                                    let proof = self.check_predicate_application(
+                                        lang,
+                                        ast,
+                                        AstRef::new(type_idx),
+                                        AstRef::new(expr_idx),
+                                        100_000,
+                                    );
+                                    // B2: if B1 is blocked, try symbolic
+                                    // normalization.
+                                    let proof = if proof.verdict == Verdict::Blocked {
+                                        let sym_proof = self.check_predicate_symbolic(
+                                            lang,
+                                            ast,
+                                            AstRef::new(type_idx),
+                                            AstRef::new(expr_idx),
+                                            100_000,
+                                        );
+                                        if sym_proof.verdict != Verdict::Blocked {
+                                            sym_proof
+                                        } else {
+                                            proof
+                                        }
+                                    } else {
+                                        proof
+                                    };
+                                    // The annotation type for a closure-valued
+                                    // predicate is the expression's own type
+                                    // (the predicate is a runtime contract, not
+                                    // a static type tag).
+                                    self.resolve_predicate_proof(proof, &expr_type, &expr_type, ctx)
+                                }
+                                Ok(_) => Err(interp_err),
+                                Err(_) => Err(interp_err),
+                            }
                         }
                     }
                 }
-            }
-            "synth_first_child_or_unknown" => {
-                // Synthesize the type of the first child of the current node.
-                // If the node has no children (empty array), returns
-                // `type.unknown`. This supports `array` type rules where the
-                // element type is the type of the first element, with a
-                // fallback for empty arrays.
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: synth_first_child_or_unknown: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let children = node.payload.get("children").and_then(|c| c.as_array());
-                match children {
-                    Some(arr) if !arr.is_empty() => {
-                        let first_idx = arr.first().and_then(|v| v.as_u64()).ok_or_else(|| {
+                "synth_first_child_or_unknown" => {
+                    // Synthesize the type of the first child of the current node.
+                    // If the node has no children (empty array), returns
+                    // `type.unknown`. This supports `array` type rules where the
+                    // element type is the type of the first element, with a
+                    // fallback for empty arrays.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: synth_first_child_or_unknown: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let children = node.payload.get("children").and_then(|c| c.as_array());
+                    match children {
+                        Some(arr) if !arr.is_empty() => {
+                            let first_idx = arr.first().and_then(|v| v.as_u64()).ok_or_else(|| {
                             LangError::engine(
                                 "typecheck: synth_first_child_or_unknown: first child index is not a u64",
                             )
                         })?;
-                        let child = AstRef::new(first_idx as usize);
-                        self.synth_node(lang, ast, child, ctx)
-                    }
-                    _ => {
-                        // Empty or no children → type.unknown
-                        ctx.registry
+                            let child = AstRef::new(first_idx as usize);
+                            self.synth_node(lang, ast, child, ctx)
+                        }
+                        _ => {
+                            // Empty or no children → type.unknown
+                            ctx.registry
                             .construct("type.unknown", &Value::Null)
                             .ok_or_else(|| {
                                 LangError::engine(
                                     "typecheck: synth_first_child_or_unknown: construct failed for type.unknown",
                                 )
                             })
-                    }
-                }
-            }
-            "record_field_type" => {
-                // Extract a field's or element's type. The field/index name
-                // comes from `lit` or `incoming` (string or number). The
-                // record/array type value comes from `args[0]`. If the type is
-                // `type.array` and the field is a numeric index, return the
-                // array's element type; if it is `type.record`, look up the
-                // string field name.
-                let field_value = match lit.and_then(|v| if v.is_null() { None } else { Some(v) }) {
-                    Some(v) => v.clone(),
-                    None => incoming.clone().ok_or_else(|| {
-                        LangError::engine("record_field_type: no field name in lit or incoming")
-                    })?,
-                };
-                let field_name = field_value.as_str().map(|s| s.to_string());
-                let field_index = field_value
-                    .as_u64()
-                    .or_else(|| field_name.as_ref().and_then(|s| s.parse::<u64>().ok()));
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "record_field_type: requires args[0] (record type sub-scheme)",
-                    ));
-                }
-                let container_type =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                // Detect whether the type tag is `type.array` by inspecting
-                // the `__tag__` key that the canonical registry adds.
-                if container_type.get("__tag__").and_then(|t| t.as_str()) == Some("type.array")
-                    || (container_type.get("element").is_some() && field_index.is_some())
-                {
-                    let element_type = container_type.get("element").ok_or_else(|| {
-                        LangError::engine(format!(
-                            "record_field_type: array type has no 'element' field: {:?}",
-                            container_type
-                        ))
-                    })?;
-                    return Ok(element_type.clone());
-                }
-                let field_name = field_name.ok_or_else(|| {
-                    LangError::engine("record_field_type: field name must be a string for records")
-                })?;
-                // `type.unknown` projects to `type.unknown` — dynamic
-                // imports/`resolve` are statically opaque, so `m.f` on an
-                // unknown record stays unknown rather than erroring.
-                if container_type.get("__tag__").and_then(|t| t.as_str())
-                    == Some("type.unknown")
-                {
-                    return Ok(container_type.clone());
-                }
-                // Suspended-join scope (`ctx.loose`, e.g. `while` step
-                // bodies): projecting a field off an unsolved meta yields
-                // a fresh meta rather than "no fields object" — the
-                // meta's record shape is unknowable here and the body is
-                // already in the permissive dynamic lane.
-                if ctx.loose > 0 && extract_meta_id(&container_type).is_some() {
-                    return Ok(meta_value(ctx.fresh_meta()));
-                }
-                // `type.module_sig` — an *open* signature record: a field
-                // absent from `fields` is probed as `<module>.<name>`
-                // through the module chain (declared signature first,
-                // opaque meta-function when the op resolves unsigned).
-                if container_type.get("__tag__").and_then(|t| t.as_str())
-                    == Some("type.module_sig")
-                {
-                    if let Some(ft) = container_type
-                        .get("fields")
-                        .and_then(|f| f.as_object())
-                        .and_then(|f| f.get(&field_name))
-                    {
-                        return Ok(ft.clone());
-                    }
-                    if let Some(mname) =
-                        container_type.get("module").and_then(Value::as_str)
-                    {
-                        let q = format!("{mname}.{field_name}");
-                        if let Some(mods) = self.modules.as_ref() {
-                            if let Some(sig) = mods.lookup_type_signature(&q) {
-                                return Ok(sig);
-                            }
-                            if mods.lookup(&q).is_some() {
-                                let p = meta_value(ctx.fresh_meta());
-                                let b = meta_value(ctx.fresh_meta());
-                                return ctx
-                                    .registry
-                                    .construct(
-                                        "type.function",
-                                        &serde_json::json!({"param": p, "body": b}),
-                                    )
-                                    .ok_or_else(|| {
-                                        LangError::engine(
-                                            "record_field_type: construct type.function failed",
-                                        )
-                                    });
-                            }
                         }
                     }
-                    return Err(LangError::engine(format!(
-                        "record_field_type: field '{}' not found in module signature",
-                        field_name
-                    )));
                 }
-                // A `data`-declared family is not a record — but `F.rec`
-                // (and any other `<F>.<name>` scope binding `synth_data`
-                // registers) resolves through Γ: the eliminator lives in
-                // the family's scope (the desugared `__splice__` binds a
-                // var literally named `F.rec`), not as a record field.
-                if container_type.get("__tag__").and_then(|t| t.as_str())
-                    == Some("type.family")
-                {
-                    let fname = container_type
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("");
-                    if let Some(bound) =
-                        ctx.lookup(&format!("{fname}.{field_name}")).cloned()
+                "record_field_type" => {
+                    // Extract a field's or element's type. The field/index name
+                    // comes from `lit` or `incoming` (string or number). The
+                    // record/array type value comes from `args[0]`. If the type is
+                    // `type.array` and the field is a numeric index, return the
+                    // array's element type; if it is `type.record`, look up the
+                    // string field name.
+                    let field_value = match lit
+                        .filter(|&v| !v.is_null())
                     {
-                        return Ok(bound);
+                        Some(v) => v.clone(),
+                        None => incoming.clone().ok_or_else(|| {
+                            LangError::engine("record_field_type: no field name in lit or incoming")
+                        })?,
+                    };
+                    let field_name = field_value.as_str().map(|s| s.to_string());
+                    let field_index = field_value
+                        .as_u64()
+                        .or_else(|| field_name.as_ref().and_then(|s| s.parse::<u64>().ok()));
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "record_field_type: requires args[0] (record type sub-scheme)",
+                        ));
                     }
-                    return Err(LangError::engine(format!(
-                        "record_field_type: family '{fname}' has no scope binding '{field_name}'"
-                    )));
-                }
-                let fields = container_type
-                    .get("fields")
-                    .and_then(|f| f.as_object())
-                    .ok_or_else(|| {
-                        LangError::engine(format!(
-                            "record_field_type: type value has no 'fields' object: {:?}",
-                            container_type
-                        ))
-                    })?;
-                let field_type = fields.get(&field_name).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "record_field_type: field '{}' not found in record type",
-                        field_name
-                    ))
-                })?;
-                Ok(field_type.clone())
-            }
-            "array_element_type" => {
-                // Extract the element type from a `type.array` value. The
-                // array type value comes from `args[0]` (a sub-scheme) or
-                // `incoming` (when no args are provided).
-                let array_type = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                // `type.unknown` indexes to `type.unknown` — the same
-                // dynamic-opacity rule `record_field_type` applies to
-                // field projection: `xs[i]` on an unknown container
-                // stays unknown rather than erroring.
-                if array_type.get("__tag__").and_then(|t| t.as_str())
-                    == Some("type.unknown")
-                {
-                    return Ok(array_type.clone());
-                }
-                // Suspended-join scope (`ctx.loose`, e.g. `while` step
-                // bodies): indexing into an unsolved meta yields a
-                // fresh meta rather than erroring.
-                if ctx.loose > 0 && extract_meta_id(&array_type).is_some() {
-                    return Ok(meta_value(ctx.fresh_meta()));
-                }
-                let element_type = array_type.get("element").ok_or_else(|| {
-                    LangError::engine(format!(
-                        "array_element_type: type value has no 'element' field: {:?}",
-                        array_type
-                    ))
-                })?;
-                Ok(element_type.clone())
-            }
-            "synth_object_record" => {
-                // Synthesize a `type.record{fields: {...}}` from an `object`
-                // node's `entries` array. Each entry has a `key` (string) and
-                // a `value` (JSON value); the value's JSON type becomes the
-                // field type (ADR-0054 — `object` uses `entries`, not
-                // `children`, so a dedicated op iterates the entries).
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "synth_object_record: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let mut fields = serde_json::Map::new();
-                let mut tag_name: Option<String> = None;
-
-                if let Some(entries) = node.payload.get("entries").and_then(|e| e.as_array()) {
-                    for entry in entries {
-                        let key = entry.get("key").and_then(|k| k.as_str()).ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_object_record: entry missing 'key' string",
-                                node,
-                            )
-                        })?;
-                        let value = entry.get("value").ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_object_record: entry missing 'value'",
-                                node,
-                            )
-                        })?;
-                        // The reserved `__tag__` key (ADR-0055): its string
-                        // *value* names the tag — the object literal denotes
-                        // the tagged type, not a record field of type
-                        // `type.string`.
-                        if key == "__tag__" {
-                            tag_name = value.as_str().map(str::to_string);
-                            continue;
-                        }
-                        let tag = match value {
-                            Value::Number(_) => "type.number",
-                            Value::String(_) => "type.string",
-                            Value::Bool(_) => "type.bool",
-                            Value::Null => "type.null",
-                            Value::Array(_) => "type.array",
-                            Value::Object(_) => "type.object",
-                        };
-                        let field_type =
-                            ctx.registry.construct(tag, &Value::Null).ok_or_else(|| {
-                                LangError::engine(format!(
-                                    "synth_object_record: construct failed for tag '{}'",
-                                    tag
-                                ))
-                            })?;
-                        fields.insert(key.to_string(), field_type);
-                    }
-                } else if let Some(children) =
-                    node.payload.get("children").and_then(|c| c.as_array())
-                {
-                    for child_entry in children {
-                        let child_idx = child_entry.as_u64().ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_object_record: child index is not a u64",
-                                node,
-                            )
-                        })? as usize;
-                        let child_ref = AstRef::new(child_idx);
-                        let child_node = ast.get(child_ref).ok_or_else(|| {
+                    let container_type = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    // Detect whether the type tag is `type.array` by inspecting
+                    // the `__tag__` key that the canonical registry adds.
+                    if container_type.get("__tag__").and_then(|t| t.as_str()) == Some("type.array")
+                        || (container_type.get("element").is_some() && field_index.is_some())
+                    {
+                        let element_type = container_type.get("element").ok_or_else(|| {
                             LangError::engine(format!(
-                                "synth_object_record: child node {} out of bounds",
-                                child_idx
+                                "record_field_type: array type has no 'element' field: {:?}",
+                                container_type
                             ))
                         })?;
-                        // Surface parser emits object entries as child `entry`
-                        // nodes with two children: [key, value]. Use structural
-                        // shape (string payload as first child) to avoid a
-                        // hardcoded node-kind check.
-                        let entry_children = child_node
-                            .payload
-                            .get("children")
-                            .and_then(|c| c.as_array())
-                            .ok_or_else(|| {
+                        return Ok(element_type.clone());
+                    }
+                    let field_name = field_name.ok_or_else(|| {
+                        LangError::engine(
+                            "record_field_type: field name must be a string for records",
+                        )
+                    })?;
+                    // `type.unknown` projects to `type.unknown` — dynamic
+                    // imports/`resolve` are statically opaque, so `m.f` on an
+                    // unknown record stays unknown rather than erroring.
+                    if container_type.get("__tag__").and_then(|t| t.as_str())
+                        == Some("type.unknown")
+                    {
+                        return Ok(container_type.clone());
+                    }
+                    // Suspended-join scope (`ctx.loose`, e.g. `while` step
+                    // bodies): projecting a field off an unsolved meta yields
+                    // a fresh meta rather than "no fields object" — the
+                    // meta's record shape is unknowable here and the body is
+                    // already in the permissive dynamic lane.
+                    if ctx.loose > 0 && extract_meta_id(&container_type).is_some() {
+                        return Ok(meta_value(ctx.fresh_meta()));
+                    }
+                    // `type.module_sig` — an *open* signature record: a field
+                    // absent from `fields` is probed as `<module>.<name>`
+                    // through the module chain (declared signature first,
+                    // opaque meta-function when the op resolves unsigned).
+                    if container_type.get("__tag__").and_then(|t| t.as_str())
+                        == Some("type.module_sig")
+                    {
+                        if let Some(ft) = container_type
+                            .get("fields")
+                            .and_then(|f| f.as_object())
+                            .and_then(|f| f.get(&field_name))
+                        {
+                            return Ok(ft.clone());
+                        }
+                        if let Some(mname) = container_type.get("module").and_then(Value::as_str) {
+                            let q = format!("{mname}.{field_name}");
+                            if let Some(mods) = self.modules.as_ref() {
+                                if let Some(sig) = mods.lookup_type_signature(&q) {
+                                    return Ok(sig);
+                                }
+                                if mods.lookup(&q).is_some() {
+                                    let p = meta_value(ctx.fresh_meta());
+                                    let b = meta_value(ctx.fresh_meta());
+                                    return ctx
+                                        .registry
+                                        .construct(
+                                            "type.function",
+                                            &serde_json::json!({"param": p, "body": b}),
+                                        )
+                                        .ok_or_else(|| {
+                                            LangError::engine(
+                                                "record_field_type: construct type.function failed",
+                                            )
+                                        });
+                                }
+                            }
+                        }
+                        return Err(LangError::engine(format!(
+                            "record_field_type: field '{}' not found in module signature",
+                            field_name
+                        )));
+                    }
+                    // A `data`-declared family is not a record — but `F.rec`
+                    // (and any other `<F>.<name>` scope binding `synth_data`
+                    // registers) resolves through Γ: the eliminator lives in
+                    // the family's scope (the desugared `__splice__` binds a
+                    // var literally named `F.rec`), not as a record field.
+                    if container_type.get("__tag__").and_then(|t| t.as_str()) == Some("type.family")
+                    {
+                        let fname = container_type
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                        if let Some(bound) = ctx.lookup(&format!("{fname}.{field_name}")).cloned() {
+                            return Ok(bound);
+                        }
+                        return Err(LangError::engine(format!(
+                            "record_field_type: family '{fname}' has no scope binding '{field_name}'"
+                        )));
+                    }
+                    let fields = container_type
+                        .get("fields")
+                        .and_then(|f| f.as_object())
+                        .ok_or_else(|| {
+                            LangError::engine(format!(
+                                "record_field_type: type value has no 'fields' object: {:?}",
+                                container_type
+                            ))
+                        })?;
+                    let field_type = fields.get(&field_name).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "record_field_type: field '{}' not found in record type",
+                            field_name
+                        ))
+                    })?;
+                    Ok(field_type.clone())
+                }
+                "array_element_type" => {
+                    // Extract the element type from a `type.array` value. The
+                    // array type value comes from `args[0]` (a sub-scheme) or
+                    // `incoming` (when no args are provided).
+                    let array_type = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    // `type.unknown` indexes to `type.unknown` — the same
+                    // dynamic-opacity rule `record_field_type` applies to
+                    // field projection: `xs[i]` on an unknown container
+                    // stays unknown rather than erroring.
+                    if array_type.get("__tag__").and_then(|t| t.as_str()) == Some("type.unknown") {
+                        return Ok(array_type.clone());
+                    }
+                    // Suspended-join scope (`ctx.loose`, e.g. `while` step
+                    // bodies): indexing into an unsolved meta yields a
+                    // fresh meta rather than erroring.
+                    if ctx.loose > 0 && extract_meta_id(&array_type).is_some() {
+                        return Ok(meta_value(ctx.fresh_meta()));
+                    }
+                    let element_type = array_type.get("element").ok_or_else(|| {
+                        LangError::engine(format!(
+                            "array_element_type: type value has no 'element' field: {:?}",
+                            array_type
+                        ))
+                    })?;
+                    Ok(element_type.clone())
+                }
+                "synth_object_record" => {
+                    // Synthesize a `type.record{fields: {...}}` from an `object`
+                    // node's `entries` array. Each entry has a `key` (string) and
+                    // a `value` (JSON value); the value's JSON type becomes the
+                    // field type (ADR-0054 — `object` uses `entries`, not
+                    // `children`, so a dedicated op iterates the entries).
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "synth_object_record: node {} out of bounds",
+                            node_ref.index()
+                        ))
+                    })?;
+                    let mut fields = serde_json::Map::new();
+                    let mut tag_name: Option<String> = None;
+
+                    if let Some(entries) = node.payload.get("entries").and_then(|e| e.as_array()) {
+                        for entry in entries {
+                            let key =
+                                entry.get("key").and_then(|k| k.as_str()).ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "synth_object_record: entry missing 'key' string",
+                                        node,
+                                    )
+                                })?;
+                            let value = entry.get("value").ok_or_else(|| {
                                 LangError::engine_node(
-                                    "synth_object_record: child node has no children array",
+                                    "synth_object_record: entry missing 'value'",
                                     node,
                                 )
                             })?;
-                        if entry_children.len() < 2 {
-                            continue;
+                            // The reserved `__tag__` key (ADR-0055): its string
+                            // *value* names the tag — the object literal denotes
+                            // the tagged type, not a record field of type
+                            // `type.string`.
+                            if key == "__tag__" {
+                                tag_name = value.as_str().map(str::to_string);
+                                continue;
+                            }
+                            let tag = match value {
+                                Value::Number(_) => "type.number",
+                                Value::String(_) => "type.string",
+                                Value::Bool(_) => "type.bool",
+                                Value::Null => "type.null",
+                                Value::Array(_) => "type.array",
+                                Value::Object(_) => "type.object",
+                            };
+                            let field_type =
+                                ctx.registry.construct(tag, &Value::Null).ok_or_else(|| {
+                                    LangError::engine(format!(
+                                        "synth_object_record: construct failed for tag '{}'",
+                                        tag
+                                    ))
+                                })?;
+                            fields.insert(key.to_string(), field_type);
                         }
-                        let key_idx = entry_children[0].as_u64().ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_object_record: child key index is not a u64",
-                                node,
-                            )
-                        })? as usize;
-                        let value_idx = entry_children[1].as_u64().ok_or_else(|| {
-                            LangError::engine_node(
-                                "synth_object_record: child value index is not a u64",
-                                node,
-                            )
-                        })? as usize;
-                        let key_node = ast.get(AstRef::new(key_idx)).ok_or_else(|| {
-                            LangError::engine(format!(
-                                "synth_object_record: key node {} out of bounds",
-                                key_idx
-                            ))
-                        })?;
-                        let Some(key) = key_node.payload.as_str() else {
-                            continue;
-                        };
-                        if key == "__tag__" {
-                            let value_node = ast.get(AstRef::new(value_idx));
-                            tag_name = value_node.and_then(|n| {
-                                n.payload
-                                    .as_str()
-                                    .map(str::to_string)
-                                    .or_else(|| {
+                    } else if let Some(children) =
+                        node.payload.get("children").and_then(|c| c.as_array())
+                    {
+                        for child_entry in children {
+                            let child_idx = child_entry.as_u64().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "synth_object_record: child index is not a u64",
+                                    node,
+                                )
+                            })? as usize;
+                            let child_ref = AstRef::new(child_idx);
+                            let child_node = ast.get(child_ref).ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "synth_object_record: child node {} out of bounds",
+                                    child_idx
+                                ))
+                            })?;
+                            // Surface parser emits object entries as child `entry`
+                            // nodes with two children: [key, value]. Use structural
+                            // shape (string payload as first child) to avoid a
+                            // hardcoded node-kind check.
+                            let entry_children = child_node
+                                .payload
+                                .get("children")
+                                .and_then(|c| c.as_array())
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "synth_object_record: child node has no children array",
+                                        node,
+                                    )
+                                })?;
+                            if entry_children.len() < 2 {
+                                continue;
+                            }
+                            let key_idx = entry_children[0].as_u64().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "synth_object_record: child key index is not a u64",
+                                    node,
+                                )
+                            })? as usize;
+                            let value_idx = entry_children[1].as_u64().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "synth_object_record: child value index is not a u64",
+                                    node,
+                                )
+                            })? as usize;
+                            let key_node = ast.get(AstRef::new(key_idx)).ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "synth_object_record: key node {} out of bounds",
+                                    key_idx
+                                ))
+                            })?;
+                            let Some(key) = key_node.payload.as_str() else {
+                                continue;
+                            };
+                            if key == "__tag__" {
+                                let value_node = ast.get(AstRef::new(value_idx));
+                                tag_name = value_node.and_then(|n| {
+                                    n.payload.as_str().map(str::to_string).or_else(|| {
                                         n.payload
                                             .get("value")
                                             .and_then(Value::as_str)
                                             .map(str::to_string)
                                     })
-                            });
-                            // Still synthesize the value node (node_types
-                            // bookkeeping), but it is not a record field.
-                            let _ = self.synth_node(lang, ast, AstRef::new(value_idx), ctx);
-                            continue;
+                                });
+                                // Still synthesize the value node (node_types
+                                // bookkeeping), but it is not a record field.
+                                let _ = self.synth_node(lang, ast, AstRef::new(value_idx), ctx);
+                                continue;
+                            }
+                            let value_type =
+                                self.synth_node(lang, ast, AstRef::new(value_idx), ctx)?;
+                            fields.insert(key.to_string(), value_type);
                         }
-                        let value_type = self.synth_node(lang, ast, AstRef::new(value_idx), ctx)?;
-                        fields.insert(key.to_string(), value_type);
+                    } else {
+                        return Err(LangError::engine_node(
+                            "synth_object_record: node has no entries or children array",
+                            node,
+                        ));
                     }
-                } else {
-                    return Err(LangError::engine_node(
-                        "synth_object_record: node has no entries or children array",
-                        node,
-                    ));
-                }
 
-                // A `__tag__`-bearing literal mints the tagged type
-                // (`{"__tag__": t, …fields}`); an untagged one is a
-                // `type.record`.
-                if let Some(tag) = tag_name {
-                    return ctx
-                        .registry
-                        .construct(&tag, &Value::Object(fields))
+                    // A `__tag__`-bearing literal mints the tagged type
+                    // (`{"__tag__": t, …fields}`); an untagged one is a
+                    // `type.record`.
+                    if let Some(tag) = tag_name {
+                        return ctx
+                            .registry
+                            .construct(&tag, &Value::Object(fields))
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "synth_object_record: construct failed for tagged type",
+                                    node,
+                                )
+                            });
+                    }
+                    let fields_value = Value::Object(fields);
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("fields".to_string(), fields_value);
+                    ctx.registry
+                        .construct("type.record", &Value::Object(payload))
                         .ok_or_else(|| {
                             LangError::engine_node(
-                                "synth_object_record: construct failed for tagged type",
+                                "synth_object_record: construct failed for type.record",
                                 node,
                             )
-                        });
+                        })
                 }
-                let fields_value = Value::Object(fields);
-                let mut payload = serde_json::Map::new();
-                payload.insert("fields".to_string(), fields_value);
-                ctx.registry
-                    .construct("type.record", &Value::Object(payload))
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            "synth_object_record: construct failed for type.record",
-                            node,
-                        )
-                    })
-            }
-            "check_object_record" => {
-                // Check an `object` node's entries against an expected
-                // `type.record{fields: {...}}`. For each entry, look up the
-                // field type in the expected record and verify the entry's
-                // JSON value matches that type (ADR-0054 — directed checking
-                // for `object` against a known record type).
-                //
-                // ADR-0074 ID.7 — row polymorphism: when the expected
-                // `type.record` has a `rest` field (row variable), entries
-                // with keys NOT in the expected `fields` are collected as
-                // extra fields and assigned to the `rest` row variable. When
-                // `rest` is absent (closed record), every entry must have a
-                // matching field in the expected record (the original
-                // behavior).
-                let expected = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let expected_fields = expected
-                    .get("fields")
-                    .and_then(|f| f.as_object())
-                    .ok_or_else(|| {
+                "check_object_record" => {
+                    // Check an `object` node's entries against an expected
+                    // `type.record{fields: {...}}`. For each entry, look up the
+                    // field type in the expected record and verify the entry's
+                    // JSON value matches that type (ADR-0054 — directed checking
+                    // for `object` against a known record type).
+                    //
+                    // ADR-0074 ID.7 — row polymorphism: when the expected
+                    // `type.record` has a `rest` field (row variable), entries
+                    // with keys NOT in the expected `fields` are collected as
+                    // extra fields and assigned to the `rest` row variable. When
+                    // `rest` is absent (closed record), every entry must have a
+                    // matching field in the expected record (the original
+                    // behavior).
+                    let expected = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let expected_fields = expected
+                        .get("fields")
+                        .and_then(|f| f.as_object())
+                        .ok_or_else(|| {
+                            LangError::engine(format!(
+                                "check_object_record: expected type has no 'fields' object: {:?}",
+                                expected
+                            ))
+                        })?;
+                    let rest = expected.get("rest");
+                    let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine(format!(
-                            "check_object_record: expected type has no 'fields' object: {:?}",
-                            expected
+                            "check_object_record: node {} out of bounds",
+                            node_ref.index()
                         ))
                     })?;
-                let rest = expected.get("rest");
-                let node = ast.get(node_ref).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "check_object_record: node {} out of bounds",
-                        node_ref.index()
-                    ))
-                })?;
-                let entries = node
-                    .payload
-                    .get("entries")
-                    .and_then(|e| e.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            "check_object_record: node has no entries array",
-                            node,
-                        )
-                    })?;
-                // Collect extra fields (entries not in expected_fields) for
-                // the row variable when the expected record is open.
-                let mut extra_fields: serde_json::Map<String, Value> = serde_json::Map::new();
-                for entry in entries {
-                    let key = entry.get("key").and_then(|k| k.as_str()).ok_or_else(|| {
-                        LangError::engine_node(
-                            "check_object_record: entry missing 'key' string",
-                            node,
-                        )
-                    })?;
-                    let value = entry.get("value").ok_or_else(|| {
-                        LangError::engine_node("check_object_record: entry missing 'value'", node)
-                    })?;
-                    let field_type = expected_fields.get(key);
-                    match field_type {
-                        Some(ft) => {
-                            let expected_tag = ctx.registry.as_type_tag(ft).ok_or_else(|| {
+                    let entries = node
+                        .payload
+                        .get("entries")
+                        .and_then(|e| e.as_array())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "check_object_record: node has no entries array",
+                                node,
+                            )
+                        })?;
+                    // Collect extra fields (entries not in expected_fields) for
+                    // the row variable when the expected record is open.
+                    let mut extra_fields: serde_json::Map<String, Value> = serde_json::Map::new();
+                    for entry in entries {
+                        let key = entry.get("key").and_then(|k| k.as_str()).ok_or_else(|| {
+                            LangError::engine_node(
+                                "check_object_record: entry missing 'key' string",
+                                node,
+                            )
+                        })?;
+                        let value = entry.get("value").ok_or_else(|| {
+                            LangError::engine_node(
+                                "check_object_record: entry missing 'value'",
+                                node,
+                            )
+                        })?;
+                        let field_type = expected_fields.get(key);
+                        match field_type {
+                            Some(ft) => {
+                                let expected_tag = ctx.registry.as_type_tag(ft).ok_or_else(|| {
                                 LangError::engine(format!(
                                     "check_object_record: field '{}' type is not a tagged type value",
                                     key
                                 ))
                             })?;
-                            let matches = match expected_tag {
-                                "type.number" => value.is_number(),
-                                "type.string" => value.is_string(),
-                                "type.bool" => value.is_boolean(),
-                                "type.null" => value.is_null(),
-                                "type.array" => value.is_array(),
-                                "type.object" => value.is_object(),
-                                _ => false,
-                            };
-                            if !matches {
-                                return Err(LangError::engine(format!(
-                                    "check_object_record: field '{}' value {:?} does not match expected type {}",
-                                    key, value, expected_tag
-                                )));
-                            }
-                        }
-                        None => {
-                            // Entry key not in expected fields.
-                            if let Some(_rest_val) = rest {
-                                // Open record: collect as an extra field for
-                                // the row variable. Infer the field type from
-                                // the JSON value's type.
-                                let tag = match value {
-                                    Value::Number(_) => "type.number",
-                                    Value::String(_) => "type.string",
-                                    Value::Bool(_) => "type.bool",
-                                    Value::Null => "type.null",
-                                    Value::Array(_) => "type.array",
-                                    Value::Object(_) => "type.object",
+                                let matches = match expected_tag {
+                                    "type.number" => value.is_number(),
+                                    "type.string" => value.is_string(),
+                                    "type.bool" => value.is_boolean(),
+                                    "type.null" => value.is_null(),
+                                    "type.array" => value.is_array(),
+                                    "type.object" => value.is_object(),
+                                    _ => false,
                                 };
-                                let field_ty =
+                                if !matches {
+                                    return Err(LangError::engine(format!(
+                                        "check_object_record: field '{}' value {:?} does not match expected type {}",
+                                        key, value, expected_tag
+                                    )));
+                                }
+                            }
+                            None => {
+                                // Entry key not in expected fields.
+                                if let Some(_rest_val) = rest {
+                                    // Open record: collect as an extra field for
+                                    // the row variable. Infer the field type from
+                                    // the JSON value's type.
+                                    let tag = match value {
+                                        Value::Number(_) => "type.number",
+                                        Value::String(_) => "type.string",
+                                        Value::Bool(_) => "type.bool",
+                                        Value::Null => "type.null",
+                                        Value::Array(_) => "type.array",
+                                        Value::Object(_) => "type.object",
+                                    };
+                                    let field_ty =
                                     ctx.registry.construct(tag, &Value::Null).ok_or_else(|| {
                                         LangError::engine(format!(
                                             "check_object_record: construct failed for tag '{}'",
                                             tag
                                         ))
                                     })?;
-                                extra_fields.insert(key.to_string(), field_ty);
-                            } else {
-                                // Closed record: no extra fields allowed.
-                                return Err(LangError::engine(format!(
-                                    "check_object_record: field '{}' not found in expected record",
-                                    key
-                                )));
+                                    extra_fields.insert(key.to_string(), field_ty);
+                                } else {
+                                    // Closed record: no extra fields allowed.
+                                    return Err(LangError::engine(format!(
+                                        "check_object_record: field '{}' not found in expected record",
+                                        key
+                                    )));
+                                }
                             }
                         }
                     }
-                }
-                // If the expected record is open, assign the collected extra
-                // fields to the row variable (`rest`).
-                if let Some(rest_val) = rest {
-                    let extra_record = self.construct_record(&extra_fields, None, ctx)?;
-                    self.unify(rest_val, &extra_record, ctx)?;
-                }
-                Ok(Value::Null)
-            }
-            // --- ADR-0054 dependent-type closure machinery (Pi/Sigma) ---
-            //
-            // These ops bring NBE closure machinery into the data-driven
-            // engine for dependent type support. A Pi/Sigma type value carries
-            // a `body_closure` field (instead of a flat `body` field) that
-            // records the variable name and the AST child index of the body.
-            // When the closure is applied, the engine marks Γ, extends it with
-            // the variable, synths the body child, and restores Γ — mirroring
-            // the legacy `Closure::apply` (ADR-0054).
-            "construct_pi" => {
-                // Construct a dependent function type `Π (x: param) → body(x)`.
-                // `lit` is the variable name (default "x"); `args[0]` is a
-                // sub-scheme producing the param type. The body child is child
-                // 1 of the current node; its arena index is stored in the
-                // closure marker for lazy evaluation via `pi_apply`.
-                let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
-                let param = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let body_child = child_ref(ast, node_ref, 1)?;
-                let body_child_idx = body_child.index();
-                let mut payload = serde_json::Map::new();
-                payload.insert("param".to_string(), param);
-                payload.insert(
-                    "body_closure".to_string(),
-                    serde_json::json!({
-                        "var_name": var_name,
-                        "body_child_idx": body_child_idx,
-                    }),
-                );
-                ctx.registry
-                    .construct("type.pi", &Value::Object(payload))
-                    .ok_or_else(|| {
-                        LangError::engine("typecheck: construct_pi: failed to mint type.pi value")
-                    })
-            }
-            "construct_sigma" => {
-                // Construct a dependent pair type `Σ (x: param) × body(x)`.
-                // Same structure as `construct_pi` but mints `type.sigma`.
-                let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
-                let param = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let body_child = child_ref(ast, node_ref, 1)?;
-                let body_child_idx = body_child.index();
-                let mut payload = serde_json::Map::new();
-                payload.insert("param".to_string(), param);
-                payload.insert(
-                    "body_closure".to_string(),
-                    serde_json::json!({
-                        "var_name": var_name,
-                        "body_child_idx": body_child_idx,
-                    }),
-                );
-                ctx.registry
-                    .construct("type.sigma", &Value::Object(payload))
-                    .ok_or_else(|| {
-                        LangError::engine(
-                            "typecheck: construct_sigma: failed to mint type.sigma value",
-                        )
-                    })
-            }
-            "pi_apply" => {
-                // Apply a Pi (or Sigma) closure to an argument type value,
-                // returning the body type. `args[0]` is a sub-scheme producing
-                // the Pi type value; `args[1]` (or `incoming`) is a sub-scheme
-                // producing the argument's type value. The engine marks Γ,
-                // extends it with the bound variable → argument type, synths
-                // the body child, and restores Γ (ADR-0054 closure application).
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "typecheck: pi_apply requires at least 1 arg (Pi type sub-scheme)",
-                    ));
-                }
-                let pi_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let arg_type = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let body_type = self.apply_type_closure(lang, ast, &pi_val, &arg_type, ctx)?;
-                Ok(body_type)
-            }
-            "unify_pi" => {
-                // Unify two Pi (or Sigma) types with closure-based bodies.
-                // `args[0]` and `args[1]` are sub-schemes producing the two
-                // type values. Unifies the `param` fields, then creates a
-                // fresh metavariable, applies both closures with it, and
-                // unifies the resulting body types (ADR-0054 closure
-                // unification — mirrors legacy `unify` for `Value::Pi`).
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "typecheck: unify_pi requires 2 args (two Pi type sub-schemes)",
-                    ));
-                }
-                let pi_a =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let pi_b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                // Unify param fields.
-                let param_a = pi_a.get("param").unwrap_or(&Value::Null);
-                let param_b = pi_b.get("param").unwrap_or(&Value::Null);
-                self.unify(param_a, param_b, ctx)?;
-                // Create a fresh metavariable as the stand-in argument type.
-                let fresh_id = ctx.fresh_meta();
-                let fresh = meta_value(fresh_id);
-                // Apply both closures with the fresh metavariable.
-                let body_a = self.apply_type_closure(lang, ast, &pi_a, &fresh, ctx)?;
-                let body_b = self.apply_type_closure(lang, ast, &pi_b, &fresh, ctx)?;
-                // Unify the resulting body types.
-                self.unify(&body_a, &body_b, ctx)?;
-                Ok(Value::Null)
-            }
-            "check_pi_body" => {
-                // Check a lambda/function body against a Pi type's body
-                // closure. `args[0]` is a sub-scheme producing the Pi type
-                // value; the current node's child 1 is the body to check.
-                // The engine marks Γ, extends it with the bound variable →
-                // Pi's param type, applies the closure to get the expected
-                // body type, checks child 1 against it, and restores Γ
-                // (ADR-0054 lambda checking against Pi types).
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "typecheck: check_pi_body requires 1 arg (Pi type sub-scheme)",
-                    ));
-                }
-                let pi_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let param_type = pi_val.get("param").cloned().unwrap_or(Value::Null);
-                // Extract closure info to get the variable name.
-                let body_closure = pi_val.get("body_closure").ok_or_else(|| {
-                    LangError::engine("typecheck: check_pi_body: Pi type has no body_closure")
-                })?;
-                let var_name = body_closure
-                    .get("var_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("x");
-                // Mark Γ, extend with the variable → param type.
-                let mark = ctx.mark();
-                ctx.extend(var_name.to_string(), param_type.clone());
-                // Apply the closure with the param type to get the expected
-                // body type.
-                let expected_body =
-                    self.apply_type_closure(lang, ast, &pi_val, &param_type, ctx)?;
-                // Check child 1 (the lambda body) against the expected body type.
-                let body_child = child_ref(ast, node_ref, 1)?;
-                self.check_node(lang, ast, body_child, &expected_body, ctx)?;
-                // Restore Γ.
-                ctx.restore(mark);
-                Ok(Value::Null)
-            }
-            // --- ADR-0054 Forall (parametric polymorphism) ---
-            //
-            // Forall is like Pi but for type-level abstraction:
-            // `∀ (x:Kind) → body(x)`. The parameter is a *type*, not a value.
-            // The forall type value carries a `kind` field (the kind of the
-            // type parameter) and a `body_closure` marker, mirroring Pi.
-            "construct_forall" => {
-                // Construct a polymorphic type `∀ (x: kind) → body(x)`.
-                // `lit` is the variable name (default "x"); `args[0]` is a
-                // sub-scheme producing the kind of the type parameter. The
-                // body child is child 1 of the current node; its arena index
-                // is stored in the closure marker for lazy evaluation via
-                // `forall_apply`.
-                let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
-                let kind = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let body_child = child_ref(ast, node_ref, 1)?;
-                let body_child_idx = body_child.index();
-                let mut payload = serde_json::Map::new();
-                payload.insert("kind".to_string(), kind);
-                payload.insert(
-                    "body_closure".to_string(),
-                    serde_json::json!({
-                        "var_name": var_name,
-                        "body_child_idx": body_child_idx,
-                    }),
-                );
-                ctx.registry
-                    .construct("type.forall", &Value::Object(payload))
-                    .ok_or_else(|| {
-                        LangError::engine(
-                            "typecheck: construct_forall: failed to mint type.forall value",
-                        )
-                    })
-            }
-            "forall_apply" => {
-                // Instantiate a polymorphic Forall type with a type argument,
-                // returning the body type. `args[0]` is a sub-scheme producing
-                // the Forall type value; `args[1]` (or `incoming`) is a
-                // sub-scheme producing the type argument. The engine marks Γ,
-                // extends it with the bound variable → type argument, synths
-                // the body child, and restores Γ (ADR-0054 closure
-                // application — mirrors `pi_apply`).
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "typecheck: forall_apply requires at least 1 arg (Forall type sub-scheme)",
-                    ));
-                }
-                let forall_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let arg_type = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let body_type = self.apply_type_closure(lang, ast, &forall_val, &arg_type, ctx)?;
-                Ok(body_type)
-            }
-            "unify_forall" => {
-                // Unify two Forall types with closure-based bodies.
-                // `args[0]` and `args[1]` are sub-schemes producing the two
-                // type values. Unifies the `kind` fields, then creates a
-                // fresh metavariable, applies both closures with it, and
-                // unifies the resulting body types (ADR-0054 closure
-                // unification — mirrors `unify_pi`).
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "typecheck: unify_forall requires 2 args (two Forall type sub-schemes)",
-                    ));
-                }
-                let fa_a =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let fa_b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                // Unify kind fields.
-                let kind_a = fa_a.get("kind").unwrap_or(&Value::Null);
-                let kind_b = fa_b.get("kind").unwrap_or(&Value::Null);
-                self.unify(kind_a, kind_b, ctx)?;
-                // Create a fresh metavariable as the stand-in type argument.
-                let fresh_id = ctx.fresh_meta();
-                let fresh = meta_value(fresh_id);
-                // Apply both closures with the fresh metavariable.
-                let body_a = self.apply_type_closure(lang, ast, &fa_a, &fresh, ctx)?;
-                let body_b = self.apply_type_closure(lang, ast, &fa_b, &fresh, ctx)?;
-                // Unify the resulting body types.
-                self.unify(&body_a, &body_b, ctx)?;
-                Ok(Value::Null)
-            }
-            // --- ADR-0054 Vau (fexpr) type support ---
-            //
-            // Vau is like Lambda but the parameter is NOT evaluated before
-            // substitution. The type is `type.vau` — like `type.pi` but
-            // marked as unevaluated. The vau type value carries a `param`
-            // field and a `body_closure` marker, mirroring Pi.
-            "construct_vau_type" => {
-                // Construct a vau (fexpr) type `Vau (x: param) → body(x)`.
-                // Same structure as `construct_pi` but mints `type.vau`.
-                let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
-                let param = if args.is_empty() {
-                    incoming.clone().unwrap_or(Value::Null)
-                } else {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                };
-                let body_child = child_ref(ast, node_ref, 1)?;
-                let body_child_idx = body_child.index();
-                let mut payload = serde_json::Map::new();
-                payload.insert("param".to_string(), param);
-                payload.insert(
-                    "body_closure".to_string(),
-                    serde_json::json!({
-                        "var_name": var_name,
-                        "body_child_idx": body_child_idx,
-                    }),
-                );
-                ctx.registry
-                    .construct("type.vau", &Value::Object(payload))
-                    .ok_or_else(|| {
-                        LangError::engine(
-                            "typecheck: construct_vau_type: failed to mint type.vau value",
-                        )
-                    })
-            }
-            "vau_apply" => {
-                // Apply a Vau type closure to an argument type value,
-                // returning the body type. `args[0]` is a sub-scheme producing
-                // the Vau type value; `args[1]` (or `incoming`) is a
-                // sub-scheme producing the argument's type value. The engine
-                // marks Γ, extends it with the bound variable → argument
-                // type, synths the body child, and restores Γ (ADR-0054
-                // closure application — mirrors `pi_apply`).
-                if args.is_empty() {
-                    return Err(LangError::engine(
-                        "typecheck: vau_apply requires at least 1 arg (Vau type sub-scheme)",
-                    ));
-                }
-                let vau_val =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let arg_type = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let body_type = self.apply_type_closure(lang, ast, &vau_val, &arg_type, ctx)?;
-                Ok(body_type)
-            }
-            "unify_vau" => {
-                // Unify two Vau types with closure-based bodies.
-                // `args[0]` and `args[1]` are sub-schemes producing the two
-                // type values. Unifies the `param` fields, then creates a
-                // fresh metavariable, applies both closures with it, and
-                // unifies the resulting body types (ADR-0054 closure
-                // unification — mirrors `unify_pi`).
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "typecheck: unify_vau requires 2 args (two Vau type sub-schemes)",
-                    ));
-                }
-                let vau_a =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let vau_b = self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
-                // Unify param fields.
-                let param_a = vau_a.get("param").unwrap_or(&Value::Null);
-                let param_b = vau_b.get("param").unwrap_or(&Value::Null);
-                self.unify(param_a, param_b, ctx)?;
-                // Create a fresh metavariable as the stand-in argument type.
-                let fresh_id = ctx.fresh_meta();
-                let fresh = meta_value(fresh_id);
-                // Apply both closures with the fresh metavariable.
-                let body_a = self.apply_type_closure(lang, ast, &vau_a, &fresh, ctx)?;
-                let body_b = self.apply_type_closure(lang, ast, &vau_b, &fresh, ctx)?;
-                // Unify the resulting body types.
-                self.unify(&body_a, &body_b, ctx)?;
-                Ok(Value::Null)
-            }
-            // --- ADR-0054 equality type support (Eq, Refl, Empty) ---
-            //
-            // These ops bring propositional equality into the data-driven
-            // engine. `Eq(a, b)` is the equality type — inhabited (by `Refl`)
-            // iff `a == b`. `Refl` is the proof of equality. `Empty` is the
-            // empty type (contradiction), used when equality fails
-            // (ADR-0054 legacy migration — mirrors legacy `Value::Eq`,
-            // `Value::Refl`, `Value::Empty`).
-            "construct_eq" => {
-                // Construct a `type.eq` tagged value with `left` and `right`
-                // fields. `args[0]` is the left side sub-scheme; `args[1]` is
-                // the right side sub-scheme (ADR-0054).
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "construct_eq: requires 2 args (left, right)",
-                    ));
-                }
-                let left =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let right =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?;
-                let payload = serde_json::json!({"left": left, "right": right});
-                ctx.registry
-                    .construct("type.eq", &payload)
-                    .ok_or_else(|| LangError::engine("construct_eq: construct failed"))
-            }
-            "construct_empty" => {
-                // Construct a `type.empty` tagged value (the empty type /
-                // contradiction). It carries no fields (ADR-0054).
-                ctx.registry
-                    .construct("type.empty", &Value::Null)
-                    .ok_or_else(|| LangError::engine("construct_empty: construct failed"))
-            }
-            "check_refl" => {
-                // Check a `refl` node against an expected `type.eq` type. The
-                // check succeeds iff the two sides are equal. The expected
-                // type comes from `incoming` (threaded by the `check` scheme)
-                // or `args[0]` (ADR-0054).
-                let expected = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                // Check that expected is a type.eq.
-                let tag = ctx.registry.as_type_tag(&expected).ok_or_else(|| {
-                    LangError::engine("check_refl: expected type is not a tagged type value")
-                })?;
-                if tag != "type.eq" {
-                    return Err(LangError::engine(format!(
-                        "check_refl: expected type {} is not type.eq",
-                        tag
-                    )));
-                }
-                // Extract left and right sides.
-                let left = expected.get("left").unwrap_or(&Value::Null);
-                let right = expected.get("right").unwrap_or(&Value::Null);
-                // Check that left == right (they must be equal for refl to be
-                // a valid proof).
-                if left == right {
+                    // If the expected record is open, assign the collected extra
+                    // fields to the row variable (`rest`).
+                    if let Some(rest_val) = rest {
+                        let extra_record = self.construct_record(&extra_fields, None, ctx)?;
+                        self.unify(rest_val, &extra_record, ctx)?;
+                    }
                     Ok(Value::Null)
-                } else {
-                    Err(LangError::engine(format!(
-                        "check_refl: cannot prove {:?} == {:?}",
-                        left, right
-                    )))
                 }
-            }
-            "eq_reduce" => {
-                // Reduce an `Eq(a, b)` type: if `a == b`, returns `type.refl`
-                // (the inhabited case); otherwise returns `type.empty`
-                // (ADR-0054). The Eq type value comes from `args[0]` or
-                // `incoming`.
-                let eq_val = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let left = eq_val.get("left").unwrap_or(&Value::Null);
-                let right = eq_val.get("right").unwrap_or(&Value::Null);
-                if left == right {
-                    // Equality holds — return type.refl (the inhabited case).
+                // --- ADR-0054 dependent-type closure machinery (Pi/Sigma) ---
+                //
+                // These ops bring NBE closure machinery into the data-driven
+                // engine for dependent type support. A Pi/Sigma type value carries
+                // a `body_closure` field (instead of a flat `body` field) that
+                // records the variable name and the AST child index of the body.
+                // When the closure is applied, the engine marks Γ, extends it with
+                // the variable, synths the body child, and restores Γ — mirroring
+                // the legacy `Closure::apply` (ADR-0054).
+                "construct_pi" => {
+                    // Construct a dependent function type `Π (x: param) → body(x)`.
+                    // `lit` is the variable name (default "x"); `args[0]` is a
+                    // sub-scheme producing the param type. The body child is child
+                    // 1 of the current node; its arena index is stored in the
+                    // closure marker for lazy evaluation via `pi_apply`.
+                    let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
+                    let param = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let body_child = child_ref(ast, node_ref, 1)?;
+                    let body_child_idx = body_child.index();
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("param".to_string(), param);
+                    payload.insert(
+                        "body_closure".to_string(),
+                        serde_json::json!({
+                            "var_name": var_name,
+                            "body_child_idx": body_child_idx,
+                        }),
+                    );
                     ctx.registry
-                        .construct("type.refl", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine("eq_reduce: construct failed for type.refl")
-                        })
-                } else {
-                    // Equality fails — return type.empty.
-                    ctx.registry
-                        .construct("type.empty", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine("eq_reduce: construct failed for type.empty")
-                        })
-                }
-            }
-            // --- ADR-0054 universe level support ---
-            //
-            // Universe types `Type_n` are types whose elements are types of
-            // level < n. The cumulative hierarchy is `Type_0 ⊆ Type_1 ⊆ ...`
-            // (mirrors the legacy `plugin-typecheck-nbe` `Level` type). These
-            // ops let type rules construct universes, extract their levels,
-            // and compute `max` levels for Pi/Sigma result universes.
-            "construct_universe" => {
-                // Construct a `type.universe` value carrying a `level` field.
-                // `lit` is the level (u64), or `args[0]` is a sub-scheme
-                // evaluating to the level (u64). Defaults to 0 when neither is
-                // present (base universe `Type_0`).
-                let level = if let Some(lit_val) = lit {
-                    lit_val.as_u64().ok_or_else(|| {
-                        LangError::engine("construct_universe: lit must be a u64 level")
-                    })? as u32
-                } else if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                        .as_u64()
+                        .construct("type.pi", &Value::Object(payload))
                         .ok_or_else(|| {
                             LangError::engine(
-                                "construct_universe: arg must evaluate to a u64 level",
+                                "typecheck: construct_pi: failed to mint type.pi value",
                             )
-                        })? as u32
-                } else {
-                    0
-                };
-                let mut payload = serde_json::Map::new();
-                payload.insert("level".to_string(), Value::from(level));
-                ctx.registry
-                    .construct("type.universe", &Value::Object(payload))
-                    .ok_or_else(|| {
-                        LangError::engine("construct_universe: construct failed for type.universe")
-                    })
-            }
-            "universe_level" => {
-                // Extract the universe level of a type value. For a
-                // `type.universe` value, returns its `level` field. For other
-                // type values (base types like `type.number`), returns 0
-                // (base types live in `Type_0`). The type value comes from
-                // `args[0]` (a sub-scheme) or `incoming`.
-                let type_val = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                if let Some(tag) = ctx.registry.as_type_tag(&type_val) {
-                    if tag == "type.universe" {
-                        let level = type_val.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
-                        return Ok(Value::from(level));
+                        })
+                }
+                "construct_sigma" => {
+                    // Construct a dependent pair type `Σ (x: param) × body(x)`.
+                    // Same structure as `construct_pi` but mints `type.sigma`.
+                    let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
+                    let param = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let body_child = child_ref(ast, node_ref, 1)?;
+                    let body_child_idx = body_child.index();
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("param".to_string(), param);
+                    payload.insert(
+                        "body_closure".to_string(),
+                        serde_json::json!({
+                            "var_name": var_name,
+                            "body_child_idx": body_child_idx,
+                        }),
+                    );
+                    ctx.registry
+                        .construct("type.sigma", &Value::Object(payload))
+                        .ok_or_else(|| {
+                            LangError::engine(
+                                "typecheck: construct_sigma: failed to mint type.sigma value",
+                            )
+                        })
+                }
+                "pi_apply" => {
+                    // Apply a Pi (or Sigma) closure to an argument type value,
+                    // returning the body type. `args[0]` is a sub-scheme producing
+                    // the Pi type value; `args[1]` (or `incoming`) is a sub-scheme
+                    // producing the argument's type value. The engine marks Γ,
+                    // extends it with the bound variable → argument type, synths
+                    // the body child, and restores Γ (ADR-0054 closure application).
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "typecheck: pi_apply requires at least 1 arg (Pi type sub-scheme)",
+                        ));
+                    }
+                    let pi_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let arg_type = if args.len() > 1 {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[1],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let body_type = self.apply_type_closure(lang, ast, &pi_val, &arg_type, ctx)?;
+                    Ok(body_type)
+                }
+                "unify_pi" => {
+                    // Unify two Pi (or Sigma) types with closure-based bodies.
+                    // `args[0]` and `args[1]` are sub-schemes producing the two
+                    // type values. Unifies the `param` fields, then creates a
+                    // fresh metavariable, applies both closures with it, and
+                    // unifies the resulting body types (ADR-0054 closure
+                    // unification — mirrors legacy `unify` for `Value::Pi`).
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "typecheck: unify_pi requires 2 args (two Pi type sub-schemes)",
+                        ));
+                    }
+                    let pi_a = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let pi_b =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    // Unify param fields.
+                    let param_a = pi_a.get("param").unwrap_or(&Value::Null);
+                    let param_b = pi_b.get("param").unwrap_or(&Value::Null);
+                    self.unify(param_a, param_b, ctx)?;
+                    // Create a fresh metavariable as the stand-in argument type.
+                    let fresh_id = ctx.fresh_meta();
+                    let fresh = meta_value(fresh_id);
+                    // Apply both closures with the fresh metavariable.
+                    let body_a = self.apply_type_closure(lang, ast, &pi_a, &fresh, ctx)?;
+                    let body_b = self.apply_type_closure(lang, ast, &pi_b, &fresh, ctx)?;
+                    // Unify the resulting body types.
+                    self.unify(&body_a, &body_b, ctx)?;
+                    Ok(Value::Null)
+                }
+                "check_pi_body" => {
+                    // Check a lambda/function body against a Pi type's body
+                    // closure. `args[0]` is a sub-scheme producing the Pi type
+                    // value; the current node's child 1 is the body to check.
+                    // The engine marks Γ, extends it with the bound variable →
+                    // Pi's param type, applies the closure to get the expected
+                    // body type, checks child 1 against it, and restores Γ
+                    // (ADR-0054 lambda checking against Pi types).
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "typecheck: check_pi_body requires 1 arg (Pi type sub-scheme)",
+                        ));
+                    }
+                    let pi_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let param_type = pi_val.get("param").cloned().unwrap_or(Value::Null);
+                    // Extract closure info to get the variable name.
+                    let body_closure = pi_val.get("body_closure").ok_or_else(|| {
+                        LangError::engine("typecheck: check_pi_body: Pi type has no body_closure")
+                    })?;
+                    let var_name = body_closure
+                        .get("var_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("x");
+                    // Mark Γ, extend with the variable → param type.
+                    let mark = ctx.mark();
+                    ctx.extend(var_name.to_string(), param_type.clone());
+                    // Apply the closure with the param type to get the expected
+                    // body type.
+                    let expected_body =
+                        self.apply_type_closure(lang, ast, &pi_val, &param_type, ctx)?;
+                    // Check child 1 (the lambda body) against the expected body type.
+                    let body_child = child_ref(ast, node_ref, 1)?;
+                    self.check_node(lang, ast, body_child, &expected_body, ctx)?;
+                    // Restore Γ.
+                    ctx.restore(mark);
+                    Ok(Value::Null)
+                }
+                // --- ADR-0054 Forall (parametric polymorphism) ---
+                //
+                // Forall is like Pi but for type-level abstraction:
+                // `∀ (x:Kind) → body(x)`. The parameter is a *type*, not a value.
+                // The forall type value carries a `kind` field (the kind of the
+                // type parameter) and a `body_closure` marker, mirroring Pi.
+                "construct_forall" => {
+                    // Construct a polymorphic type `∀ (x: kind) → body(x)`.
+                    // `lit` is the variable name (default "x"); `args[0]` is a
+                    // sub-scheme producing the kind of the type parameter. The
+                    // body child is child 1 of the current node; its arena index
+                    // is stored in the closure marker for lazy evaluation via
+                    // `forall_apply`.
+                    let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
+                    let kind = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let body_child = child_ref(ast, node_ref, 1)?;
+                    let body_child_idx = body_child.index();
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("kind".to_string(), kind);
+                    payload.insert(
+                        "body_closure".to_string(),
+                        serde_json::json!({
+                            "var_name": var_name,
+                            "body_child_idx": body_child_idx,
+                        }),
+                    );
+                    ctx.registry
+                        .construct("type.forall", &Value::Object(payload))
+                        .ok_or_else(|| {
+                            LangError::engine(
+                                "typecheck: construct_forall: failed to mint type.forall value",
+                            )
+                        })
+                }
+                "forall_apply" => {
+                    // Instantiate a polymorphic Forall type with a type argument,
+                    // returning the body type. `args[0]` is a sub-scheme producing
+                    // the Forall type value; `args[1]` (or `incoming`) is a
+                    // sub-scheme producing the type argument. The engine marks Γ,
+                    // extends it with the bound variable → type argument, synths
+                    // the body child, and restores Γ (ADR-0054 closure
+                    // application — mirrors `pi_apply`).
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "typecheck: forall_apply requires at least 1 arg (Forall type sub-scheme)",
+                        ));
+                    }
+                    let forall_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let arg_type = if args.len() > 1 {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[1],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let body_type =
+                        self.apply_type_closure(lang, ast, &forall_val, &arg_type, ctx)?;
+                    Ok(body_type)
+                }
+                "unify_forall" => {
+                    // Unify two Forall types with closure-based bodies.
+                    // `args[0]` and `args[1]` are sub-schemes producing the two
+                    // type values. Unifies the `kind` fields, then creates a
+                    // fresh metavariable, applies both closures with it, and
+                    // unifies the resulting body types (ADR-0054 closure
+                    // unification — mirrors `unify_pi`).
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "typecheck: unify_forall requires 2 args (two Forall type sub-schemes)",
+                        ));
+                    }
+                    let fa_a = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let fa_b =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    // Unify kind fields.
+                    let kind_a = fa_a.get("kind").unwrap_or(&Value::Null);
+                    let kind_b = fa_b.get("kind").unwrap_or(&Value::Null);
+                    self.unify(kind_a, kind_b, ctx)?;
+                    // Create a fresh metavariable as the stand-in type argument.
+                    let fresh_id = ctx.fresh_meta();
+                    let fresh = meta_value(fresh_id);
+                    // Apply both closures with the fresh metavariable.
+                    let body_a = self.apply_type_closure(lang, ast, &fa_a, &fresh, ctx)?;
+                    let body_b = self.apply_type_closure(lang, ast, &fa_b, &fresh, ctx)?;
+                    // Unify the resulting body types.
+                    self.unify(&body_a, &body_b, ctx)?;
+                    Ok(Value::Null)
+                }
+                // --- ADR-0054 Vau (fexpr) type support ---
+                //
+                // Vau is like Lambda but the parameter is NOT evaluated before
+                // substitution. The type is `type.vau` — like `type.pi` but
+                // marked as unevaluated. The vau type value carries a `param`
+                // field and a `body_closure` marker, mirroring Pi.
+                "construct_vau_type" => {
+                    // Construct a vau (fexpr) type `Vau (x: param) → body(x)`.
+                    // Same structure as `construct_pi` but mints `type.vau`.
+                    let var_name = lit.and_then(|v| v.as_str()).unwrap_or("x").to_string();
+                    let param = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    let body_child = child_ref(ast, node_ref, 1)?;
+                    let body_child_idx = body_child.index();
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("param".to_string(), param);
+                    payload.insert(
+                        "body_closure".to_string(),
+                        serde_json::json!({
+                            "var_name": var_name,
+                            "body_child_idx": body_child_idx,
+                        }),
+                    );
+                    ctx.registry
+                        .construct("type.vau", &Value::Object(payload))
+                        .ok_or_else(|| {
+                            LangError::engine(
+                                "typecheck: construct_vau_type: failed to mint type.vau value",
+                            )
+                        })
+                }
+                "vau_apply" => {
+                    // Apply a Vau type closure to an argument type value,
+                    // returning the body type. `args[0]` is a sub-scheme producing
+                    // the Vau type value; `args[1]` (or `incoming`) is a
+                    // sub-scheme producing the argument's type value. The engine
+                    // marks Γ, extends it with the bound variable → argument
+                    // type, synths the body child, and restores Γ (ADR-0054
+                    // closure application — mirrors `pi_apply`).
+                    if args.is_empty() {
+                        return Err(LangError::engine(
+                            "typecheck: vau_apply requires at least 1 arg (Vau type sub-scheme)",
+                        ));
+                    }
+                    let vau_val = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let arg_type = if args.len() > 1 {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[1],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let body_type = self.apply_type_closure(lang, ast, &vau_val, &arg_type, ctx)?;
+                    Ok(body_type)
+                }
+                "unify_vau" => {
+                    // Unify two Vau types with closure-based bodies.
+                    // `args[0]` and `args[1]` are sub-schemes producing the two
+                    // type values. Unifies the `param` fields, then creates a
+                    // fresh metavariable, applies both closures with it, and
+                    // unifies the resulting body types (ADR-0054 closure
+                    // unification — mirrors `unify_pi`).
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "typecheck: unify_vau requires 2 args (two Vau type sub-schemes)",
+                        ));
+                    }
+                    let vau_a = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let vau_b =
+                        self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?;
+                    // Unify param fields.
+                    let param_a = vau_a.get("param").unwrap_or(&Value::Null);
+                    let param_b = vau_b.get("param").unwrap_or(&Value::Null);
+                    self.unify(param_a, param_b, ctx)?;
+                    // Create a fresh metavariable as the stand-in argument type.
+                    let fresh_id = ctx.fresh_meta();
+                    let fresh = meta_value(fresh_id);
+                    // Apply both closures with the fresh metavariable.
+                    let body_a = self.apply_type_closure(lang, ast, &vau_a, &fresh, ctx)?;
+                    let body_b = self.apply_type_closure(lang, ast, &vau_b, &fresh, ctx)?;
+                    // Unify the resulting body types.
+                    self.unify(&body_a, &body_b, ctx)?;
+                    Ok(Value::Null)
+                }
+                // --- ADR-0054 equality type support (Eq, Refl, Empty) ---
+                //
+                // These ops bring propositional equality into the data-driven
+                // engine. `Eq(a, b)` is the equality type — inhabited (by `Refl`)
+                // iff `a == b`. `Refl` is the proof of equality. `Empty` is the
+                // empty type (contradiction), used when equality fails
+                // (ADR-0054 legacy migration — mirrors legacy `Value::Eq`,
+                // `Value::Refl`, `Value::Empty`).
+                "construct_eq" => {
+                    // Construct a `type.eq` tagged value with `left` and `right`
+                    // fields. `args[0]` is the left side sub-scheme; `args[1]` is
+                    // the right side sub-scheme (ADR-0054).
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "construct_eq: requires 2 args (left, right)",
+                        ));
+                    }
+                    let left = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let right = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[1],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let payload = serde_json::json!({"left": left, "right": right});
+                    ctx.registry
+                        .construct("type.eq", &payload)
+                        .ok_or_else(|| LangError::engine("construct_eq: construct failed"))
+                }
+                "construct_empty" => {
+                    // Construct a `type.empty` tagged value (the empty type /
+                    // contradiction). It carries no fields (ADR-0054).
+                    ctx.registry
+                        .construct("type.empty", &Value::Null)
+                        .ok_or_else(|| LangError::engine("construct_empty: construct failed"))
+                }
+                "check_refl" => {
+                    // Check a `refl` node against an expected `type.eq` type. The
+                    // check succeeds iff the two sides are equal. The expected
+                    // type comes from `incoming` (threaded by the `check` scheme)
+                    // or `args[0]` (ADR-0054).
+                    let expected = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    // Check that expected is a type.eq.
+                    let tag = ctx.registry.as_type_tag(&expected).ok_or_else(|| {
+                        LangError::engine("check_refl: expected type is not a tagged type value")
+                    })?;
+                    if tag != "type.eq" {
+                        return Err(LangError::engine(format!(
+                            "check_refl: expected type {} is not type.eq",
+                            tag
+                        )));
+                    }
+                    // Extract left and right sides.
+                    let left = expected.get("left").unwrap_or(&Value::Null);
+                    let right = expected.get("right").unwrap_or(&Value::Null);
+                    // Check that left == right (they must be equal for refl to be
+                    // a valid proof).
+                    if left == right {
+                        Ok(Value::Null)
+                    } else {
+                        Err(LangError::engine(format!(
+                            "check_refl: cannot prove {:?} == {:?}",
+                            left, right
+                        )))
                     }
                 }
-                // For other type values, return 0 (base types live in Type_0).
-                Ok(Value::from(0u64))
-            }
-            "universe_max" => {
-                // Compute the max of two universe levels (u64). `args[0]` and
-                // `args[1]` are sub-schemes evaluating to levels. Used by
-                // Pi/Sigma rules to compute the result universe as
-                // `max(param_universe, body_universe)`.
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "universe_max requires 2 args (two level sub-schemes)",
-                    ));
+                "eq_reduce" => {
+                    // Reduce an `Eq(a, b)` type: if `a == b`, returns `type.refl`
+                    // (the inhabited case); otherwise returns `type.empty`
+                    // (ADR-0054). The Eq type value comes from `args[0]` or
+                    // `incoming`.
+                    let eq_val = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let left = eq_val.get("left").unwrap_or(&Value::Null);
+                    let right = eq_val.get("right").unwrap_or(&Value::Null);
+                    if left == right {
+                        // Equality holds — return type.refl (the inhabited case).
+                        ctx.registry
+                            .construct("type.refl", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine("eq_reduce: construct failed for type.refl")
+                            })
+                    } else {
+                        // Equality fails — return type.empty.
+                        ctx.registry
+                            .construct("type.empty", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine("eq_reduce: construct failed for type.empty")
+                            })
+                    }
                 }
-                let level_a = self
-                    .eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
-                    .as_u64()
-                    .ok_or_else(|| LangError::engine("universe_max: arg 0 is not a u64"))?;
-                let level_b = self
-                    .eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?
-                    .as_u64()
-                    .ok_or_else(|| LangError::engine("universe_max: arg 1 is not a u64"))?;
-                Ok(Value::from(level_a.max(level_b)))
-            }
-            // --- ADR-0054 Membership types (Is, Collection, Membership) ---
-            //
-            // Membership types model the proposition `value ∈ collection`.
-            // `Collection(name)` is a named collection (e.g. `type.number`,
-            // `type.string`). `Membership(value, collection)` is the type of
-            // `value ∈ collection`. `IsEvidence` is the proof when membership
-            // holds; `Empty` is the result when it doesn't. The core
-            // operation is `primitive_member(value, collection)` — it checks
-            // if a JSON value is a member of a primitive collection
-            // (type.number ↔ JSON number, etc.), mirroring the legacy
-            // `plugin-typecheck-nbe` `primitive_member` function.
-            "construct_membership" => {
-                // Create a `type.membership` tagged value with `value` and
-                // `collection` fields. `args[0]` is the value sub-scheme;
-                // `args[1]` is the collection type sub-scheme.
-                if args.len() < 2 {
-                    return Err(LangError::engine(
-                        "construct_membership: requires 2 args (value, collection)",
-                    ));
-                }
-                let value =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?;
-                let collection =
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?;
-                let payload = serde_json::json!({"value": value, "collection": collection});
-                ctx.registry
-                    .construct("type.membership", &payload)
-                    .ok_or_else(|| LangError::engine("construct_membership: construct failed"))
-            }
-            "check_membership" => {
-                // Check if a JSON value is a member of a collection type.
-                // This is the core membership oracle. `args[0]` is the JSON
-                // value sub-scheme (or `incoming`); `args[1]` is the
-                // collection type sub-scheme (or `lit` is the collection tag
-                // string). Returns `type.is_evidence` if membership holds,
-                // `type.empty` otherwise.
-                let value = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let collection = if args.len() > 1 {
-                    self.eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming.clone())?
-                } else if let Some(lit_val) = lit {
-                    // lit is the collection tag string.
-                    ctx.registry
-                        .construct(
-                            lit_val.as_str().ok_or_else(|| {
+                // --- ADR-0054 universe level support ---
+                //
+                // Universe types `Type_n` are types whose elements are types of
+                // level < n. The cumulative hierarchy is `Type_0 ⊆ Type_1 ⊆ ...`
+                // (mirrors the legacy `plugin-typecheck-nbe` `Level` type). These
+                // ops let type rules construct universes, extract their levels,
+                // and compute `max` levels for Pi/Sigma result universes.
+                "construct_universe" => {
+                    // Construct a `type.universe` value carrying a `level` field.
+                    // `lit` is the level (u64), or `args[0]` is a sub-scheme
+                    // evaluating to the level (u64). Defaults to 0 when neither is
+                    // present (base universe `Type_0`).
+                    let level = if let Some(lit_val) = lit {
+                        lit_val.as_u64().ok_or_else(|| {
+                            LangError::engine("construct_universe: lit must be a u64 level")
+                        })? as u32
+                    } else if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                            .as_u64()
+                            .ok_or_else(|| {
                                 LangError::engine(
-                                    "check_membership: lit must be a collection tag string",
+                                    "construct_universe: arg must evaluate to a u64 level",
                                 )
-                            })?,
-                            &Value::Null,
+                            })? as u32
+                    } else {
+                        0
+                    };
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("level".to_string(), Value::from(level));
+                    ctx.registry
+                        .construct("type.universe", &Value::Object(payload))
+                        .ok_or_else(|| {
+                            LangError::engine(
+                                "construct_universe: construct failed for type.universe",
+                            )
+                        })
+                }
+                "universe_level" => {
+                    // Extract the universe level of a type value. For a
+                    // `type.universe` value, returns its `level` field. For other
+                    // type values (base types like `type.number`), returns 0
+                    // (base types live in `Type_0`). The type value comes from
+                    // `args[0]` (a sub-scheme) or `incoming`.
+                    let type_val = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    if let Some(tag) = ctx.registry.as_type_tag(&type_val)
+                        && tag == "type.universe" {
+                            let level = type_val.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
+                            return Ok(Value::from(level));
+                        }
+                    // For other type values, return 0 (base types live in Type_0).
+                    Ok(Value::from(0u64))
+                }
+                "universe_max" => {
+                    // Compute the max of two universe levels (u64). `args[0]` and
+                    // `args[1]` are sub-schemes evaluating to levels. Used by
+                    // Pi/Sigma rules to compute the result universe as
+                    // `max(param_universe, body_universe)`.
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "universe_max requires 2 args (two level sub-schemes)",
+                        ));
+                    }
+                    let level_a = self
+                        .eval_type_scheme_td(lang, ast, node_ref, args[0], ctx, incoming.clone())?
+                        .as_u64()
+                        .ok_or_else(|| LangError::engine("universe_max: arg 0 is not a u64"))?;
+                    let level_b = self
+                        .eval_type_scheme_td(lang, ast, node_ref, args[1], ctx, incoming)?
+                        .as_u64()
+                        .ok_or_else(|| LangError::engine("universe_max: arg 1 is not a u64"))?;
+                    Ok(Value::from(level_a.max(level_b)))
+                }
+                // --- ADR-0054 Membership types (Is, Collection, Membership) ---
+                //
+                // Membership types model the proposition `value ∈ collection`.
+                // `Collection(name)` is a named collection (e.g. `type.number`,
+                // `type.string`). `Membership(value, collection)` is the type of
+                // `value ∈ collection`. `IsEvidence` is the proof when membership
+                // holds; `Empty` is the result when it doesn't. The core
+                // operation is `primitive_member(value, collection)` — it checks
+                // if a JSON value is a member of a primitive collection
+                // (type.number ↔ JSON number, etc.), mirroring the legacy
+                // `plugin-typecheck-nbe` `primitive_member` function.
+                "construct_membership" => {
+                    // Create a `type.membership` tagged value with `value` and
+                    // `collection` fields. `args[0]` is the value sub-scheme;
+                    // `args[1]` is the collection type sub-scheme.
+                    if args.len() < 2 {
+                        return Err(LangError::engine(
+                            "construct_membership: requires 2 args (value, collection)",
+                        ));
+                    }
+                    let value = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[0],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let collection = self.eval_type_scheme_td(
+                        lang,
+                        ast,
+                        node_ref,
+                        args[1],
+                        ctx,
+                        incoming.clone(),
+                    )?;
+                    let payload = serde_json::json!({"value": value, "collection": collection});
+                    ctx.registry
+                        .construct("type.membership", &payload)
+                        .ok_or_else(|| LangError::engine("construct_membership: construct failed"))
+                }
+                "check_membership" => {
+                    // Check if a JSON value is a member of a collection type.
+                    // This is the core membership oracle. `args[0]` is the JSON
+                    // value sub-scheme (or `incoming`); `args[1]` is the
+                    // collection type sub-scheme (or `lit` is the collection tag
+                    // string). Returns `type.is_evidence` if membership holds,
+                    // `type.empty` otherwise.
+                    let value = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let collection = if args.len() > 1 {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[1],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    } else if let Some(lit_val) = lit {
+                        // lit is the collection tag string.
+                        ctx.registry
+                            .construct(
+                                lit_val.as_str().ok_or_else(|| {
+                                    LangError::engine(
+                                        "check_membership: lit must be a collection tag string",
+                                    )
+                                })?,
+                                &Value::Null,
+                            )
+                            .ok_or_else(|| {
+                                LangError::engine("check_membership: construct failed")
+                            })?
+                    } else {
+                        return Err(LangError::engine(
+                            "check_membership: no collection specified",
+                        ));
+                    };
+                    // Get the collection tag.
+                    let collection_tag =
+                        ctx.registry.as_type_tag(&collection).ok_or_else(|| {
+                            LangError::engine(
+                                "check_membership: collection is not a tagged type value",
+                            )
+                        })?;
+                    // Check membership (mirrors legacy `primitive_member`).
+                    let is_member = match collection_tag {
+                        "type.number" => value.is_number(),
+                        "type.string" => value.is_string(),
+                        "type.bool" => value.is_boolean(),
+                        "type.null" => value.is_null(),
+                        "type.array" => value.is_array(),
+                        "type.object" => value.is_object(),
+                        _ => false,
+                    };
+                    if is_member {
+                        // Return IsEvidence (proof that membership holds).
+                        ctx.registry
+                            .construct("type.is_evidence", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine(
+                                    "check_membership: construct failed for type.is_evidence",
+                                )
+                            })
+                    } else {
+                        // Return Empty (membership doesn't hold).
+                        ctx.registry
+                            .construct("type.empty", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine(
+                                    "check_membership: construct failed for type.empty",
+                                )
+                            })
+                    }
+                }
+                "eval_membership" => {
+                    // Reduce a `type.membership` value to either
+                    // `type.is_evidence` (if membership holds) or `type.empty`
+                    // (if not). `args[0]` or `incoming` is the membership type
+                    // value.
+                    let membership_val = if let Some(arg) = args.first().copied() {
+                        self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
+                    } else {
+                        incoming.clone().unwrap_or(Value::Null)
+                    };
+                    let value = membership_val.get("value").unwrap_or(&Value::Null);
+                    let collection = membership_val.get("collection").unwrap_or(&Value::Null);
+                    let collection_tag = ctx.registry.as_type_tag(collection).ok_or_else(|| {
+                        LangError::engine("eval_membership: collection is not a tagged type value")
+                    })?;
+                    let is_member = match collection_tag {
+                        "type.number" => value.is_number(),
+                        "type.string" => value.is_string(),
+                        "type.bool" => value.is_boolean(),
+                        "type.null" => value.is_null(),
+                        "type.array" => value.is_array(),
+                        "type.object" => value.is_object(),
+                        _ => false,
+                    };
+                    if is_member {
+                        ctx.registry
+                            .construct("type.is_evidence", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine(
+                                    "eval_membership: construct failed for type.is_evidence",
+                                )
+                            })
+                    } else {
+                        ctx.registry
+                            .construct("type.empty", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine(
+                                    "eval_membership: construct failed for type.empty",
+                                )
+                            })
+                    }
+                }
+                "construct_collection" => {
+                    // Create a `type.collection` tagged value with a `name`
+                    // field. `lit` is the collection name string.
+                    let name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine(
+                            "construct_collection: lit must be a collection name string",
                         )
-                        .ok_or_else(|| LangError::engine("check_membership: construct failed"))?
-                } else {
-                    return Err(LangError::engine(
-                        "check_membership: no collection specified",
-                    ));
-                };
-                // Get the collection tag.
-                let collection_tag = ctx.registry.as_type_tag(&collection).ok_or_else(|| {
-                    LangError::engine("check_membership: collection is not a tagged type value")
-                })?;
-                // Check membership (mirrors legacy `primitive_member`).
-                let is_member = match collection_tag {
-                    "type.number" => value.is_number(),
-                    "type.string" => value.is_string(),
-                    "type.bool" => value.is_boolean(),
-                    "type.null" => value.is_null(),
-                    "type.array" => value.is_array(),
-                    "type.object" => value.is_object(),
-                    _ => false,
-                };
-                if is_member {
-                    // Return IsEvidence (proof that membership holds).
+                    })?;
+                    let payload = serde_json::json!({"name": name});
                     ctx.registry
-                        .construct("type.is_evidence", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine(
-                                "check_membership: construct failed for type.is_evidence",
-                            )
-                        })
-                } else {
-                    // Return Empty (membership doesn't hold).
-                    ctx.registry
-                        .construct("type.empty", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine("check_membership: construct failed for type.empty")
-                        })
+                        .construct("type.collection", &payload)
+                        .ok_or_else(|| LangError::engine("construct_collection: construct failed"))
                 }
-            }
-            "eval_membership" => {
-                // Reduce a `type.membership` value to either
-                // `type.is_evidence` (if membership holds) or `type.empty`
-                // (if not). `args[0]` or `incoming` is the membership type
-                // value.
-                let membership_val = if let Some(arg) = args.first().copied() {
-                    self.eval_type_scheme_td(lang, ast, node_ref, arg, ctx, incoming.clone())?
-                } else {
-                    incoming.clone().unwrap_or(Value::Null)
-                };
-                let value = membership_val.get("value").unwrap_or(&Value::Null);
-                let collection = membership_val.get("collection").unwrap_or(&Value::Null);
-                let collection_tag = ctx.registry.as_type_tag(collection).ok_or_else(|| {
-                    LangError::engine("eval_membership: collection is not a tagged type value")
-                })?;
-                let is_member = match collection_tag {
-                    "type.number" => value.is_number(),
-                    "type.string" => value.is_string(),
-                    "type.bool" => value.is_boolean(),
-                    "type.null" => value.is_null(),
-                    "type.array" => value.is_array(),
-                    "type.object" => value.is_object(),
-                    _ => false,
-                };
-                if is_member {
-                    ctx.registry
-                        .construct("type.is_evidence", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine(
-                                "eval_membership: construct failed for type.is_evidence",
-                            )
-                        })
-                } else {
-                    ctx.registry
-                        .construct("type.empty", &Value::Null)
-                        .ok_or_else(|| {
-                            LangError::engine("eval_membership: construct failed for type.empty")
-                        })
+                "marshalable" => {
+                    // Check that the incoming type value is an FFI-marshalable
+                    // type (ADR-0083).
+                    let ty = incoming.as_ref().ok_or_else(|| {
+                        LangError::engine("typecheck: marshalable requires an incoming type value")
+                    })?;
+                    if is_marshalable(&ctx.registry, ty) {
+                        Ok(Value::Bool(true))
+                    } else {
+                        let tag = ctx.registry.as_type_tag(ty).unwrap_or("unknown");
+                        Err(LangError::engine(format!(
+                            "typecheck: type '{}' is not FFI-marshalable (ADR-0083)",
+                            tag
+                        )))
+                    }
                 }
-            }
-            "construct_collection" => {
-                // Create a `type.collection` tagged value with a `name`
-                // field. `lit` is the collection name string.
-                let name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("construct_collection: lit must be a collection name string")
-                })?;
-                let payload = serde_json::json!({"name": name});
-                ctx.registry
-                    .construct("type.collection", &payload)
-                    .ok_or_else(|| LangError::engine("construct_collection: construct failed"))
-            }
-            "marshalable" => {
-                // Check that the incoming type value is an FFI-marshalable
-                // type (ADR-0083).
-                let ty = incoming.as_ref().ok_or_else(|| {
-                    LangError::engine("typecheck: marshalable requires an incoming type value")
-                })?;
-                if is_marshalable(&ctx.registry, ty) {
-                    Ok(Value::Bool(true))
-                } else {
-                    let tag = ctx.registry.as_type_tag(ty).unwrap_or("unknown");
-                    Err(LangError::engine(format!(
-                        "typecheck: type '{}' is not FFI-marshalable (ADR-0083)",
-                        tag
-                    )))
-                }
-            }
-            "foreign_type" => {
-                // Look up a Foreign op's type signature from the module
-                // registry (ADR-0083). The op name comes from the lit
-                // payload (a string).
-                let op_name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine("typecheck: foreign_type requires a string lit (op name)")
-                })?;
-                let modules = self.modules.as_ref().ok_or_else(|| {
+                "foreign_type" => {
+                    // Look up a Foreign op's type signature from the module
+                    // registry (ADR-0083). The op name comes from the lit
+                    // payload (a string).
+                    let op_name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
+                        LangError::engine("typecheck: foreign_type requires a string lit (op name)")
+                    })?;
+                    let modules = self.modules.as_ref().ok_or_else(|| {
                     LangError::engine(
                         "typecheck: foreign_type requires a module registry (call with_modules)",
                     )
                 })?;
-                modules.lookup_type_signature(op_name).ok_or_else(|| {
-                    LangError::engine(format!(
-                        "typecheck: foreign op '{}' has no registered type signature",
-                        op_name
-                    ))
-                })
+                    modules.lookup_type_signature(op_name).ok_or_else(|| {
+                        LangError::engine(format!(
+                            "typecheck: foreign op '{}' has no registered type signature",
+                            op_name
+                        ))
+                    })
+                }
+                other => Err(LangError::engine(format!(
+                    "typecheck: unknown judgment op '{}'",
+                    other
+                ))),
             }
-            other => Err(LangError::engine(format!(
-                "typecheck: unknown judgment op '{}'",
-                other
-            ))),
-        }
         })
     }
 
@@ -3753,27 +4022,26 @@ impl NbeTypecheckEngine {
     fn occurs_in(&self, meta_id: usize, v: &Value) -> bool {
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        if let Some(obj) = v.as_object() {
-            if let Some(meta) = obj.get("__meta__") {
-                if meta.as_u64() == Some(meta_id as u64) {
-                    return true;
+            if let Some(obj) = v.as_object() {
+                if let Some(meta) = obj.get("__meta__")
+                    && meta.as_u64() == Some(meta_id as u64) {
+                        return true;
+                    }
+                // Recurse into all object values.
+                for (_, val) in obj {
+                    if self.occurs_in(meta_id, val) {
+                        return true;
+                    }
                 }
             }
-            // Recurse into all object values.
-            for (_, val) in obj {
-                if self.occurs_in(meta_id, val) {
-                    return true;
+            if let Some(arr) = v.as_array() {
+                for val in arr {
+                    if self.occurs_in(meta_id, val) {
+                        return true;
+                    }
                 }
             }
-        }
-        if let Some(arr) = v.as_array() {
-            for val in arr {
-                if self.occurs_in(meta_id, val) {
-                    return true;
-                }
-            }
-        }
-        false
+            false
         })
     }
 
@@ -3803,34 +4071,34 @@ impl NbeTypecheckEngine {
     ) -> Value {
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        if let Some(id) = extract_meta_id(v) {
-            if visited.contains(&id) {
-                // Cycle — break it by leaving the meta as-is.
+            if let Some(id) = extract_meta_id(v) {
+                if visited.contains(&id) {
+                    // Cycle — break it by leaving the meta as-is.
+                    return v.clone();
+                }
+                if let Some(Some(solved)) = ctx.metas.get(id as usize) {
+                    visited.insert(id);
+                    let out = self.zonk_inner(solved, ctx, visited);
+                    visited.remove(&id);
+                    return out;
+                }
                 return v.clone();
             }
-            if let Some(Some(solved)) = ctx.metas.get(id as usize) {
-                visited.insert(id);
-                let out = self.zonk_inner(solved, ctx, visited);
-                visited.remove(&id);
-                return out;
-            }
-            return v.clone();
-        }
-        match v {
-            Value::Object(map) => {
-                let mut out = serde_json::Map::new();
-                for (k, val) in map {
-                    out.insert(k.clone(), self.zonk_inner(val, ctx, visited));
+            match v {
+                Value::Object(map) => {
+                    let mut out = serde_json::Map::new();
+                    for (k, val) in map {
+                        out.insert(k.clone(), self.zonk_inner(val, ctx, visited));
+                    }
+                    Value::Object(out)
                 }
-                Value::Object(out)
+                Value::Array(arr) => Value::Array(
+                    arr.iter()
+                        .map(|val| self.zonk_inner(val, ctx, visited))
+                        .collect(),
+                ),
+                _ => v.clone(),
             }
-            Value::Array(arr) => Value::Array(
-                arr.iter()
-                    .map(|val| self.zonk_inner(val, ctx, visited))
-                    .collect(),
-            ),
-            _ => v.clone(),
-        }
         })
     }
 
@@ -3850,172 +4118,179 @@ impl NbeTypecheckEngine {
     ) -> Result<(), LangError> {
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        let pattern = ast.get(pattern_ref).ok_or_else(|| {
-            LangError::engine(format!(
-                "bind_pattern_vars: pattern node {} out of bounds",
-                pattern_ref.index()
-            ))
-        })?;
+            let pattern = ast.get(pattern_ref).ok_or_else(|| {
+                LangError::engine(format!(
+                    "bind_pattern_vars: pattern node {} out of bounds",
+                    pattern_ref.index()
+                ))
+            })?;
 
-        let pattern_role = lang
-            .ast
-            .get_by_identity(&pattern.kind)
-            .and_then(|s| s.pattern_role.as_deref());
+            let pattern_role = lang
+                .ast
+                .get_by_identity(&pattern.kind)
+                .and_then(|s| s.pattern_role.as_deref());
 
-        match pattern_role {
-            Some("leaf") => {
-                if let Some(name) = pattern.payload.as_str() {
-                    if name != "_" {
-                        let meta = ctx.fresh_meta();
-                        ctx.extend(name.to_string(), meta_value(meta));
-                    }
+            match pattern_role {
+                Some("leaf") => {
+                    if let Some(name) = pattern.payload.as_str()
+                        && name != "_" {
+                            let meta = ctx.fresh_meta();
+                            ctx.extend(name.to_string(), meta_value(meta));
+                        }
+                    Ok(())
                 }
-                Ok(())
-            }
-            Some("sequence") => {
-                let start = lang
-                    .child_role_index(&pattern.kind, "elements")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                // `type.sigma` pair pattern `[witness, payload]`: a
-                // dependent destructure — the witness binds rigidly
-                // (`var{w}` in Γ and `results`) so a repack
-                // `Vec(m + 1, a)` unifies; the payload binds against the
-                // sigma's instantiated closure. Exactly 2 element
-                // positions (no `rest`) qualify — anything else keeps
-                // the generic element reading.
-                if scrutinee_type.get("__tag__").and_then(Value::as_str)
-                    == Some("type.sigma")
-                {
+                Some("sequence") => {
+                    let start = lang
+                        .child_role_index(&pattern.kind, "elements")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    // `type.sigma` pair pattern `[witness, payload]`: a
+                    // dependent destructure — the witness binds rigidly
+                    // (`var{w}` in Γ and `results`) so a repack
+                    // `Vec(m + 1, a)` unifies; the payload binds against the
+                    // sigma's instantiated closure. Exactly 2 element
+                    // positions (no `rest`) qualify — anything else keeps
+                    // the generic element reading.
+                    if scrutinee_type.get("__tag__").and_then(Value::as_str) == Some("type.sigma")
+                        && let Some(children) =
+                            pattern.payload.get("children").and_then(|c| c.as_array())
+                        {
+                            let elem_refs: Vec<AstRef> = children
+                                .iter()
+                                .skip(start)
+                                .filter_map(|e| e.as_u64().map(|i| AstRef::new(i as usize)))
+                                .collect();
+                            let elem_kinds: Vec<&str> = elem_refs
+                                .iter()
+                                .filter_map(|r| ast.get(*r))
+                                .map(|n| {
+                                    lang.ast
+                                        .get_by_identity(&n.kind)
+                                        .and_then(|s| s.pattern_role.as_deref())
+                                        .unwrap_or("")
+                                })
+                                .collect();
+                            if elem_refs.len() == 2 && !elem_kinds.contains(&"rest") {
+                                let witness_node = ast.get(elem_refs[0]).ok_or_else(|| {
+                                    LangError::engine(format!(
+                                        "bind_pattern_vars: sigma witness node {} out of bounds",
+                                        elem_refs[0].index()
+                                    ))
+                                })?;
+                                return self.bind_sigma_destructure(
+                                    lang,
+                                    ast,
+                                    witness_node,
+                                    elem_refs[0],
+                                    elem_refs[1],
+                                    scrutinee_type,
+                                    ctx,
+                                );
+                            }
+                        }
+                    let element_type = scrutinee_type
+                        .get("element")
+                        .cloned()
+                        .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
                     if let Some(children) =
                         pattern.payload.get("children").and_then(|c| c.as_array())
                     {
-                        let elem_refs: Vec<AstRef> = children
-                            .iter()
-                            .skip(start)
-                            .filter_map(|e| e.as_u64().map(|i| AstRef::new(i as usize)))
-                            .collect();
-                        let elem_kinds: Vec<&str> = elem_refs
-                            .iter()
-                            .filter_map(|r| ast.get(*r))
-                            .map(|n| {
-                                lang.ast
-                                    .get_by_identity(&n.kind)
-                                    .and_then(|s| s.pattern_role.as_deref())
-                                    .unwrap_or("")
-                            })
-                            .collect();
-                        if elem_refs.len() == 2 && !elem_kinds.iter().any(|r| *r == "rest") {
-                            let witness_node = ast.get(elem_refs[0]).ok_or_else(|| {
-                                LangError::engine(format!(
-                                    "bind_pattern_vars: sigma witness node {} out of bounds",
-                                    elem_refs[0].index()
-                                ))
-                            })?;
-                            return self.bind_sigma_destructure(
-                                lang,
-                                ast,
-                                witness_node,
-                                elem_refs[0],
-                                elem_refs[1],
-                                scrutinee_type,
-                                ctx,
-                            );
+                        for child_entry in children.iter().skip(start) {
+                            let child_idx = child_entry.as_u64().ok_or_else(|| {
+                                LangError::engine(
+                                    "bind_pattern_vars: sequence child index is not a u64",
+                                )
+                            })? as usize;
+                            let child_ref = AstRef::new(child_idx);
+                            let Some(child_node) = ast.get(child_ref) else {
+                                continue;
+                            };
+                            let child_role = lang
+                                .ast
+                                .get_by_identity(&child_node.kind)
+                                .and_then(|s| s.pattern_role.as_deref());
+                            if child_role == Some("rest") {
+                                self.bind_pattern_vars(lang, ast, child_ref, scrutinee_type, ctx)?;
+                            } else {
+                                self.bind_pattern_vars(lang, ast, child_ref, &element_type, ctx)?;
+                            }
                         }
                     }
+                    Ok(())
                 }
-                let element_type = scrutinee_type
-                    .get("element")
-                    .cloned()
-                    .unwrap_or_else(|| meta_value(ctx.fresh_meta()));
-                if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array()) {
-                    for child_entry in children.iter().skip(start) {
-                        let child_idx = child_entry.as_u64().ok_or_else(|| {
-                            LangError::engine(
-                                "bind_pattern_vars: sequence child index is not a u64",
-                            )
-                        })? as usize;
-                        let child_ref = AstRef::new(child_idx);
-                        let Some(child_node) = ast.get(child_ref) else {
-                            continue;
-                        };
-                        let child_role = lang
-                            .ast
-                            .get_by_identity(&child_node.kind)
-                            .and_then(|s| s.pattern_role.as_deref());
-                        if child_role == Some("rest") {
-                            self.bind_pattern_vars(lang, ast, child_ref, scrutinee_type, ctx)?;
-                        } else {
-                            self.bind_pattern_vars(lang, ast, child_ref, &element_type, ctx)?;
+                Some("entries") => {
+                    let fields = scrutinee_type.get("fields");
+                    let start = lang
+                        .child_role_index(&pattern.kind, "entries")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    if let Some(children) =
+                        pattern.payload.get("children").and_then(|c| c.as_array())
+                    {
+                        for child_entry in children.iter().skip(start) {
+                            let child_idx = child_entry.as_u64().ok_or_else(|| {
+                                LangError::engine(
+                                    "bind_pattern_vars: entries child index is not a u64",
+                                )
+                            })? as usize;
+                            let child_ref = AstRef::new(child_idx);
+                            let Some(child_node) = ast.get(child_ref) else {
+                                continue;
+                            };
+                            let child_role = lang
+                                .ast
+                                .get_by_identity(&child_node.kind)
+                                .and_then(|s| s.pattern_role.as_deref());
+                            if child_role == Some("entry") {
+                                self.bind_pattern_entry(
+                                    lang,
+                                    ast,
+                                    child_node,
+                                    fields,
+                                    scrutinee_type,
+                                    ctx,
+                                )?;
+                            } else if child_role == Some("rest") {
+                                self.bind_pattern_vars(lang, ast, child_ref, scrutinee_type, ctx)?;
+                            }
                         }
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
-            Some("entries") => {
-                let fields = scrutinee_type.get("fields");
-                let start = lang
-                    .child_role_index(&pattern.kind, "entries")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array()) {
-                    for child_entry in children.iter().skip(start) {
-                        let child_idx = child_entry.as_u64().ok_or_else(|| {
-                            LangError::engine("bind_pattern_vars: entries child index is not a u64")
-                        })? as usize;
-                        let child_ref = AstRef::new(child_idx);
-                        let Some(child_node) = ast.get(child_ref) else {
-                            continue;
-                        };
-                        let child_role = lang
-                            .ast
-                            .get_by_identity(&child_node.kind)
-                            .and_then(|s| s.pattern_role.as_deref());
-                        if child_role == Some("entry") {
-                            self.bind_pattern_entry(
+                Some("entry") => {
+                    let fields = scrutinee_type.get("fields");
+                    self.bind_pattern_entry(lang, ast, pattern, fields, scrutinee_type, ctx)
+                }
+                Some("rest") => {
+                    let subject_idx = lang
+                        .child_role_index(&pattern.kind, "subject")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    if let Some(children) =
+                        pattern.payload.get("children").and_then(|c| c.as_array())
+                        && let Some(entry) = children.get(subject_idx).and_then(|v| v.as_u64()) {
+                            self.bind_pattern_vars(
                                 lang,
                                 ast,
-                                child_node,
-                                fields,
+                                AstRef::new(entry as usize),
                                 scrutinee_type,
                                 ctx,
                             )?;
-                        } else if child_role == Some("rest") {
-                            self.bind_pattern_vars(lang, ast, child_ref, scrutinee_type, ctx)?;
                         }
-                    }
+                    Ok(())
                 }
-                Ok(())
+                _ => self.bind_pattern_vars_legacy(
+                    lang,
+                    ast,
+                    pattern,
+                    pattern_ref,
+                    scrutinee_type,
+                    ctx,
+                ),
             }
-            Some("entry") => {
-                let fields = scrutinee_type.get("fields");
-                self.bind_pattern_entry(lang, ast, pattern, fields, scrutinee_type, ctx)
-            }
-            Some("rest") => {
-                let subject_idx = lang
-                    .child_role_index(&pattern.kind, "subject")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array()) {
-                    if let Some(entry) = children.get(subject_idx).and_then(|v| v.as_u64()) {
-                        self.bind_pattern_vars(
-                            lang,
-                            ast,
-                            AstRef::new(entry as usize),
-                            scrutinee_type,
-                            ctx,
-                        )?;
-                    }
-                }
-                Ok(())
-            }
-            _ => {
-                self.bind_pattern_vars_legacy(lang, ast, pattern, pattern_ref, scrutinee_type, ctx)
-            }
-        }
         })
     }
 
@@ -4084,12 +4359,11 @@ impl NbeTypecheckEngine {
     ) -> Result<(), LangError> {
         match pattern.kind.as_str() {
             "var" => {
-                if let Some(name) = pattern.payload.as_str() {
-                    if name != "_" {
+                if let Some(name) = pattern.payload.as_str()
+                    && name != "_" {
                         let meta = ctx.fresh_meta();
                         ctx.extend(name.to_string(), meta_value(meta));
                     }
-                }
                 Ok(())
             }
             "array" => {
@@ -4143,8 +4417,8 @@ impl NbeTypecheckEngine {
                 Ok(())
             }
             "rest" => {
-                if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array()) {
-                    if let Some(first) = children.first().and_then(|v| v.as_u64()) {
+                if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array())
+                    && let Some(first) = children.first().and_then(|v| v.as_u64()) {
                         self.bind_pattern_vars(
                             lang,
                             ast,
@@ -4153,7 +4427,6 @@ impl NbeTypecheckEngine {
                             ctx,
                         )?;
                     }
-                }
                 Ok(())
             }
             _ => Ok(()),
@@ -4295,10 +4568,10 @@ impl NbeTypecheckEngine {
                     idx
                 ))
             })?;
-            if is_assign_node(lang, &child_node) {
+            if is_assign_node(lang, child_node) {
                 let (name, value_ref) = self.extract_assign_binding(ast, child_node)?;
                 bindings.push((name, value_ref));
-            } else if is_return_node(lang, &child_node) {
+            } else if is_return_node(lang, child_node) {
                 return_ref = Some(child);
             }
             last_ref = Some(child);
@@ -4362,7 +4635,7 @@ impl NbeTypecheckEngine {
                     lref.index()
                 ))
             })?;
-            if is_assign_node(lang, &lnode) {
+            if is_assign_node(lang, lnode) {
                 let (_name, value_ref) = self.extract_assign_binding(ast, lnode)?;
                 let t = self.synth_node(lang, ast, value_ref, ctx)?;
                 self.zonk(&t, ctx)
@@ -4436,10 +4709,7 @@ impl NbeTypecheckEngine {
                     step_idx
                 ))
             })?;
-            let step_children = step_node
-                .payload
-                .get("children")
-                .and_then(|c| c.as_array());
+            let step_children = step_node.payload.get("children").and_then(|c| c.as_array());
             let params_ref = role_child_ref(lang, step_node, "params").or_else(|| {
                 step_children
                     .and_then(|c| c.first())
@@ -4458,7 +4728,7 @@ impl NbeTypecheckEngine {
                     return Err(LangError::engine_node(
                         "typecheck: synth_while: step closure needs params and body children",
                         step_node,
-                    ))
+                    ));
                 }
             };
             let params_node = ast.get(params_ref).ok_or_else(|| {
@@ -4479,13 +4749,12 @@ impl NbeTypecheckEngine {
             // synthesis rather than a plain block check.
             let state_ty = self.synth_while_state(lang, ast, head_ref, ctx)?;
             let state_ty = self.zonk(&state_ty, ctx);
-            let state_fields = if state_ty.get("__tag__").and_then(|t| t.as_str())
-                == Some("type.record")
-            {
-                state_ty.get("fields").and_then(|f| f.as_object())
-            } else {
-                None
-            };
+            let state_fields =
+                if state_ty.get("__tag__").and_then(|t| t.as_str()) == Some("type.record") {
+                    state_ty.get("fields").and_then(|f| f.as_object())
+                } else {
+                    None
+                };
             let mark = ctx.mark();
             ctx.loose += 1;
             let checked = (|| -> Result<(), LangError> {
@@ -4647,7 +4916,9 @@ impl NbeTypecheckEngine {
         for entry in &kids {
             let Some(cidx) = entry.as_u64() else { continue };
             let child_ref = AstRef::new(cidx as usize);
-            let Some(cnode) = ast.get(child_ref) else { continue };
+            let Some(cnode) = ast.get(child_ref) else {
+                continue;
+            };
             if let Some((key, vref)) = self.entry_key_value(lang, ast, cnode) {
                 let vt = self.loose_synth_node(lang, ast, vref, ctx)?;
                 fields.insert(key, vt);
@@ -4692,7 +4963,10 @@ impl NbeTypecheckEngine {
                         .and_then(|s| s.payload.as_str().map(str::to_string))
                 })?;
             let vref = role_child_ref(lang, node, "annot").or_else(|| {
-                ckids.and_then(|c| c.get(1)).and_then(Value::as_u64).map(|i| AstRef::new(i as usize))
+                ckids
+                    .and_then(|c| c.get(1))
+                    .and_then(Value::as_u64)
+                    .map(|i| AstRef::new(i as usize))
             })?;
             return Some((key, vref));
         }
@@ -4714,7 +4988,7 @@ impl NbeTypecheckEngine {
         &self,
         lang: &Language,
         ast: &Ast,
-        node: &handl_language::AstNode,
+        _node: &handl_language::AstNode,
         kids: &[Value],
         ctx: &mut TypecheckContext,
     ) -> Result<Option<Value>, LangError> {
@@ -4723,7 +4997,9 @@ impl NbeTypecheckEngine {
         }
         let mut entries: Vec<(String, AstRef)> = Vec::with_capacity(kids.len());
         for entry in kids {
-            let Some(cidx) = entry.as_u64() else { return Ok(None) };
+            let Some(cidx) = entry.as_u64() else {
+                return Ok(None);
+            };
             let Some(cnode) = ast.get(AstRef::new(cidx as usize)) else {
                 return Ok(None);
             };
@@ -4917,12 +5193,20 @@ impl NbeTypecheckEngine {
                 .cloned()
                 .unwrap_or_default();
             let params_ref = role_child_ref(lang, node, "params")
-                .or_else(|| kids.first().and_then(Value::as_u64).map(|i| AstRef::new(i as usize)))
+                .or_else(|| {
+                    kids.first()
+                        .and_then(Value::as_u64)
+                        .map(|i| AstRef::new(i as usize))
+                })
                 .ok_or_else(|| {
                     LangError::engine_node("typecheck: loose fn: no params child", node)
                 })?;
             let body_ref = role_child_ref(lang, node, "body")
-                .or_else(|| kids.get(1).and_then(Value::as_u64).map(|i| AstRef::new(i as usize)))
+                .or_else(|| {
+                    kids.get(1)
+                        .and_then(Value::as_u64)
+                        .map(|i| AstRef::new(i as usize))
+                })
                 .ok_or_else(|| {
                     LangError::engine_node("typecheck: loose fn: no body child", node)
                 })?;
@@ -5010,10 +5294,16 @@ impl NbeTypecheckEngine {
                 };
                 let ekids = enode.payload.get("children").and_then(|c| c.as_array());
                 let key_ref = role_child_ref(lang, enode, "key").or_else(|| {
-                    ekids.and_then(|c| c.first()).and_then(Value::as_u64).map(|i| AstRef::new(i as usize))
+                    ekids
+                        .and_then(|c| c.first())
+                        .and_then(Value::as_u64)
+                        .map(|i| AstRef::new(i as usize))
                 });
                 let val_ref = role_child_ref(lang, enode, "value").or_else(|| {
-                    ekids.and_then(|c| c.get(1)).and_then(Value::as_u64).map(|i| AstRef::new(i as usize))
+                    ekids
+                        .and_then(|c| c.get(1))
+                        .and_then(Value::as_u64)
+                        .map(|i| AstRef::new(i as usize))
                 });
                 let Some((kr, vr)) = key_ref.zip(val_ref) else {
                     ok = false;
@@ -5040,7 +5330,9 @@ impl NbeTypecheckEngine {
                         &serde_json::json!({"fields": Value::Object(fields)}),
                     )
                     .ok_or_else(|| {
-                        LangError::engine("typecheck: loose object: construct failed for type.record")
+                        LangError::engine(
+                            "typecheck: loose object: construct failed for type.record",
+                        )
                     })?;
                 ctx.node_types.insert(node_ref.index(), ty.clone());
                 return Ok(ty);
@@ -5057,7 +5349,11 @@ impl NbeTypecheckEngine {
                 .cloned()
                 .unwrap_or_default();
             let value_ref = role_child_ref(lang, node, "value")
-                .or_else(|| kids.first().and_then(Value::as_u64).map(|i| AstRef::new(i as usize)))
+                .or_else(|| {
+                    kids.first()
+                        .and_then(Value::as_u64)
+                        .map(|i| AstRef::new(i as usize))
+                })
                 .ok_or_else(|| {
                     LangError::engine_node("typecheck: loose return: no value child", node)
                 })?;
@@ -5085,8 +5381,8 @@ impl NbeTypecheckEngine {
             .and_then(|c| c.as_array())
             .cloned()
             .unwrap_or_default();
-        if let Some(name) = node.payload.get("name").and_then(Value::as_str) {
-            if let Some(vref) = kids
+        if let Some(name) = node.payload.get("name").and_then(Value::as_str)
+            && let Some(vref) = kids
                 .first()
                 .and_then(Value::as_u64)
                 .map(|i| AstRef::new(i as usize))
@@ -5095,28 +5391,20 @@ impl NbeTypecheckEngine {
                 ctx.extend(name.to_string(), ty.clone());
                 return Ok(ty);
             }
-        }
-        if kids.len() == 2 {
-            if let Some((tidx, vidx)) = kids[0].as_u64().zip(kids[1].as_u64()) {
-                if let Some(lhs) = ast.get(AstRef::new(tidx as usize)) {
+        if kids.len() == 2
+            && let Some((tidx, vidx)) = kids[0].as_u64().zip(kids[1].as_u64())
+                && let Some(lhs) = ast.get(AstRef::new(tidx as usize)) {
                     let annot_like = role_declared(lang, &lhs.kind, "annot")
                         || role_declared(lang, &lhs.kind, "subject")
                         || role_declared(lang, &lhs.kind, "params");
-                    if !annot_like {
-                        if let Some(name) = lhs.payload.as_str().map(str::to_string) {
-                            let ty = self.loose_synth_node(
-                                lang,
-                                ast,
-                                AstRef::new(vidx as usize),
-                                ctx,
-                            )?;
+                    if !annot_like
+                        && let Some(name) = lhs.payload.as_str().map(str::to_string) {
+                            let ty =
+                                self.loose_synth_node(lang, ast, AstRef::new(vidx as usize), ctx)?;
                             ctx.extend(name, ty.clone());
                             return Ok(ty);
                         }
-                    }
                 }
-            }
-        }
         self.synth_assign_judgment(lang, ast, node, ctx)
     }
 
@@ -5530,188 +5818,186 @@ impl NbeTypecheckEngine {
     fn unify(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> Result<(), LangError> {
         // Growable-stack seam (WS-H, see `STACK_RED_ZONE`).
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
-        let _t = crate::stats::timer(&crate::stats::T_UNIFY);
-        crate::stats::unify(a, b);
-        if a == b {
-            return Ok(());
-        }
-        if let Some(id) = extract_meta_id(a) {
-            if self.occurs_in(id as usize, b) {
-                return Err(LangError::engine(format!(
-                    "typecheck: occurs-check failed for meta {}",
-                    id
-                )));
-            }
-            ctx.solve_meta(id, b.clone());
-            return Ok(());
-        }
-        if let Some(id) = extract_meta_id(b) {
-            if self.occurs_in(id as usize, a) {
-                return Err(LangError::engine(format!(
-                    "typecheck: occurs-check failed for meta {}",
-                    id
-                )));
-            }
-            ctx.solve_meta(id, a.clone());
-            return Ok(());
-        }
-        // `type.unknown` is the dynamic type — *consistent* with every
-        // type (the gradual-typing wildcard the `types.yaml` docs have
-        // always claimed: "`type.unknown` … unifies with whatever the
-        // surrounding branches produce"). A `while` step body, a
-        // `resolve` import, or a host call yields `unknown`; joining or
-        // checking it against a concrete type keeps the known side
-        // rather than erroring. Genuine structural mismatches between
-        // two *known* types still fail below. `is_unknown_ty` covers
-        // both the tagged `__tag__` spelling and the domain `__sym__`/
-        // `__former__` reification a round-tripped `unknown` arrives in.
-        if dependent::is_unknown_ty(a) || dependent::is_unknown_ty(b) {
-            return Ok(());
-        }
-        // Domain-encoded operands (`__former__`/`__sym__`/`__neutral__`/
-        // `__type__` — the `quote` spellings checker-produced types
-        // carry) convert in the `Val` domain: both sides lift through
-        // `checker::lift` (tagged `__meta__` leaves remap to fresh
-        // domain metas — the stores never alias) and `ctx.vcheck.conv`
-        // decides; `store_mark`/`store_restore` bounds the attempt.
-        // Top-level metas are already handled above — they keep solving
-        // in the tagged store.
-        if dependent::is_domain_encoded(a) || dependent::is_domain_encoded(b) {
-            let mark = ctx.vcheck.store_mark();
-            let va = dependent::domain_lift(a, ctx);
-            let vb = dependent::domain_lift(b, ctx);
-            if ctx.vcheck.conv(&va, &vb) {
+            let _t = crate::stats::timer(&crate::stats::T_UNIFY);
+            crate::stats::unify(a, b);
+            if a == b {
                 return Ok(());
             }
-            // A `Hom(m, ·, ·)` at `m ≥ 3` keeps the stuck escape:
-            // higher-cell unification is deliberately under-decided
-            // (the boundary law itself checks at every `m` since
-            // phase-3 WS-B — this is the conversion contract, not a
-            // checking cap). Restore the domain store so a failed
-            // conversion leaves no partial solutions behind.
-            if dependent::beyond_checked_dim(&va) || dependent::beyond_checked_dim(&vb) {
+            if let Some(id) = extract_meta_id(a) {
+                if self.occurs_in(id as usize, b) {
+                    return Err(LangError::engine(format!(
+                        "typecheck: occurs-check failed for meta {}",
+                        id
+                    )));
+                }
+                ctx.solve_meta(id, b.clone());
+                return Ok(());
+            }
+            if let Some(id) = extract_meta_id(b) {
+                if self.occurs_in(id as usize, a) {
+                    return Err(LangError::engine(format!(
+                        "typecheck: occurs-check failed for meta {}",
+                        id
+                    )));
+                }
+                ctx.solve_meta(id, a.clone());
+                return Ok(());
+            }
+            // `type.unknown` is the dynamic type — *consistent* with every
+            // type (the gradual-typing wildcard the `types.yaml` docs have
+            // always claimed: "`type.unknown` … unifies with whatever the
+            // surrounding branches produce"). A `while` step body, a
+            // `resolve` import, or a host call yields `unknown`; joining or
+            // checking it against a concrete type keeps the known side
+            // rather than erroring. Genuine structural mismatches between
+            // two *known* types still fail below. `is_unknown_ty` covers
+            // both the tagged `__tag__` spelling and the domain `__sym__`/
+            // `__former__` reification a round-tripped `unknown` arrives in.
+            if dependent::is_unknown_ty(a) || dependent::is_unknown_ty(b) {
+                return Ok(());
+            }
+            // Domain-encoded operands (`__former__`/`__sym__`/`__neutral__`/
+            // `__type__` — the `quote` spellings checker-produced types
+            // carry) convert in the `Val` domain: both sides lift through
+            // `checker::lift` (tagged `__meta__` leaves remap to fresh
+            // domain metas — the stores never alias) and `ctx.vcheck.conv`
+            // decides; `store_mark`/`store_restore` bounds the attempt.
+            // Top-level metas are already handled above — they keep solving
+            // in the tagged store.
+            if dependent::is_domain_encoded(a) || dependent::is_domain_encoded(b) {
+                let mark = ctx.vcheck.store_mark();
+                let va = dependent::domain_lift(a, ctx);
+                let vb = dependent::domain_lift(b, ctx);
+                if ctx.vcheck.conv(&va, &vb) {
+                    return Ok(());
+                }
+                // A `Hom(m, ·, ·)` at `m ≥ 3` keeps the stuck escape:
+                // higher-cell unification is deliberately under-decided
+                // (the boundary law itself checks at every `m` since
+                // phase-3 WS-B — this is the conversion contract, not a
+                // checking cap). Restore the domain store so a failed
+                // conversion leaves no partial solutions behind.
+                if dependent::beyond_checked_dim(&va) || dependent::beyond_checked_dim(&vb) {
+                    ctx.vcheck.store_restore(mark);
+                    return Ok(());
+                }
                 ctx.vcheck.store_restore(mark);
-                return Ok(());
+                return Err(LangError::engine(format!(
+                    "typecheck: cannot unify — expected {}, got {}",
+                    dependent::display_type(b, ctx),
+                    dependent::display_type(a, ctx)
+                )));
             }
-            ctx.vcheck.store_restore(mark);
-            return Err(LangError::engine(format!(
-                "typecheck: cannot unify — expected {}, got {}",
-                dependent::display_type(b, ctx),
-                dependent::display_type(a, ctx)
-            )));
-        }
-        // Recursive structural unification of tagged type values with the
-        // same tag from the same registry (ADR-0054 legacy migration).
-        // This lets `unify(type.function{param=type.number, body=type.string},
-        // type.function{param=type.number, body=type.string})` succeed by
-        // recursively unifying the `param` and `body` payload fields.
-        if let (Some(tag_a), Some(tag_b)) =
-            (ctx.registry.as_type_tag(a), ctx.registry.as_type_tag(b))
-        {
-            if tag_a == tag_b {
-                // Universe cumulativity (ADR-0054): two `type.universe` values
-                // unify iff their levels are equal. The cumulative hierarchy
-                // is `Type_0 ⊆ Type_1 ⊆ ...`; for unification we require
-                // equality (mirrors the legacy `l1.le(l2) && l2.le(l1)`).
-                // Subtyping (`Type_n ⊆ Type_m` if `n ≤ m`) is reserved for a
-                // future subtyping judgment.
-                if tag_a == "type.universe" {
-                    let level_a = a.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let level_b = b.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if level_a == level_b {
-                        return Ok(());
-                    } else {
-                        return Err(LangError::engine(format!(
-                            "typecheck: cannot unify Type_{} with Type_{}",
-                            level_a, level_b
-                        )));
+            // Recursive structural unification of tagged type values with the
+            // same tag from the same registry (ADR-0054 legacy migration).
+            // This lets `unify(type.function{param=type.number, body=type.string},
+            // type.function{param=type.number, body=type.string})` succeed by
+            // recursively unifying the `param` and `body` payload fields.
+            if let (Some(tag_a), Some(tag_b)) =
+                (ctx.registry.as_type_tag(a), ctx.registry.as_type_tag(b))
+                && tag_a == tag_b {
+                    // Universe cumulativity (ADR-0054): two `type.universe` values
+                    // unify iff their levels are equal. The cumulative hierarchy
+                    // is `Type_0 ⊆ Type_1 ⊆ ...`; for unification we require
+                    // equality (mirrors the legacy `l1.le(l2) && l2.le(l1)`).
+                    // Subtyping (`Type_n ⊆ Type_m` if `n ≤ m`) is reserved for a
+                    // future subtyping judgment.
+                    if tag_a == "type.universe" {
+                        let level_a = a.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let level_b = b.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if level_a == level_b {
+                            return Ok(());
+                        } else {
+                            return Err(LangError::engine(format!(
+                                "typecheck: cannot unify Type_{} with Type_{}",
+                                level_a, level_b
+                            )));
+                        }
                     }
-                }
-                // Row-polymorphic record unification (ADR-0074 ID.7):
-                // `type.record` values may carry a `rest` field holding a
-                // row variable (metavariable). When present, the record is
-                // OPEN and `rest` captures extra fields during unification.
-                // When absent, the record is CLOSED (exact field match).
-                // This special case must run BEFORE the general same-tag
-                // structural unification, which would require identical
-                // payload keys.
-                if tag_a == "type.record" {
-                    return self.unify_record(a, b, ctx);
-                }
-                // Row-polymorphic effect row unification (ADR-0054 /
-                // ADR-0076): `type.effects` values carry an `ops` array and
-                // an optional `rest` row variable. This special case must run
-                // BEFORE the general same-tag structural unification, which
-                // would try to unify the `ops` arrays as JSON arrays and the
-                // `rest` row variables as plain values.
-                if tag_a == "type.effects" {
-                    return self.unify_effects(a, b, ctx);
-                }
-                // Effect row unification (ADR-0054 / ADR-0076):
-                // `type.function` values may carry an `effects` field holding
-                // a `type.effects` value (an effect row). When both sides have
-                // an `effects` field, the rows are unified via
-                // [`unify_effects`] (row-polymorphic). When one or both sides
-                // lack `effects`, effect unification is skipped (backward
-                // compatible — the function's effects are unknown/untracked).
-                // The `param` and `body` fields are always unified
-                // structurally. This special case must run BEFORE the general
-                // same-tag structural unification, which would treat a
-                // missing `effects` field as `Null` and fail.
-                if tag_a == "type.function" {
-                    let effects_a = a.get("effects");
-                    let effects_b = b.get("effects");
-                    let param_a = a.get("param").unwrap_or(&Value::Null);
-                    let param_b = b.get("param").unwrap_or(&Value::Null);
-                    self.unify(param_a, param_b, ctx)?;
-                    let body_a = a.get("body").unwrap_or(&Value::Null);
-                    let body_b = b.get("body").unwrap_or(&Value::Null);
-                    self.unify(body_a, body_b, ctx)?;
-                    // Unify effects only when both sides carry an effects field.
-                    if let (Some(ea), Some(eb)) = (effects_a, effects_b) {
-                        self.unify_effects(ea, eb, ctx)?;
+                    // Row-polymorphic record unification (ADR-0074 ID.7):
+                    // `type.record` values may carry a `rest` field holding a
+                    // row variable (metavariable). When present, the record is
+                    // OPEN and `rest` captures extra fields during unification.
+                    // When absent, the record is CLOSED (exact field match).
+                    // This special case must run BEFORE the general same-tag
+                    // structural unification, which would require identical
+                    // payload keys.
+                    if tag_a == "type.record" {
+                        return self.unify_record(a, b, ctx);
+                    }
+                    // Row-polymorphic effect row unification (ADR-0054 /
+                    // ADR-0076): `type.effects` values carry an `ops` array and
+                    // an optional `rest` row variable. This special case must run
+                    // BEFORE the general same-tag structural unification, which
+                    // would try to unify the `ops` arrays as JSON arrays and the
+                    // `rest` row variables as plain values.
+                    if tag_a == "type.effects" {
+                        return self.unify_effects(a, b, ctx);
+                    }
+                    // Effect row unification (ADR-0054 / ADR-0076):
+                    // `type.function` values may carry an `effects` field holding
+                    // a `type.effects` value (an effect row). When both sides have
+                    // an `effects` field, the rows are unified via
+                    // [`unify_effects`] (row-polymorphic). When one or both sides
+                    // lack `effects`, effect unification is skipped (backward
+                    // compatible — the function's effects are unknown/untracked).
+                    // The `param` and `body` fields are always unified
+                    // structurally. This special case must run BEFORE the general
+                    // same-tag structural unification, which would treat a
+                    // missing `effects` field as `Null` and fail.
+                    if tag_a == "type.function" {
+                        let effects_a = a.get("effects");
+                        let effects_b = b.get("effects");
+                        let param_a = a.get("param").unwrap_or(&Value::Null);
+                        let param_b = b.get("param").unwrap_or(&Value::Null);
+                        self.unify(param_a, param_b, ctx)?;
+                        let body_a = a.get("body").unwrap_or(&Value::Null);
+                        let body_b = b.get("body").unwrap_or(&Value::Null);
+                        self.unify(body_a, body_b, ctx)?;
+                        // Unify effects only when both sides carry an effects field.
+                        if let (Some(ea), Some(eb)) = (effects_a, effects_b) {
+                            self.unify_effects(ea, eb, ctx)?;
+                        }
+                        return Ok(());
+                    }
+                    // Both are type values with the same tag — unify payload
+                    // fields.  We use `get` (not `as_object`) because the type
+                    // value is always a JSON object (the registry guarantees
+                    // this).  We still guard with `ok_or_else` so a malformed
+                    // (non-object) type value surfaces as a `LangError` instead
+                    // of panicking.
+                    let obj_a = a.as_object().ok_or_else(|| {
+                        LangError::engine("typecheck: type value is not an object")
+                    })?;
+                    let obj_b = b.as_object().ok_or_else(|| {
+                        LangError::engine("typecheck: type value is not an object")
+                    })?;
+                    // Collect field keys from both objects, excluding the
+                    // `__tag__` and `__registry__` structural keys and the
+                    // `body_closure` field (which is an engine-internal closure
+                    // marker for dependent Pi/Sigma types — it cannot be
+                    // structurally unified; use the `unify_pi` judgment op for
+                    // full closure-based unification, ADR-0054).
+                    let keys: std::collections::BTreeSet<String> = obj_a
+                        .keys()
+                        .filter(|k| *k != "__tag__" && *k != "__registry__" && *k != "body_closure")
+                        .chain(obj_b.keys().filter(|k| {
+                            *k != "__tag__" && *k != "__registry__" && *k != "body_closure"
+                        }))
+                        .cloned()
+                        .collect();
+                    for key in keys {
+                        let va = obj_a.get(&key).unwrap_or(&Value::Null);
+                        let vb = obj_b.get(&key).unwrap_or(&Value::Null);
+                        self.unify(va, vb, ctx)?;
                     }
                     return Ok(());
                 }
-                // Both are type values with the same tag — unify payload
-                // fields.  We use `get` (not `as_object`) because the type
-                // value is always a JSON object (the registry guarantees
-                // this).  We still guard with `ok_or_else` so a malformed
-                // (non-object) type value surfaces as a `LangError` instead
-                // of panicking.
-                let obj_a = a
-                    .as_object()
-                    .ok_or_else(|| LangError::engine("typecheck: type value is not an object"))?;
-                let obj_b = b
-                    .as_object()
-                    .ok_or_else(|| LangError::engine("typecheck: type value is not an object"))?;
-                // Collect field keys from both objects, excluding the
-                // `__tag__` and `__registry__` structural keys and the
-                // `body_closure` field (which is an engine-internal closure
-                // marker for dependent Pi/Sigma types — it cannot be
-                // structurally unified; use the `unify_pi` judgment op for
-                // full closure-based unification, ADR-0054).
-                let keys: std::collections::BTreeSet<String> = obj_a
-                    .keys()
-                    .filter(|k| *k != "__tag__" && *k != "__registry__" && *k != "body_closure")
-                    .chain(obj_b.keys().filter(|k| {
-                        *k != "__tag__" && *k != "__registry__" && *k != "body_closure"
-                    }))
-                    .cloned()
-                    .collect();
-                for key in keys {
-                    let va = obj_a.get(&key).unwrap_or(&Value::Null);
-                    let vb = obj_b.get(&key).unwrap_or(&Value::Null);
-                    self.unify(va, vb, ctx)?;
-                }
-                return Ok(());
-            }
-        }
-        Err(LangError::engine(format!(
-            "typecheck: cannot unify — expected {}, got {}",
-            dependent::display_type(b, ctx),
-            dependent::display_type(a, ctx)
-        )))
+            Err(LangError::engine(format!(
+                "typecheck: cannot unify — expected {}, got {}",
+                dependent::display_type(b, ctx),
+                dependent::display_type(a, ctx)
+            )))
         })
     }
 }
@@ -6029,11 +6315,10 @@ impl TypecheckContext {
             // `n ↦ ?k + 1` refinement reached through an implicit-`Pi`
             // fill made `0 ≡ ?j + 1` look satisfiable and broke
             // coverage's decided-impossible arm).
-            if self.nonneg_metas.contains(&id) {
-                if let Some(other) = extract_meta_id(&val) {
+            if self.nonneg_metas.contains(&id)
+                && let Some(other) = extract_meta_id(&val) {
                     self.nonneg_metas.insert(other);
                 }
-            }
             self.metas[id as usize] = Some(val);
         }
     }
@@ -6751,22 +7036,21 @@ impl TypeModel {
         }
 
         // Fall back to the language-level handler keyed by grade.
-        if impl_json.is_none() {
-            if let Some(ref grade) = required_grade {
+        if impl_json.is_none()
+            && let Some(ref grade) = required_grade {
                 impl_json = ctx
                     .lang
                     .handler_for_grade(grade)
                     .and_then(|h| h.get("impls").and_then(|m| m.get(op)).cloned());
             }
-        }
 
         // No handler found — let the caller fall back to native dispatch.
         let Some(impl_json) = impl_json else {
             return Ok(None);
         };
 
-        let impl_term: Term = serde_json::from_value(impl_json)
-            .map_err(|_| hnl_engine::LangError::NotImplemented)?;
+        let impl_term: Term =
+            serde_json::from_value(impl_json).map_err(|_| hnl_engine::LangError::NotImplemented)?;
         let handler_in = if arg_vals.is_empty() {
             incoming
         } else {
@@ -6793,8 +7077,12 @@ impl hnl_engine::Model for TypeModel {
         let td = TermData::from_term(term);
         match td.tag() {
             "Rewrite" => {
-                let target = td.get_term("target").ok_or(hnl_engine::LangError::NotImplemented)?;
-                let target_term = target.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
+                let target = td
+                    .get_term("target")
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
+                let target_term = target
+                    .to_term()
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)?;
                 self.run(&target_term, incoming, ctx)
             }
             // `Child { role }` (ADR-0081): resolve the named child role to a
@@ -6853,12 +7141,20 @@ impl hnl_engine::Model for TypeModel {
                     .map_err(|_| hnl_engine::LangError::NotImplemented)
             }
             "Path" => {
-                let a = td.get_term("from").ok_or(hnl_engine::LangError::NotImplemented)?;
-                let b = td.get_term("to").ok_or(hnl_engine::LangError::NotImplemented)?;
-                let b_term = b.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
+                let a = td
+                    .get_term("from")
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
+                let b = td
+                    .get_term("to")
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
+                let b_term = b
+                    .to_term()
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)?;
                 let b_val = self.run(&b_term, incoming.clone(), ctx)?;
                 if b_val.is_null() {
-                    let a_term = a.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
+                    let a_term = a
+                        .to_term()
+                        .map_err(|_| hnl_engine::LangError::NotImplemented)?;
                     self.run(&a_term, incoming, ctx)
                 } else {
                     Ok(b_val)
@@ -6874,7 +7170,9 @@ impl hnl_engine::Model for TypeModel {
             // handler before falling back to the type-native dispatch.
             "Op" => {
                 let name = td.get_str("name").unwrap_or("");
-                let source = td.arr_source().ok_or(hnl_engine::LangError::NotImplemented)?;
+                let source = td
+                    .arr_source()
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
                 let op_name = match source {
                     ArrSource::Native => name.to_string(),
                     ArrSource::Foreign(n) => n.clone(),
@@ -6883,7 +7181,10 @@ impl hnl_engine::Model for TypeModel {
                 let args: Vec<Term> = td
                     .get_term_list("args")
                     .iter()
-                    .map(|t| t.to_term().map_err(|_| hnl_engine::LangError::NotImplemented))
+                    .map(|t| {
+                        t.to_term()
+                            .map_err(|_| hnl_engine::LangError::NotImplemented)
+                    })
                     .collect::<Result<_, _>>()?;
                 if let Some(v) = self.dispatch_type_op(&op_name, &args, incoming.clone(), ctx)? {
                     return Ok(v);
@@ -6898,10 +7199,18 @@ impl hnl_engine::Model for TypeModel {
                     .map_err(|_| hnl_engine::LangError::NotImplemented)
             }
             "Handle" => {
-                let body = td.get_term("body").ok_or(hnl_engine::LangError::NotImplemented)?;
-                let impl_ = td.get_term("impl_").ok_or(hnl_engine::LangError::NotImplemented)?;
-                let impl_term = impl_.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
-                let body_term = body.to_term().map_err(|_| hnl_engine::LangError::NotImplemented)?;
+                let body = td
+                    .get_term("body")
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
+                let impl_ = td
+                    .get_term("impl_")
+                    .ok_or(hnl_engine::LangError::NotImplemented)?;
+                let impl_term = impl_
+                    .to_term()
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)?;
+                let body_term = body
+                    .to_term()
+                    .map_err(|_| hnl_engine::LangError::NotImplemented)?;
                 let handler = self.run(&impl_term, incoming.clone(), ctx)?;
                 ctx.push_handler(handler);
                 let result = self.run(&body_term, incoming, ctx);

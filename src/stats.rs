@@ -214,7 +214,10 @@ pub fn instantiate_ctor(ctor: &str) {
     }
     IC_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut guard = IC_SEEN.lock().unwrap();
-    if !guard.get_or_insert_with(HashSet::new).insert(ctor.to_string()) {
+    if !guard
+        .get_or_insert_with(HashSet::new)
+        .insert(ctor.to_string())
+    {
         IC_DUPS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -254,7 +257,10 @@ pub fn report() -> String {
         DU_DUPS.load(Ordering::Relaxed),
         DU_EQ_FAST.load(Ordering::Relaxed),
     );
-    let (u, ud) = (U_CALLS.load(Ordering::Relaxed), U_DUPS.load(Ordering::Relaxed));
+    let (u, ud) = (
+        U_CALLS.load(Ordering::Relaxed),
+        U_DUPS.load(Ordering::Relaxed),
+    );
     let (ui, uid) = (
         UI_CALLS.load(Ordering::Relaxed),
         UI_DUPS.load(Ordering::Relaxed),
