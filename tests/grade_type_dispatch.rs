@@ -76,6 +76,7 @@ fn add_term() -> Term {
         ],
         source: ArrSource::Native,
         lit: None,
+        attrs: None,
     }
 }
 

@@ -1007,6 +1007,7 @@ mod tests {
             args,
             source: ArrSource::Judgment,
             lit,
+            attrs: None,
         }
     }
 

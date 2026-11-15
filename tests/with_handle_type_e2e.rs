@@ -95,6 +95,7 @@ fn with_handle_returns_number_type() {
         ],
         source: ArrSource::Native,
         lit: None,
+        attrs: None,
     };
     let with_term = Term::Handle {
         body: Box::new(body),
