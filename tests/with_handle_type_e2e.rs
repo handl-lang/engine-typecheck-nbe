@@ -104,6 +104,7 @@ fn with_handle_returns_number_type() {
             dim: Box::new(Term::Const { value: json!(1) }),
             value: add_handler(),
         }),
+        acc: None,
     };
 
     // 4. Set up a `ModelCtx` with an empty `handler_stack`.

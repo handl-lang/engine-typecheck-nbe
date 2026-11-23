@@ -7205,6 +7205,18 @@ impl hnl_engine::Model for TypeModel {
                 let impl_ = td
                     .get_term("impl_")
                     .ok_or(hnl_engine::LangError::NotImplemented)?;
+                // ADR-0158 `acc` clause: `handle body with target = impl_
+                // acc s0` seeds a mutable accumulator slot on the pushed
+                // handler frame. This type model's handler stack has no
+                // per-frame accumulator, so a non-null `acc` is
+                // unsupported — the same contract as `engine`'s term
+                // interpreter, which declines `acc` handles. Note
+                // `TermData::handle` always emits `"acc": null` for the
+                // accumulator-free form, so `null`/absent both mean
+                // "no accumulator" here.
+                if td.get("acc").is_some_and(|v| !v.is_null()) {
+                    return Err(hnl_engine::LangError::NotImplemented);
+                }
                 let impl_term = impl_
                     .to_term()
                     .map_err(|_| hnl_engine::LangError::NotImplemented)?;
