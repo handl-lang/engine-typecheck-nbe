@@ -35,4 +35,4 @@ hnl-engine-parse = { git = "https://github.com/handl-lang/engine-parse", branch 
 hnl-engine-parse-pratt = { git = "https://github.com/handl-lang/engine-parse-pratt", branch = "main" }
 handl-plugin-module = { git = "https://github.com/handl-lang/host", branch = "main" }
 handl-plugin-lib-handl = { git = "https://github.com/handl-lang/host", branch = "main" }
-handl-kit-data-prelude = { git = "https://github.com/handl-lang/kit-data-prelude", branch = "main" }
+handl-kit-data-prelude = { git = "https://github.com/handl-lang/host", branch = "main" }
