@@ -4,7 +4,7 @@ A normalization-by-evaluation typecheck engine: reads `lang.types[kind]` rules a
 
 ## What it is
 
-A **typecheck engine** in the `engine-*` family. Types are values (ADR-0032): checking reduces to evaluating the language-supplied judgment schemes, so a new typing rule is data, not a new Rust arm.
+A **typecheck engine** in the `tool-*` family. Types are values (ADR-0032): checking reduces to evaluating the language-supplied judgment schemes, so a new typing rule is data, not a new Rust arm.
 
 ## Start here
 

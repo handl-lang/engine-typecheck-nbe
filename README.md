@@ -4,7 +4,7 @@ Normalization-by-evaluation typecheck engine: reads `lang.types[kind]` rules,
 interprets them as `Term` judgments over a `Val` domain, and mints tagged type
 values.
 
-An `engine-*` crate: a concrete `TypecheckEngine` — "types are values". The
+A `tool-*` crate: a concrete `TypecheckEngine` — "types are values". The
 bound eval engine supplies value-level computation; the host owns the purity
 boundary (effectful `Foreign` ops are rejected there).
 
