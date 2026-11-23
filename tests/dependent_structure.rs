@@ -142,7 +142,7 @@ fn dependent_surface_forms_typecheck() {
             "mk : Pi(Nat, n ~> Nat) = n ~> n",
             "mk2 : Pi(Nat, n ~> Nat) = n ~> n + 1",
             "p : Sigma(Nat, n ~> Nat) = [3, 4]",
-            "data Bool :: True | False",
+            "Bool := { True : Bool, False : Bool }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -208,7 +208,7 @@ fn dependent_indices_compute_definitionally() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "v1 : Vec(1 + 1, Bool) = VCons(true, VCons(false, VNil))",
             "v2 : Vec(2 - 0, Bool) = VCons(true, VCons(false, VNil))",
             "v3 : Vec(2 * 1, Bool) = VCons(true, VCons(false, VNil))",
@@ -231,7 +231,7 @@ fn dependent_constructors_check_arguments() {
     let good = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "x : Nat = Succ(Zero)",
             "y : Nat = Succ(Succ(Zero))",
         ],
@@ -245,7 +245,10 @@ fn dependent_constructors_check_arguments() {
 
     let bad = parse_block(
         &lang,
-        &["data Nat :: Zero | Succ(pred : Nat)", "x : Nat = Succ(3)"],
+        &[
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "x : Nat = Succ(3)",
+        ],
     );
     let result = typecheck(&lang, bad);
     assert!(
@@ -260,7 +263,7 @@ fn dependent_constructors_check_arguments() {
 #[test]
 fn dependent_constructors_reject_wrong_indices() {
     let lang = canonical_lang();
-    let decl = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
+    let decl = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
 
     let wrong_len = parse_block(
         &lang,
@@ -288,7 +291,7 @@ fn dependent_family_unifies_inside_function() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "f : Nat ~> Vec(1 + 1, Bool) = n ~> VCons(true, VCons(false, VNil))",
         ],
     );
@@ -312,8 +315,8 @@ fn succ_index_bridges_to_arithmetic() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "fwd : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 1, Bool))) = n ~> v ~> v",
             "bwd : Pi(Nat, n ~> Pi(Vec(n + 1, Bool), v ~> Vec(Succ(n), Bool))) = n ~> v ~> v",
             "nested : Pi(Nat, n ~> Pi(Vec(Succ(Succ(n)), Bool), v ~> Vec(n + 2, Bool))) = n ~> v ~> v",
@@ -340,8 +343,8 @@ fn match_on_succ_indexed_scrutinee_refines() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VCons(x, xs): x }",
         ],
     );
@@ -362,8 +365,8 @@ fn match_on_succ_indexed_scrutinee_refines() {
 fn succ_projection_keeps_decided_contract() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let off_by_one = parse_block(
         &lang,
@@ -418,7 +421,7 @@ fn match_constructor_patterns_bind_arguments() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "f = v ~> match v { Zero: Zero, Succ(p): p }",
         ],
     );
@@ -448,7 +451,7 @@ fn match_refines_scrutinee_index_per_branch() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: v, VCons(x, xs): v }",
         ],
     );
@@ -468,7 +471,7 @@ fn match_refines_scrutinee_index_per_branch() {
 #[test]
 fn match_refinement_solves_linear_index() {
     let lang = canonical_lang();
-    let decl = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
+    let decl = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
     let ast = parse_block(
         &lang,
         &[
@@ -497,7 +500,7 @@ fn match_refinement_solves_linear_index() {
 #[test]
 fn match_auto_discharges_decided_impossible_arm() {
     let lang = canonical_lang();
-    let decl = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
+    let decl = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
 
     let direct = parse_block(
         &lang,
@@ -562,7 +565,7 @@ fn transport_consumes_branch_path_witness() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: eq_n # v, VCons(x, xs): eq_n # v }",
         ],
     );
@@ -593,7 +596,7 @@ fn refl_is_the_identity_path() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
             "p : Path(2, 2) = refl",
             "w : Vec(2, Bool) = p # v",
@@ -614,7 +617,7 @@ fn refl_is_the_identity_path() {
 #[test]
 fn transport_rejects_non_path_and_absent_paths() {
     let lang = canonical_lang();
-    let decl = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
+    let decl = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
 
     let num_path = parse_block(
         &lang,
@@ -683,7 +686,7 @@ fn j_eliminates_branch_path_through_motive() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "_motive := (i2, w2) ~> Vec(i2, Bool)",
             "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, _motive, v, VCons(x, xs): J eq_n, _motive, v }",
         ],
@@ -704,7 +707,7 @@ fn j_surface_literal_motive() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, (i2, w2) ~> Vec(i2, Bool), v, VCons(x, xs): J eq_n, (i2, w2) ~> Vec(i2, Bool), v }",
         ],
     );
@@ -726,7 +729,7 @@ fn j_surface_literal_motive() {
 #[test]
 fn nonlinear_product_solves_by_exact_division() {
     let lang = canonical_lang();
-    let decl = "data Dbl(n : Nat) :: MkDbl(x : Nat) : Dbl(2 * n)";
+    let decl = "Dbl<n : Nat> := { MkDbl : (x : Nat) ~> Dbl(2 * n) }";
 
     let good = parse_block(
         &lang,
@@ -759,8 +762,8 @@ fn nonlinear_product_solves_by_exact_division() {
 #[test]
 fn nonlinear_square_and_pow_solve_by_integer_root() {
     let lang = canonical_lang();
-    let sq = "data Sq(n : Nat) :: MkSq(x : Nat) : Sq(n * n)";
-    let cube = "data Cube(n : Nat) :: MkCube(x : Nat) : Cube(n ** 3)";
+    let sq = "Sq<n : Nat> := { MkSq : (x : Nat) ~> Sq(n * n) }";
+    let cube = "Cube<n : Nat> := { MkCube : (x : Nat) ~> Cube(n ** 3) }";
 
     let good = parse_block(
         &lang,
@@ -880,8 +883,8 @@ fn io_signature_subtyping() {
 #[test]
 fn absurd_discharges_decided_impossible_arm() {
     let lang = canonical_lang();
-    let vec = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
-    let dbl = "data Dbl(n : Nat) :: MkDbl(x : Nat) : Dbl(2 * n)";
+    let vec = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
+    let dbl = "Dbl<n : Nat> := { MkDbl : (x : Nat) ~> Dbl(2 * n) }";
 
     let ast = parse_block(
         &lang,
@@ -922,7 +925,7 @@ fn absurd_discharges_decided_impossible_arm() {
 #[test]
 fn absurd_rejects_reachable_arm() {
     let lang = canonical_lang();
-    let vec = "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)";
+    let vec = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
 
     let reachable = parse_block(
         &lang,
@@ -980,8 +983,8 @@ fn absurd_rejects_reachable_arm() {
 fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let head = parse_block(
         &lang,
@@ -1043,8 +1046,8 @@ fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
 fn match_auto_discharge_zipwith_shape() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let zip = parse_block(
         &lang,
@@ -1074,8 +1077,8 @@ fn match_auto_discharge_zipwith_shape() {
 fn nested_absurd_inner_match_checks() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1101,8 +1104,8 @@ fn nested_absurd_inner_match_checks() {
 fn export_implicit_binders_abstract_index() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1128,8 +1131,8 @@ fn export_implicit_binders_abstract_index() {
 fn export_zipwith_recursive_body_checks() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1170,8 +1173,8 @@ fn export_zipwith_recursive_body_checks() {
 fn export_zipwith_wrong_result_errors() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1198,8 +1201,8 @@ fn export_zipwith_wrong_result_errors() {
 fn sigma_destructure_repack_index() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1241,8 +1244,8 @@ fn sigma_destructure_repack_index() {
 fn sigma_destructure_wrong_payload_errors() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1268,8 +1271,8 @@ fn sigma_destructure_wrong_payload_errors() {
 fn exists_sugar_mints_sigma() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1300,8 +1303,8 @@ fn exists_sugar_mints_sigma() {
 fn exists_sugar_filter_repro() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1326,8 +1329,8 @@ fn exists_sugar_filter_repro() {
 fn exists_sugar_wrong_payload_errors() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let ast = parse_block(
         &lang,
@@ -1353,8 +1356,8 @@ fn exists_sugar_wrong_payload_errors() {
 fn match_split_tree_decides_n_plus_m_coverage() {
     let lang = canonical_lang();
     let decls = [
-        "data Nat :: Zero | Succ(pred : Nat)",
-        "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+        "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
     ];
     let good = parse_block(
         &lang,
@@ -1417,8 +1420,8 @@ fn match_literal_zero_index_needs_no_vcons_arm() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "v0 : Vec(0, Bool) = VNil",
             "x : Bool = match v0 { VNil: true }",
         ],
@@ -1440,7 +1443,7 @@ fn match_enum_scrutinee_requires_all_ctors_or_catchall() {
     let missing = parse_block(
         &lang,
         &[
-            "data Bool :: True | False",
+            "Bool := { True : Bool, False : Bool }",
             "b : Bool = True",
             "x : Nat = match b { True: 1 }",
         ],
@@ -1458,7 +1461,7 @@ fn match_enum_scrutinee_requires_all_ctors_or_catchall() {
     let caught = parse_block(
         &lang,
         &[
-            "data Bool :: True | False",
+            "Bool := { True : Bool, False : Bool }",
             "b : Bool = True",
             "x : Nat = match b { True: 1, _: 0 }",
         ],
@@ -1482,8 +1485,8 @@ fn match_undecided_coverage_warns_not_errors() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Bool))) = f ~> n ~> v ~> match v { VNil: true }",
         ],
     );
@@ -1834,8 +1837,8 @@ fn instance_resolves_implicit_evidence_binder() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Eq<a : Type> := { mkEq : (f : a ~> a ~> Bool) ~> Eq(a) }",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
             "f<a, eq : Eq(a)> : a ~> a := v ~> v",
             "r := f(Zero)",
@@ -1858,9 +1861,9 @@ fn instance_missing_produces_named_error() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Bool :: True | False",
-            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Bool := { True : Bool, False : Bool }",
+            "Eq<a : Type> := { mkEq : (f : a ~> a ~> Bool) ~> Eq(a) }",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
             "f<a, eq : Eq(a)> : a ~> a := v ~> v",
             "r := f(True)",
@@ -1887,8 +1890,8 @@ fn instance_overlap_is_a_coherence_error() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Eq<a : Type> := { mkEq : (f : a ~> a ~> Bool) ~> Eq(a) }",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
             "instance Eq(Nat) := {eq: (x, y) ~> true}",
         ],
@@ -1915,9 +1918,9 @@ fn distinct_instance_index_shapes_coexist() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Bool :: True | False",
-            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Bool := { True : Bool, False : Bool }",
+            "Eq<a : Type> := { mkEq : (f : a ~> a ~> Bool) ~> Eq(a) }",
             "instance Eq(Nat) := {eq: (x, y) ~> x == y}",
             "instance Eq(Bool) := {eq: (x, y) ~> x == y}",
             "f<a, eq : Eq(a)> : a ~> a := v ~> v",
@@ -1943,9 +1946,9 @@ fn generic_indexed_instance_resolves() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data List(a : Type) :: LNil | LCons(h : a, t : List(a))",
-            "data Eq(a : Type) :: mkEq(f : a ~> a ~> Bool)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "List<a : Type> := { LNil : List(a), LCons : (h : a, t : List(a)) ~> List(a) }",
+            "Eq<a : Type> := { mkEq : (f : a ~> a ~> Bool) ~> Eq(a) }",
             "instance Eq(List(a)) := {eq: (x, y) ~> true}",
             "f<a, eq : Eq(List(a))> : a ~> a := v ~> v",
             "r := f(LCons(Zero, LNil))",
@@ -1989,8 +1992,8 @@ fn commuted_sum_index_unifies_through_metas() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "append<n, m, a> : Vec<n, a> ~> Vec<m, a> ~> Vec<n + m, a> = xs ~> ys ~> match xs { VNil: ys, VCons(x, t): VCons(x, append(t)(ys)) }",
         ],
     );
@@ -2013,8 +2016,8 @@ fn implicit_binder_names_scope_into_body_annotation() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "f<n, a> : Vec<n, a> ~> Vec<n, a> = v ~> (v : Vec(n, a))",
             "g<n, a> : Vec<n + 1, a> ~> Vec<n + 1, a> = v ~> match (v : Vec(n + 1, a)) { VCons(x, xs): xs }",
         ],
@@ -2038,8 +2041,8 @@ fn family_rec_resolves_eliminator_type() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(x : a, xs : Vec(n, a)) : Vec(n + 1, a)",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "v1 : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
             "step : Bool ~> Vec(1, Bool) ~> Number ~> Number = x ~> xs ~> ih ~> ih + 1",
             "len : Number = Vec.rec(null, 0, step)(2, Bool, v1)",
@@ -2067,7 +2070,7 @@ fn annotated_arm_family_params_dont_shadow_rigids() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(k : Nat, x : a, xs : Vec(k, a)) : Vec(k + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (k : Nat, x : a, xs : Vec(k, a)) ~> Vec(k + 1, a) }",
             "push<n, a> : a ~> Vec<n, a> ~> Vec<n + 1, a> = x ~> v ~> match v { VNil: VCons(0, x, VNil), VCons(k, x2, xs): VCons(k + 1, x2, v) }",
         ],
     );
@@ -2088,7 +2091,7 @@ fn annotated_arm_elem_param_scopes_cleanly() {
     let ast = parse_block(
         &lang,
         &[
-            "data Vec(n : Nat, a : Type) :: VNil : Vec(0, a) | VCons(k : Nat, x : a, xs : Vec(k, a)) : Vec(k + 1, a)",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (k : Nat, x : a, xs : Vec(k, a)) ~> Vec(k + 1, a) }",
             "dup<n, a> : Vec<n, a> ~> Vec<n, a> = v ~> match v { VNil: VNil, VCons(k, x, xs): VCons(k, x, xs) }",
             "bump<n> : Vec<n, Bool> ~> Vec<n + 1, Bool> = v ~> match v { VNil: VCons(0, true, VNil), VCons(k, x, xs): VCons(k + 1, x, v) }",
         ],
@@ -2110,8 +2113,8 @@ fn unannotated_ctor_result_index_is_decided_mismatch() {
     let ast = parse_block(
         &lang,
         &[
-            "data Nat :: Zero | Succ(pred : Nat)",
-            "data Vec(n : Nat, a : Type) :: VNil | VCons(k : Nat, x : a, xs : Vec(k, a))",
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec, VCons : (k : Nat, x : a, xs : Vec(k, a)) ~> Vec }",
             "v : Vec(5, Bool) = VCons(Zero, true, VNil)",
         ],
     );

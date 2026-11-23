@@ -2027,6 +2027,22 @@ pub(crate) fn parse_data_node(
     let cons_node = ast.get(AstRef::new(cons_idx.as_u64()? as usize))?;
     let mut ctors = Vec::new();
     collect_ctors(lang, cons_node, ast, &mut ctors);
+    // A codomain spelled as the bare family name (`C : (a⃗) ~> F`) names
+    // the family with no index vector — the record-spelling equivalent of
+    // the retired `data F :: C(a⃗)` result-less ctor. Normalize it to
+    // `result: None` so the unrecoverable-index `lit null` convention
+    // applies instead of synthesizing the bare `var F` (which reads as
+    // the family *type*, not an indexed application, and would unify
+    // with any `F(i⃗)`).
+    for c in &mut ctors {
+        if let Some(ri) = c.result
+            && let Some(n) = ast.get(AstRef::new(ri))
+            && n.kind == "var"
+            && node_name(n).as_deref() == Some(name.as_str())
+        {
+            c.result = None;
+        }
+    }
     Some((name, params, ctors))
 }
 
@@ -2113,9 +2129,32 @@ fn collect_ctors(lang: &Language, node: &AstNode, ast: &Ast, out: &mut Vec<DepCt
             let cons_idx = kids.get(subj).and_then(Value::as_u64).map(|v| v as usize);
             let result_idx = kids.get(annot).and_then(Value::as_u64).map(|v| v as usize);
             if let Some(ci) = cons_idx
-                && let Some(cn) = ast.get(AstRef::new(ci)) {
-                    collect_ctor_leaf(cn, ast, out, result_idx, false);
+                && let Some(cn) = ast.get(AstRef::new(ci))
+            {
+                // Peel nested `type-annot` wrappers down to the ctor
+                // leaf: the record-lowered `C : F(i⃗)` spelling emits
+                // `type-annot(type-annot(C, R), R, name)` — the outer
+                // `annot` is the declared result, the innermost
+                // `subject` is the `var`/`call` leaf consumers read
+                // (same descent `engine-typecheck`'s
+                // `collect_data_ctors` performs).
+                let mut leaf = cn;
+                while leaf.kind == "type-annot" {
+                    let subj = lang
+                        .child_role_index(&leaf.kind, "subject")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    let inner = children_of(leaf)
+                        .and_then(|k| k.get(subj).and_then(Value::as_u64))
+                        .map(|v| v as usize);
+                    match inner.and_then(|i| ast.get(AstRef::new(i))) {
+                        Some(n) => leaf = n,
+                        None => break,
+                    }
                 }
+                collect_ctor_leaf(leaf, ast, out, result_idx, false);
+            }
         }
         _ => collect_ctor_leaf(node, ast, out, None, node.kind == "var"),
     }
