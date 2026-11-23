@@ -1,6 +1,6 @@
 # How-to guides
 
-Task recipes for `engine-typecheck-nbe`.
+Task recipes for `tool-typecheck-nbe`.
 
 ## Run the gate
 
@@ -12,8 +12,8 @@ Task recipes for `engine-typecheck-nbe`.
 ## Use it from Rust
 
 ```bash
-cargo add --git https://github.com/handl-lang/engine-typecheck-nbe --branch main
+cargo add --git https://github.com/handl-lang/tool-typecheck-nbe --branch main
 ```
 
-See the [reference](/engine-typecheck-nbe/reference/) for the types involved and the
-[explanation](/engine-typecheck-nbe/explanation/) for why the crate is shaped this way.
+See the [reference](/tool-typecheck-nbe/reference/) for the types involved and the
+[explanation](/tool-typecheck-nbe/explanation/) for why the crate is shaped this way.

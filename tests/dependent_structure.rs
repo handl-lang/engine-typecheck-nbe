@@ -19,12 +19,12 @@
 
 use handl_kit_data_prelude::language_from_yaml;
 use handl_language::{Ast, AstNode, AstRef, Language};
-use hnl_engine_exec_tree_walk::TreeWalkEngine;
-use hnl_engine_lex_pattern::lex;
-use hnl_engine_parse::{ParserEngine, ParserRequest};
-use hnl_engine_parse_pratt::PrattEngine;
-use hnl_engine_typecheck::{TypecheckEngine, TypecheckRequest};
-use hnl_engine_typecheck_nbe::NbeTypecheckEngine;
+use hnl_exec_tree_walk::TreeWalkEngine;
+use hnl_tool_lex_pattern::lex;
+use hnl_tool_parse::{ParserEngine, ParserRequest};
+use hnl_tool_parse_pratt::PrattEngine;
+use hnl_tool_typecheck::{TypecheckEngine, TypecheckRequest};
+use hnl_tool_typecheck_nbe::NbeTypecheckEngine;
 use serde_json::json;
 
 fn canonical_lang() -> Language {
@@ -94,7 +94,7 @@ fn parse_block(lang: &Language, stmts: &[&str]) -> Ast {
     combined
 }
 
-fn typecheck(lang: &Language, ast: Ast) -> hnl_engine_typecheck::TypecheckResult {
+fn typecheck(lang: &Language, ast: Ast) -> hnl_tool_typecheck::TypecheckResult {
     let engine = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
     let req = TypecheckRequest::new(ast);
     // The NBE engine reports fatal type errors as `Err(LangError)`; the
@@ -102,9 +102,9 @@ fn typecheck(lang: &Language, ast: Ast) -> hnl_engine_typecheck::TypecheckResult
     // `has_error` behaves identically to the Handl model.
     match engine.typecheck(lang, &req) {
         Ok(result) => result,
-        Err(e) => hnl_engine_typecheck::TypecheckResult {
+        Err(e) => hnl_tool_typecheck::TypecheckResult {
             typ: serde_json::Value::Null,
-            diagnostics: vec![hnl_engine_typecheck::TypecheckDiagnostic {
+            diagnostics: vec![hnl_tool_typecheck::TypecheckDiagnostic {
                 severity: "error".to_string(),
                 message: e.to_string(),
                 span: None,
@@ -115,7 +115,7 @@ fn typecheck(lang: &Language, ast: Ast) -> hnl_engine_typecheck::TypecheckResult
     }
 }
 
-fn diags_of(result: &hnl_engine_typecheck::TypecheckResult) -> Vec<String> {
+fn diags_of(result: &hnl_tool_typecheck::TypecheckResult) -> Vec<String> {
     result
         .diagnostics
         .iter()
@@ -123,7 +123,7 @@ fn diags_of(result: &hnl_engine_typecheck::TypecheckResult) -> Vec<String> {
         .collect()
 }
 
-fn has_error(result: &hnl_engine_typecheck::TypecheckResult) -> bool {
+fn has_error(result: &hnl_tool_typecheck::TypecheckResult) -> bool {
     result.diagnostics.iter().any(|d| d.severity == "error")
 }
 
@@ -2131,7 +2131,7 @@ fn unannotated_ctor_result_index_is_decided_mismatch() {
 /// a no-op.
 #[test]
 fn zzz_tc_stats_dump() {
-    if hnl_engine_typecheck_nbe::stats_enabled() {
-        eprintln!("{}", hnl_engine_typecheck_nbe::stats_report());
+    if hnl_tool_typecheck_nbe::stats_enabled() {
+        eprintln!("{}", hnl_tool_typecheck_nbe::stats_report());
     }
 }

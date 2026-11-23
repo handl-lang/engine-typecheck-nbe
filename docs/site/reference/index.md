@@ -9,7 +9,7 @@ the `engine-*` contract for this slot exposes.
 
 | crate | role |
 |---|---|
-| `hnl-engine-typecheck-nbe` | typecheck engine |
+| `hnl-tool-typecheck-nbe` | typecheck engine |
 
 ## Build and test
 

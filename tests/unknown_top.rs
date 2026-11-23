@@ -13,12 +13,12 @@
 
 use handl_kit_data_prelude::language_from_yaml;
 use handl_language::{Ast, Language};
-use hnl_engine_exec_tree_walk::TreeWalkEngine;
-use hnl_engine_lex_pattern::lex;
-use hnl_engine_parse::{ParserEngine, ParserRequest};
-use hnl_engine_parse_pratt::PrattEngine;
-use hnl_engine_typecheck::{TypecheckEngine, TypecheckRequest};
-use hnl_engine_typecheck_nbe::NbeTypecheckEngine;
+use hnl_exec_tree_walk::TreeWalkEngine;
+use hnl_tool_lex_pattern::lex;
+use hnl_tool_parse::{ParserEngine, ParserRequest};
+use hnl_tool_parse_pratt::PrattEngine;
+use hnl_tool_typecheck::{TypecheckEngine, TypecheckRequest};
+use hnl_tool_typecheck_nbe::NbeTypecheckEngine;
 
 fn lang() -> Language {
     let lang = language_from_yaml().expect("canonical language should assemble");
@@ -28,7 +28,7 @@ fn lang() -> Language {
 
 /// Typecheck `src` through the same `do { … }` wrap `Kit::typecheck_*`
 /// uses: the Pratt parser consumes one top-level expression per call.
-fn check(src: &str) -> Result<hnl_engine_typecheck::TypecheckResult, String> {
+fn check(src: &str) -> Result<hnl_tool_typecheck::TypecheckResult, String> {
     let lang = lang();
     let wrapped = format!("do {{\n{}\n}}", src);
     let tokens = lex(&lang, &wrapped).map_err(|e| format!("lex: {e}"))?;
@@ -57,7 +57,7 @@ fn err(src: &str) -> String {
     }
 }
 
-fn ok(src: &str) -> hnl_engine_typecheck::TypecheckResult {
+fn ok(src: &str) -> hnl_tool_typecheck::TypecheckResult {
     match check(src) {
         Err(e) => panic!("expected ok, got error: {e}\n  src: {src}"),
         Ok(res) => {

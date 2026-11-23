@@ -25,12 +25,12 @@
 //! `synth_last_child`), none of which require the eval engine.
 
 use handl_language::{LangError, Language, Value};
-use hnl_engine_exec_tree_walk::TreeWalkEngine;
-use hnl_engine_lex_pattern::lex as lex_src;
-use hnl_engine_parse::{ParserEngine, ParserRequest};
-use hnl_engine_parse_pratt::PrattEngine;
-use hnl_engine_typecheck::{TypecheckEngine, TypecheckRequest};
-use hnl_engine_typecheck_nbe::NbeTypecheckEngine;
+use hnl_exec_tree_walk::TreeWalkEngine;
+use hnl_tool_lex_pattern::lex as lex_src;
+use hnl_tool_parse::{ParserEngine, ParserRequest};
+use hnl_tool_parse_pratt::PrattEngine;
+use hnl_tool_typecheck::{TypecheckEngine, TypecheckRequest};
+use hnl_tool_typecheck_nbe::NbeTypecheckEngine;
 use serde_json::json;
 
 // ---------------------------------------------------------------------------

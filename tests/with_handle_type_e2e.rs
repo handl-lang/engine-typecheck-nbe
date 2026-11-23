@@ -6,8 +6,8 @@
 
 use handl_language::{ArrSource, Ast, Language, Term, Value};
 use hnl_engine::{Model, ModelCtx};
-use hnl_engine_exec_tree_walk::TreeWalkEngine;
-use hnl_engine_typecheck_nbe::{NbeTypecheckEngine, TypeModel};
+use hnl_exec_tree_walk::TreeWalkEngine;
+use hnl_tool_typecheck_nbe::{NbeTypecheckEngine, TypeModel};
 use serde_json::json;
 
 /// The canonical `type.number` value minted by `handl.canonical`.

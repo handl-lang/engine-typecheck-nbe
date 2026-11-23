@@ -28,8 +28,8 @@
 //! since indices are preserved and the subtree is self-contained.)
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Proof, Value, Verdict};
-use hnl_engine_exec::EvalRequest;
-use hnl_engine_typecheck::TypecheckDiagnostic;
+use hnl_exec::EvalRequest;
+use hnl_tool_typecheck::TypecheckDiagnostic;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 

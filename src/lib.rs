@@ -1,4 +1,4 @@
-//! # hnl-engine-typecheck-nbe
+//! # hnl-tool-typecheck-nbe
 //!
 //! A **data-driven, normalization-based typecheck engine** implementing the
 //! [`TypecheckEngine`] trait (ADR-0054 — Generic Typecheck Engine).
@@ -95,8 +95,8 @@ use handl_language::{
 use handl_plugin_lib_tag::TypeRegistry;
 use handl_value::{TaggedValue, nbe::Val};
 use hnl_engine::TermData;
-use hnl_engine_exec::{EvalEngine, EvalRequest};
-use hnl_engine_typecheck::{
+use hnl_exec::{EvalEngine, EvalRequest};
+use hnl_tool_typecheck::{
     TypecheckDiagnostic, TypecheckEngine, TypecheckRequest, TypecheckResult,
 };
 
@@ -6978,7 +6978,7 @@ impl TypeModel {
 
     /// Grade-based `Op` dispatch for the typecheck model.
     ///
-    /// Mirrors [`ValueModel::dispatch_op`](hnl_engine_exec_tree_walk).
+    /// Mirrors [`ValueModel::dispatch_op`](hnl_exec_tree_walk).
     /// Looks up the `op` declaration for the required grade, verifies the
     /// incoming value carries that grade, then searches `ctx.handler_stack`
     /// and `ctx.lang.handler_for_grade(grade)` for a `Handler` providing an

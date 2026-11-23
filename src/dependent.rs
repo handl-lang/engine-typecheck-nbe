@@ -29,7 +29,7 @@
 use handl_language::{Ast, AstNode, AstRef, LangError, Language};
 use handl_value::TaggedValue;
 use handl_value::nbe::{MetaId, Val};
-use hnl_engine_typecheck::TypecheckDiagnostic;
+use hnl_tool_typecheck::TypecheckDiagnostic;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -2136,7 +2136,7 @@ fn collect_ctors(lang: &Language, node: &AstNode, ast: &Ast, out: &mut Vec<DepCt
                 // `type-annot(type-annot(C, R), R, name)` — the outer
                 // `annot` is the declared result, the innermost
                 // `subject` is the `var`/`call` leaf consumers read
-                // (same descent `engine-typecheck`'s
+                // (same descent `tool-typecheck`'s
                 // `collect_data_ctors` performs).
                 let mut leaf = cn;
                 while leaf.kind == "type-annot" {
@@ -6799,7 +6799,7 @@ impl NbeTypecheckEngine {
     ///
     /// The body's `IO(S)` former has its op set checked against `h`'s
     /// declared impls, and the result re-wraps as `IO(S')` mirroring the
-    /// runtime's interpret-in-place semantics ([`engine-exec-tree-walk`]
+    /// runtime's interpret-in-place semantics ([`exec-tree-walk`]
     /// `interpret_io_former`): each covered entry's declared type is
     /// replaced by the impl's declared *return* type (the op is
     /// interpreted, its result is data); each uncovered entry keeps its
