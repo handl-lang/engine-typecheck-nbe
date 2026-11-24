@@ -137,11 +137,11 @@ fn dependent_surface_forms_typecheck() {
     let ast = parse_block(
         &lang,
         &[
-            "x : Nat = 5",
-            "fam : Family(Nat) = n ~> n > 0",
-            "mk : Pi(Nat, n ~> Nat) = n ~> n",
-            "mk2 : Pi(Nat, n ~> Nat) = n ~> n + 1",
-            "p : Sigma(Nat, n ~> Nat) = [3, 4]",
+            "x : Nat := 5",
+            "fam : Family(Nat) := n ~> n > 0",
+            "mk : Pi(Nat, n ~> Nat) := n ~> n",
+            "mk2 : Pi(Nat, n ~> Nat) := n ~> n + 1",
+            "p : Sigma(Nat, n ~> Nat) := [3, 4]",
             "Bool := { True : Bool, False : Bool }",
         ],
     );
@@ -161,9 +161,9 @@ fn reindexing_is_ordinary_composition() {
     let ast = parse_block(
         &lang,
         &[
-            "P : Family(Nat) = n ~> n > 0",
-            "f = n ~> n + 1",
-            "Q = f >>> P",
+            "P : Family(Nat) := n ~> n > 0",
+            "f := n ~> n + 1",
+            "Q := f >>> P",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -183,11 +183,11 @@ fn adjunction_laws_are_2cell_terms() {
     let ast = parse_block(
         &lang,
         &[
-            "reindex = (f, P) ~> f >>> P",
-            "sigma_unit = (Q, f, Sigma_f) ~> Q ~[2]~> (f >>> Sigma_f(Q))",
-            "sigma_counit = (P, f, Sigma_f) ~> Sigma_f((f >>> P)) ~[2]~> P",
-            "pi_unit = (P, f, Pi_f) ~> P ~[2]~> Pi_f((f >>> P))",
-            "pi_counit = (Q, f, Pi_f) ~> (f >>> Pi_f(Q)) ~[2]~> Q",
+            "reindex := (f, P) ~> f >>> P",
+            "sigma_unit := (Q, f, Sigma_f) ~> Q ~[2]~> (f >>> Sigma_f(Q))",
+            "sigma_counit := (P, f, Sigma_f) ~> Sigma_f((f >>> P)) ~[2]~> P",
+            "pi_unit := (P, f, Pi_f) ~> P ~[2]~> Pi_f((f >>> P))",
+            "pi_counit := (Q, f, Pi_f) ~> (f >>> Pi_f(Q)) ~[2]~> Q",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -209,9 +209,9 @@ fn dependent_indices_compute_definitionally() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "v1 : Vec(1 + 1, Bool) = VCons(true, VCons(false, VNil))",
-            "v2 : Vec(2 - 0, Bool) = VCons(true, VCons(false, VNil))",
-            "v3 : Vec(2 * 1, Bool) = VCons(true, VCons(false, VNil))",
+            "v1 : Vec(1 + 1, Bool) := VCons(true, VCons(false, VNil))",
+            "v2 : Vec(2 - 0, Bool) := VCons(true, VCons(false, VNil))",
+            "v3 : Vec(2 * 1, Bool) := VCons(true, VCons(false, VNil))",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -232,8 +232,8 @@ fn dependent_constructors_check_arguments() {
         &lang,
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
-            "x : Nat = Succ(Zero)",
-            "y : Nat = Succ(Succ(Zero))",
+            "x : Nat := Succ(Zero)",
+            "y : Nat := Succ(Succ(Zero))",
         ],
     );
     let result = typecheck(&lang, good);
@@ -247,7 +247,7 @@ fn dependent_constructors_check_arguments() {
         &lang,
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
-            "x : Nat = Succ(3)",
+            "x : Nat := Succ(3)",
         ],
     );
     let result = typecheck(&lang, bad);
@@ -267,7 +267,7 @@ fn dependent_constructors_reject_wrong_indices() {
 
     let wrong_len = parse_block(
         &lang,
-        &[decl, "v : Vec(3, Bool) = VCons(true, VCons(false, VNil))"],
+        &[decl, "v : Vec(3, Bool) := VCons(true, VCons(false, VNil))"],
     );
     let result = typecheck(&lang, wrong_len);
     assert!(
@@ -275,7 +275,7 @@ fn dependent_constructors_reject_wrong_indices() {
         "a 2-element vector should not check at Vec(3, Bool)"
     );
 
-    let wrong_elem = parse_block(&lang, &[decl, "v : Vec(2, Bool) = VCons(\"s\", VNil)"]);
+    let wrong_elem = parse_block(&lang, &[decl, "v : Vec(2, Bool) := VCons(\"s\", VNil)"]);
     let result = typecheck(&lang, wrong_elem);
     assert!(
         has_error(&result),
@@ -292,7 +292,7 @@ fn dependent_family_unifies_inside_function() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "f : Nat ~> Vec(1 + 1, Bool) = n ~> VCons(true, VCons(false, VNil))",
+            "f : Nat ~> Vec(1 + 1, Bool) := n ~> VCons(true, VCons(false, VNil))",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -317,11 +317,11 @@ fn succ_index_bridges_to_arithmetic() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "fwd : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 1, Bool))) = n ~> v ~> v",
-            "bwd : Pi(Nat, n ~> Pi(Vec(n + 1, Bool), v ~> Vec(Succ(n), Bool))) = n ~> v ~> v",
-            "nested : Pi(Nat, n ~> Pi(Vec(Succ(Succ(n)), Bool), v ~> Vec(n + 2, Bool))) = n ~> v ~> v",
-            "one : Vec(Succ(Zero), Bool) = VCons(true, VNil)",
-            "nil : Vec(Zero, Bool) = VNil",
+            "fwd : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 1, Bool))) := n ~> v ~> v",
+            "bwd : Pi(Nat, n ~> Pi(Vec(n + 1, Bool), v ~> Vec(Succ(n), Bool))) := n ~> v ~> v",
+            "nested : Pi(Nat, n ~> Pi(Vec(Succ(Succ(n)), Bool), v ~> Vec(n + 2, Bool))) := n ~> v ~> v",
+            "one : Vec(Succ(Zero), Bool) := VCons(true, VNil)",
+            "nil : Vec(Zero, Bool) := VNil",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -345,7 +345,7 @@ fn match_on_succ_indexed_scrutinee_refines() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VCons(x, xs): x }",
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) := n ~> v ~> match v { VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -373,7 +373,7 @@ fn succ_projection_keeps_decided_contract() {
         &[
             decls[0],
             decls[1],
-            "bad : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 2, Bool))) = n ~> v ~> v",
+            "bad : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Vec(n + 2, Bool))) := n ~> v ~> v",
         ],
     );
     let result = typecheck(&lang, off_by_one);
@@ -386,7 +386,7 @@ fn succ_projection_keeps_decided_contract() {
         &[
             decls[0],
             decls[1],
-            "bad : Vec(Succ(Zero), Bool) = VCons(true, VCons(false, VNil))",
+            "bad : Vec(Succ(Zero), Bool) := VCons(true, VCons(false, VNil))",
         ],
     );
     let result = typecheck(&lang, decided);
@@ -401,7 +401,7 @@ fn succ_projection_keeps_decided_contract() {
         &[
             decls[0],
             decls[1],
-            "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Vec(n + 1, Bool)))) = f ~> n ~> v ~> v",
+            "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Vec(n + 1, Bool)))) := f ~> n ~> v ~> v",
         ],
     );
     let result = typecheck(&lang, opaque);
@@ -422,7 +422,7 @@ fn match_constructor_patterns_bind_arguments() {
         &lang,
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
-            "f = v ~> match v { Zero: Zero, Succ(p): p }",
+            "f := v ~> match v { Zero: Zero, Succ(p): p }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -452,7 +452,7 @@ fn match_refines_scrutinee_index_per_branch() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: v, VCons(x, xs): v }",
+            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) := n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: v, VCons(x, xs): v }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -476,8 +476,8 @@ fn match_refinement_solves_linear_index() {
         &lang,
         &[
             decl,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "g : Bool = match v { VCons(x, xs): match xs { VCons(y, ys): y } }",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "g : Bool := match v { VCons(x, xs): match xs { VCons(y, ys): y } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -506,8 +506,8 @@ fn match_auto_discharges_decided_impossible_arm() {
         &lang,
         &[
             decl,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "ok : Bool = match v { VNil: VNil, VCons(x, xs): x }",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "ok : Bool := match v { VNil: VNil, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, direct);
@@ -522,8 +522,8 @@ fn match_auto_discharges_decided_impossible_arm() {
         &lang,
         &[
             decl,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "ok : Bool = match v { VCons(x, xs): match xs { VNil: VNil, VCons(y, ys): y } }",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "ok : Bool := match v { VCons(x, xs): match xs { VNil: VNil, VCons(y, ys): y } }",
         ],
     );
     let result = typecheck(&lang, nested);
@@ -540,8 +540,8 @@ fn match_auto_discharges_decided_impossible_arm() {
         &lang,
         &[
             decl,
-            "v : Vec(1, Bool) = VCons(true, VNil)",
-            "bad : Bool = match v { VCons(x, xs): VNil, VNil: true }",
+            "v : Vec(1, Bool) := VCons(true, VNil)",
+            "bad : Bool := match v { VCons(x, xs): VNil, VNil: true }",
         ],
     );
     let result = typecheck(&lang, live);
@@ -566,7 +566,7 @@ fn transport_consumes_branch_path_witness() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: eq_n # v, VCons(x, xs): eq_n # v }",
+            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) := n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: eq_n # v, VCons(x, xs): eq_n # v }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -587,7 +587,7 @@ fn transport_consumes_branch_path_witness() {
     );
 }
 
-/// `refl` is the identity path: `p : Path(2, 2) = refl` checks (the
+/// `refl` is the identity path: `p : Path(2, 2) := refl` checks (the
 /// endpoints unify), `p # v` transports `v` along it, and a bare `refl`
 /// in transport position is the identity coercion.
 #[test]
@@ -597,10 +597,10 @@ fn refl_is_the_identity_path() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "p : Path(2, 2) = refl",
-            "w : Vec(2, Bool) = p # v",
-            "w2 : Vec(2, Bool) = refl # v",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "p : Path(2, 2) := refl",
+            "w : Vec(2, Bool) := p # v",
+            "w2 : Vec(2, Bool) := refl # v",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -623,8 +623,8 @@ fn transport_rejects_non_path_and_absent_paths() {
         &lang,
         &[
             decl,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "bad : Vec(2, Bool) = 5 # v",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "bad : Vec(2, Bool) := 5 # v",
         ],
     );
     let result = typecheck(&lang, num_path);
@@ -637,8 +637,8 @@ fn transport_rejects_non_path_and_absent_paths() {
         &lang,
         &[
             decl,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "bad : Vec(2, Bool) = v # v",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "bad : Vec(2, Bool) := v # v",
         ],
     );
     let result = typecheck(&lang, vec_path);
@@ -651,8 +651,8 @@ fn transport_rejects_non_path_and_absent_paths() {
         &lang,
         &[
             decl,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "bad : Vec(2, Bool) = nosuchpath # v",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "bad : Vec(2, Bool) := nosuchpath # v",
         ],
     );
     let result = typecheck(&lang, unbound);
@@ -661,7 +661,7 @@ fn transport_rejects_non_path_and_absent_paths() {
         "an absent path should be rejected — nosuchpath # v"
     );
 
-    let bad_refl = parse_block(&lang, &[decl, "bad : Path(2, 3) = refl"]);
+    let bad_refl = parse_block(&lang, &[decl, "bad : Path(2, 3) := refl"]);
     let result = typecheck(&lang, bad_refl);
     assert!(
         has_error(&result),
@@ -688,7 +688,7 @@ fn j_eliminates_branch_path_through_motive() {
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
             "_motive := (i2, w2) ~> Vec(i2, Bool)",
-            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, _motive, v, VCons(x, xs): J eq_n, _motive, v }",
+            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) := n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, _motive, v, VCons(x, xs): J eq_n, _motive, v }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -708,7 +708,7 @@ fn j_surface_literal_motive() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) = n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, (i2, w2) ~> Vec(i2, Bool), v, VCons(x, xs): J eq_n, (i2, w2) ~> Vec(i2, Bool), v }",
+            "id_vec : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Vec(n + 0, Bool))) := n ~> v ~> match v return (i, w) ~> Vec(i, Bool) with { VNil: J eq_n, (i2, w2) ~> Vec(i2, Bool), v, VCons(x, xs): J eq_n, (i2, w2) ~> Vec(i2, Bool), v }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -735,8 +735,8 @@ fn nonlinear_product_solves_by_exact_division() {
         &lang,
         &[
             decl,
-            "d : Dbl(6) = MkDbl(7)",
-            "r : Nat = match d { MkDbl(x): x }",
+            "d : Dbl(6) := MkDbl(7)",
+            "r : Nat := match d { MkDbl(x): x }",
         ],
     );
     let result = typecheck(&lang, good);
@@ -746,7 +746,7 @@ fn nonlinear_product_solves_by_exact_division() {
         diags_of(&result)
     );
 
-    let bad = parse_block(&lang, &[decl, "d : Dbl(5) = MkDbl(7)"]);
+    let bad = parse_block(&lang, &[decl, "d : Dbl(5) := MkDbl(7)"]);
     let result = typecheck(&lang, bad);
     assert!(
         has_error(&result),
@@ -767,7 +767,7 @@ fn nonlinear_square_and_pow_solve_by_integer_root() {
 
     let good = parse_block(
         &lang,
-        &[sq, cube, "s : Sq(9) = MkSq(7)", "c : Cube(8) = MkCube(1)"],
+        &[sq, cube, "s : Sq(9) := MkSq(7)", "c : Cube(8) := MkCube(1)"],
     );
     let result = typecheck(&lang, good);
     assert!(
@@ -776,14 +776,14 @@ fn nonlinear_square_and_pow_solve_by_integer_root() {
         diags_of(&result)
     );
 
-    let bad_sq = parse_block(&lang, &[sq, "s : Sq(8) = MkSq(7)"]);
+    let bad_sq = parse_block(&lang, &[sq, "s : Sq(8) := MkSq(7)"]);
     let result = typecheck(&lang, bad_sq);
     assert!(
         has_error(&result),
         "?n * ?n ≡ 8 has no integer root — decided failure"
     );
 
-    let bad_cube = parse_block(&lang, &[cube, "c : Cube(9) = MkCube(1)"]);
+    let bad_cube = parse_block(&lang, &[cube, "c : Cube(9) := MkCube(1)"]);
     let result = typecheck(&lang, bad_cube);
     assert!(
         has_error(&result),
@@ -804,13 +804,13 @@ fn type_alias_expands_transparently() {
         &lang,
         &[
             "type.Score := Nat",
-            "s : Score = 3",
+            "s : Score := 3",
             "type.Id(A) := A",
-            "x : Id(Nat) = 4",
-            "y : type.Id(Bool) = true",
+            "x : Id(Nat) := 4",
+            "y : type.Id(Bool) := true",
             "type.Pair(A, B) := (A, B)",
-            "p : Pair(Nat, Bool) = (1, true)",
-            "q : Pair(Nat, Bool) = p",
+            "p : Pair(Nat, Bool) := (1, true)",
+            "q : Pair(Nat, Bool) := p",
         ],
     );
     let result = typecheck(&lang, good);
@@ -820,7 +820,7 @@ fn type_alias_expands_transparently() {
         diags_of(&result)
     );
 
-    let bad = parse_block(&lang, &["type.Id(A) := A", "x : Id(Bool) = 3"]);
+    let bad = parse_block(&lang, &["type.Id(A) := A", "x : Id(Bool) := 3"]);
     let result = typecheck(&lang, bad);
     assert!(
         has_error(&result),
@@ -829,7 +829,7 @@ fn type_alias_expands_transparently() {
 
     let bad_tuple = parse_block(
         &lang,
-        &["type.Pair(A, B) := (A, B)", "p : Pair(Nat, Bool) = (1, 2)"],
+        &["type.Pair(A, B) := (A, B)", "p : Pair(Nat, Bool) := (1, 2)"],
     );
     let result = typecheck(&lang, bad_tuple);
     assert!(
@@ -849,8 +849,8 @@ fn io_signature_subtyping() {
     let good = parse_block(
         &lang,
         &[
-            "narrow : IO<{ puts: Str ~> Unit }> ~> IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> = x ~> x",
-            "top : IO<{ puts: Str ~> Unit }> ~> IO = x ~> x",
+            "narrow : IO<{ puts: Str ~> Unit }> ~> IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> := x ~> x",
+            "top : IO<{ puts: Str ~> Unit }> ~> IO := x ~> x",
         ],
     );
     let result = typecheck(&lang, good);
@@ -863,7 +863,7 @@ fn io_signature_subtyping() {
     let bad = parse_block(
         &lang,
         &[
-            "widen : IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> ~> IO<{ puts: Str ~> Unit }> = x ~> x",
+            "widen : IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> ~> IO<{ puts: Str ~> Unit }> := x ~> x",
         ],
     );
     let result = typecheck(&lang, bad);
@@ -890,8 +890,8 @@ fn absurd_discharges_decided_impossible_arm() {
         &lang,
         &[
             vec,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "x : Bool = match v { VNil: absurd, VCons(h, t): h }",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "x : Bool := match v { VNil: absurd, VCons(h, t): h }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -905,7 +905,7 @@ fn absurd_discharges_decided_impossible_arm() {
         &lang,
         &[
             dbl,
-            "f : Pi(Dbl(5), d ~> Nat) = d ~> match d { MkDbl(x): absurd, y: 0 }",
+            "f : Pi(Dbl(5), d ~> Nat) := d ~> match d { MkDbl(x): absurd, y: 0 }",
         ],
     );
     let result = typecheck(&lang, nonlinear);
@@ -931,8 +931,8 @@ fn absurd_rejects_reachable_arm() {
         &lang,
         &[
             vec,
-            "v : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "bad : Bool = match v { VCons(x, xs): absurd }",
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "bad : Bool := match v { VCons(x, xs): absurd }",
         ],
     );
     let result = typecheck(&lang, reachable);
@@ -945,8 +945,8 @@ fn absurd_rejects_reachable_arm() {
         &lang,
         &[
             vec,
-            "v0 : Vec(0, Bool) = VNil",
-            "bad : Bool = match v0 { VNil: absurd }",
+            "v0 : Vec(0, Bool) := VNil",
+            "bad : Bool := match v0 { VNil: absurd }",
         ],
     );
     let result = typecheck(&lang, exact);
@@ -959,7 +959,7 @@ fn absurd_rejects_reachable_arm() {
         &lang,
         &[
             vec,
-            "f : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Bool)) = n ~> v ~> match v { VNil: absurd, VCons(x, xs): x }",
+            "f : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Bool)) := n ~> v ~> match v { VNil: absurd, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, rigid);
@@ -991,7 +991,7 @@ fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
         &[
             decls[0],
             decls[1],
-            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VCons(x, xs): x }",
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) := n ~> v ~> match v { VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, head);
@@ -1006,7 +1006,7 @@ fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
         &[
             decls[0],
             decls[1],
-            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VNil: absurd, VCons(x, xs): x }",
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) := n ~> v ~> match v { VNil: absurd, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, with_absurd);
@@ -1024,7 +1024,7 @@ fn match_succ_indexed_scrutinee_is_exhaustive_without_catchall() {
         &[
             decls[0],
             decls[1],
-            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) = n ~> v ~> match v { VNil: VNil, VCons(x, xs): x }",
+            "head : Pi(Nat, n ~> Pi(Vec(Succ(n), Bool), v ~> Bool)) := n ~> v ~> match v { VNil: VNil, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, stray);
@@ -1058,7 +1058,7 @@ fn match_auto_discharge_zipwith_shape() {
             // resolves to the `Nat` sort — see collections.hnl's gap
             // log); the VCons arm's `n ↦ ?k + 1` rewrite then reaches
             // the inner match's scrutinee.
-            "zw : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Pi(Vec(n + 0, Bool), w ~> Bool))) = n ~> v ~> w ~> match v { VNil: true, VCons(x, xs): match w { VNil: VNil, VCons(y, ys): y } }",
+            "zw : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Pi(Vec(n + 0, Bool), w ~> Bool))) := n ~> v ~> w ~> match v { VNil: true, VCons(x, xs): match w { VNil: VNil, VCons(y, ys): y } }",
         ],
     );
     let result = typecheck(&lang, zip);
@@ -1085,7 +1085,7 @@ fn nested_absurd_inner_match_checks() {
         &[
             decls[0],
             decls[1],
-            "zw : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Pi(Vec(n + 0, Bool), w ~> Bool))) = n ~> v ~> w ~> match v { VNil: true, VCons(x, xs): match w { VNil: absurd, VCons(y, ys): y } }",
+            "zw : Pi(Nat, n ~> Pi(Vec(n + 0, Bool), v ~> Pi(Vec(n + 0, Bool), w ~> Bool))) := n ~> v ~> w ~> match v { VNil: true, VCons(x, xs): match w { VNil: absurd, VCons(y, ys): y } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1112,7 +1112,7 @@ fn export_implicit_binders_abstract_index() {
         &[
             decls[0],
             decls[1],
-            "export zw<n> : Vec<n, Bool> ~> Vec<n, Bool> ~> Bool = xs ~> ys ~> match xs { VNil: true, VCons(x, t): match ys { VNil: absurd, VCons(y, u): false } }",
+            "export zw<n> : Vec<n, Bool> ~> Vec<n, Bool> ~> Bool := xs ~> ys ~> match xs { VNil: true, VCons(x, t): match ys { VNil: absurd, VCons(y, u): false } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1139,7 +1139,7 @@ fn export_zipwith_recursive_body_checks() {
         &[
             decls[0],
             decls[1],
-            "export zw<n, a, b, c> : (a ~> b ~> c) ~> Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> = f ~> xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): VCons(f(x)(y), zw(f)(t)(u)) } }",
+            "export zw<n, a, b, c> : (a ~> b ~> c) ~> Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> := f ~> xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): VCons(f(x)(y), zw(f)(t)(u)) } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1156,7 +1156,7 @@ fn export_zipwith_recursive_body_checks() {
         &[
             decls[0],
             decls[1],
-            "export zw<n, a, b, c> : Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> = xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): VCons(y, t) } }",
+            "export zw<n, a, b, c> : Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> := xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): VCons(y, t) } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1181,7 +1181,7 @@ fn export_zipwith_wrong_result_errors() {
         &[
             decls[0],
             decls[1],
-            "export zw<n, a, b, c> : (a ~> b ~> c) ~> Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> = f ~> xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): false } }",
+            "export zw<n, a, b, c> : (a ~> b ~> c) ~> Vec<n, a> ~> Vec<n, b> ~> Vec<n, c> := f ~> xs ~> ys ~> match xs { VNil: VNil, VCons(x, t): match ys { VNil: absurd, VCons(y, u): false } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1209,7 +1209,7 @@ fn sigma_destructure_repack_index() {
         &[
             decls[0],
             decls[1],
-            "export filter2<n, a> : (a ~> Bool) ~> Vec<n, a> ~> Sigma(Nat, m ~> Vec(m, a)) = f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter2(f)(xs) { [m, ys]: [Succ(m), VCons(x, ys)] } }",
+            "export filter2<n, a> : (a ~> Bool) ~> Vec<n, a> ~> Sigma(Nat, m ~> Vec(m, a)) := f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter2(f)(xs) { [m, ys]: [Succ(m), VCons(x, ys)] } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1226,7 +1226,7 @@ fn sigma_destructure_repack_index() {
         &[
             decls[0],
             decls[1],
-            "export filter3<n, a> : (a ~> Bool) ~> Vec<n, a> ~> Sigma(Nat, m ~> Vec(m, a)) = f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter3(f)(xs) { [m, ys]: if f(x) { [Succ(m), VCons(x, ys)] } else { [m, ys] } } }",
+            "export filter3<n, a> : (a ~> Bool) ~> Vec<n, a> ~> Sigma(Nat, m ~> Vec(m, a)) := f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter3(f)(xs) { [m, ys]: if f(x) { [Succ(m), VCons(x, ys)] } else { [m, ys] } } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1252,7 +1252,7 @@ fn sigma_destructure_wrong_payload_errors() {
         &[
             decls[0],
             decls[1],
-            "export bump<a> : Sigma(Nat, m ~> Vec(m, a)) ~> Sigma(Nat, k ~> Vec(k, a)) = s ~> match s { [m, ys]: [Succ(m), VCons(Zero, VNil)] }",
+            "export bump<a> : Sigma(Nat, m ~> Vec(m, a)) ~> Sigma(Nat, k ~> Vec(k, a)) := s ~> match s { [m, ys]: [Succ(m), VCons(Zero, VNil)] }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1281,10 +1281,10 @@ fn exists_sugar_mints_sigma() {
             decls[1],
             // `exists` in a plain annotation — the pair intro checks
             // against the minted `type.sigma` exactly like `Sigma(...)`.
-            "one_vec : exists m : Nat, Vec(m, Bool) = [Succ(Zero), VCons(true, VNil)]",
+            "one_vec : exists m : Nat, Vec(m, Bool) := [Succ(Zero), VCons(true, VNil)]",
             // `exists` in an arrow codomain — the `filter` shape where
             // the output length can't be named.
-            "export single_vec<a> : a ~> exists m : Nat, Vec(m, a) = x ~> [Succ(Zero), VCons(x, VNil)]",
+            "export single_vec<a> : a ~> exists m : Nat, Vec(m, a) := x ~> [Succ(Zero), VCons(x, VNil)]",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1311,7 +1311,7 @@ fn exists_sugar_filter_repro() {
         &[
             decls[0],
             decls[1],
-            "export filter<n, a> : (a ~> Bool) ~> Vec<n, a> ~> exists m : Nat, Vec(m, a) = f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter(f)(xs) { [m, ys]: if f(x) { [Succ(m), VCons(x, ys)] } else { [m, ys] } } }",
+            "export filter<n, a> : (a ~> Bool) ~> Vec<n, a> ~> exists m : Nat, Vec(m, a) := f ~> v ~> match v { VNil: [Zero, VNil], VCons(x, xs): match filter(f)(xs) { [m, ys]: if f(x) { [Succ(m), VCons(x, ys)] } else { [m, ys] } } }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1337,7 +1337,7 @@ fn exists_sugar_wrong_payload_errors() {
         &[
             decls[0],
             decls[1],
-            "export bump<a> : (exists m : Nat, Vec(m, a)) ~> exists k : Nat, Vec(k, a) = s ~> match s { [m, ys]: [Succ(m), VCons(Zero, VNil)] }",
+            "export bump<a> : (exists m : Nat, Vec(m, a)) ~> exists k : Nat, Vec(k, a) := s ~> match s { [m, ys]: [Succ(m), VCons(Zero, VNil)] }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1364,7 +1364,7 @@ fn match_split_tree_decides_n_plus_m_coverage() {
         &[
             decls[0],
             decls[1],
-            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) = n ~> m ~> v ~> match v { VNil: true, VCons(x, xs): x }",
+            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) := n ~> m ~> v ~> match v { VNil: true, VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, good);
@@ -1379,7 +1379,7 @@ fn match_split_tree_decides_n_plus_m_coverage() {
         &[
             decls[0],
             decls[1],
-            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) = n ~> m ~> v ~> match v { VCons(x, xs): x }",
+            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) := n ~> m ~> v ~> match v { VCons(x, xs): x }",
         ],
     );
     let result = typecheck(&lang, missing_nil);
@@ -1397,7 +1397,7 @@ fn match_split_tree_decides_n_plus_m_coverage() {
         &[
             decls[0],
             decls[1],
-            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) = n ~> m ~> v ~> match v { VNil: true }",
+            "f : Pi(Nat, n ~> Pi(Nat, m ~> Pi(Vec(n + m, Bool), v ~> Bool))) := n ~> m ~> v ~> match v { VNil: true }",
         ],
     );
     let result = typecheck(&lang, missing_cons);
@@ -1422,8 +1422,8 @@ fn match_literal_zero_index_needs_no_vcons_arm() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "v0 : Vec(0, Bool) = VNil",
-            "x : Bool = match v0 { VNil: true }",
+            "v0 : Vec(0, Bool) := VNil",
+            "x : Bool := match v0 { VNil: true }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1444,8 +1444,8 @@ fn match_enum_scrutinee_requires_all_ctors_or_catchall() {
         &lang,
         &[
             "Bool := { True : Bool, False : Bool }",
-            "b : Bool = True",
-            "x : Nat = match b { True: 1 }",
+            "b : Bool := True",
+            "x : Nat := match b { True: 1 }",
         ],
     );
     let result = typecheck(&lang, missing);
@@ -1462,8 +1462,8 @@ fn match_enum_scrutinee_requires_all_ctors_or_catchall() {
         &lang,
         &[
             "Bool := { True : Bool, False : Bool }",
-            "b : Bool = True",
-            "x : Nat = match b { True: 1, _: 0 }",
+            "b : Bool := True",
+            "x : Nat := match b { True: 1, _: 0 }",
         ],
     );
     let result = typecheck(&lang, caught);
@@ -1487,7 +1487,7 @@ fn match_undecided_coverage_warns_not_errors() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Bool))) = f ~> n ~> v ~> match v { VNil: true }",
+            "g : Pi(Nat ~> Nat, f ~> Pi(Nat, n ~> Pi(Vec(f(n), Bool), v ~> Bool))) := f ~> n ~> v ~> match v { VNil: true }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1590,9 +1590,9 @@ fn handle_covered_op_returns_impl_result() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
-            "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
-            "x : IO<{ puts: Unit }> = handle print(\"x\") with {puts: puts_impl}",
+            "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
+            "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
+            "x : IO<{ puts: Unit }> := handle print(\"x\") with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1610,8 +1610,8 @@ fn handle_covered_op_returns_impl_result() {
 fn handle_missing_required_op_errors() {
     let lang = canonical_lang();
     let decls = [
-        "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
-        "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
+        "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
+        "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
     ];
     let spurious = parse_block(
         &lang,
@@ -1642,13 +1642,13 @@ fn handle_uncovered_op_passes_through_as_io() {
     let ast = parse_block(
         &lang,
         &[
-            "send : String ~> IO<{ puts: String ~> Unit, gets: String ~> Unit }> = s ~> send(s)",
-            "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
+            "send : String ~> IO<{ puts: String ~> Unit, gets: String ~> Unit }> := s ~> send(s)",
+            "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
             // `gets` uncovered → stays an op in the residual;
             // `puts` covered → its entry is replaced by the impl's
             // `Unit` return (annotating `puts: Unit` proves the
             // replacement — a stale `String ~> Unit` would fail conv).
-            "x : IO<{ puts: Unit, gets: String ~> Unit }> = handle send(\"x\") with {puts: puts_impl}",
+            "x : IO<{ puts: Unit, gets: String ~> Unit }> := handle send(\"x\") with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1668,9 +1668,9 @@ fn handle_arrow_codomain_checked() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
-            "puts_impl : (String ~> Unit) ~> Unit = req ~> req(\"x\")",
-            "handled_print : String ~> IO<{ puts: Unit }> = handle print with {puts: puts_impl}",
+            "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
+            "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
+            "handled_print : String ~> IO<{ puts: Unit }> := handle print with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1692,9 +1692,9 @@ fn perform_mints_io_sig_from_op_name() {
     let ast = parse_block(
         &lang,
         &[
-            "x : IO<{ puts: Str }> = perform(puts, \"hi\")",
-            "y : IO<{ puts: Str }> = io.perform(puts, \"hi\")",
-            "z : IO<{ fs: Str }> = perform(\"fs\", \"path\")",
+            "x : IO<{ puts: Str }> := perform(puts, \"hi\")",
+            "y : IO<{ puts: Str }> := io.perform(puts, \"hi\")",
+            "z : IO<{ fs: Str }> := perform(\"fs\", \"path\")",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1710,7 +1710,7 @@ fn perform_mints_io_sig_from_op_name() {
 #[test]
 fn perform_wrong_sig_entry_errors() {
     let lang = canonical_lang();
-    let ast = parse_block(&lang, &["x : IO<{ puts: Nat }> = perform(puts, \"hi\")"]);
+    let ast = parse_block(&lang, &["x : IO<{ puts: Nat }> := perform(puts, \"hi\")"]);
     let result = typecheck(&lang, ast);
     assert!(
         has_error(&result),
@@ -1728,8 +1728,8 @@ fn perform_through_handle_checks_sig_coverage() {
     let ok = parse_block(
         &lang,
         &[
-            "puts_impl : Str ~> Str = s ~> s",
-            "x : IO<{ puts: Str }> = handle perform(puts, \"hi\") with {puts: puts_impl}",
+            "puts_impl : Str ~> Str := s ~> s",
+            "x : IO<{ puts: Str }> := handle perform(puts, \"hi\") with {puts: puts_impl}",
         ],
     );
     let result = typecheck(&lang, ok);
@@ -1744,7 +1744,7 @@ fn perform_through_handle_checks_sig_coverage() {
     let spurious = parse_block(
         &lang,
         &[
-            "puts_impl : Str ~> Str = s ~> s",
+            "puts_impl : Str ~> Str := s ~> s",
             "z := handle perform(puts, \"hi\") with {fs: puts_impl}",
         ],
     );
@@ -1787,8 +1787,8 @@ fn perform_is_shadowable() {
     let ast = parse_block(
         &lang,
         &[
-            "perform : Str ~> Str ~> Str = a ~> b ~> a",
-            "x : Str = perform(\"a\", \"b\")",
+            "perform : Str ~> Str ~> Str := a ~> b ~> a",
+            "x : Str := perform(\"a\", \"b\")",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1808,11 +1808,11 @@ fn sig_row_polymorphism_solves_meta() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO<{ puts: String ~> Unit }> = s ~> print(s)",
-            "id_io<s> : (String ~> IO(s)) ~> String ~> IO(s) = f ~> x ~> f(x)",
-            "y : IO<{ puts: String ~> Unit }> = id_io(print)(\"x\")",
-            "id_sig<s : Sig> : (String ~> IO(s)) ~> String ~> IO(s) = f ~> x ~> f(x)",
-            "z : IO<{ puts: String ~> Unit }> = id_sig(print)(\"x\")",
+            "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
+            "id_io<s> : (String ~> IO(s)) ~> String ~> IO(s) := f ~> x ~> f(x)",
+            "y : IO<{ puts: String ~> Unit }> := id_io(print)(\"x\")",
+            "id_sig<s : Sig> : (String ~> IO(s)) ~> String ~> IO(s) := f ~> x ~> f(x)",
+            "z : IO<{ puts: String ~> Unit }> := id_sig(print)(\"x\")",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1970,8 +1970,8 @@ fn io_bare_name_sig_checks_coverage() {
     let ast = parse_block(
         &lang,
         &[
-            "print : String ~> IO<{ puts }> = s ~> print(s)",
-            "x : IO<{ puts }> = handle print(\"x\") with {puts: (s) ~> s}",
+            "print : String ~> IO<{ puts }> := s ~> print(s)",
+            "x : IO<{ puts }> := handle print(\"x\") with {puts: (s) ~> s}",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -1994,7 +1994,7 @@ fn commuted_sum_index_unifies_through_metas() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "append<n, m, a> : Vec<n, a> ~> Vec<m, a> ~> Vec<n + m, a> = xs ~> ys ~> match xs { VNil: ys, VCons(x, t): VCons(x, append(t)(ys)) }",
+            "append<n, m, a> : Vec<n, a> ~> Vec<m, a> ~> Vec<n + m, a> := xs ~> ys ~> match xs { VNil: ys, VCons(x, t): VCons(x, append(t)(ys)) }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -2018,8 +2018,8 @@ fn implicit_binder_names_scope_into_body_annotation() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "f<n, a> : Vec<n, a> ~> Vec<n, a> = v ~> (v : Vec(n, a))",
-            "g<n, a> : Vec<n + 1, a> ~> Vec<n + 1, a> = v ~> match (v : Vec(n + 1, a)) { VCons(x, xs): xs }",
+            "f<n, a> : Vec<n, a> ~> Vec<n, a> := v ~> (v : Vec(n, a))",
+            "g<n, a> : Vec<n + 1, a> ~> Vec<n + 1, a> := v ~> match (v : Vec(n + 1, a)) { VCons(x, xs): xs }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -2043,9 +2043,9 @@ fn family_rec_resolves_eliminator_type() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
-            "v1 : Vec(2, Bool) = VCons(true, VCons(false, VNil))",
-            "step : Bool ~> Vec(1, Bool) ~> Number ~> Number = x ~> xs ~> ih ~> ih + 1",
-            "len : Number = Vec.rec(null, 0, step)(2, Bool, v1)",
+            "v1 : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "step : Bool ~> Vec(1, Bool) ~> Number ~> Number := x ~> xs ~> ih ~> ih + 1",
+            "len : Number := Vec.rec(null, 0, step)(2, Bool, v1)",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -2071,7 +2071,7 @@ fn annotated_arm_family_params_dont_shadow_rigids() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (k : Nat, x : a, xs : Vec(k, a)) ~> Vec(k + 1, a) }",
-            "push<n, a> : a ~> Vec<n, a> ~> Vec<n + 1, a> = x ~> v ~> match v { VNil: VCons(0, x, VNil), VCons(k, x2, xs): VCons(k + 1, x2, v) }",
+            "push<n, a> : a ~> Vec<n, a> ~> Vec<n + 1, a> := x ~> v ~> match v { VNil: VCons(0, x, VNil), VCons(k, x2, xs): VCons(k + 1, x2, v) }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -2092,8 +2092,8 @@ fn annotated_arm_elem_param_scopes_cleanly() {
         &lang,
         &[
             "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (k : Nat, x : a, xs : Vec(k, a)) ~> Vec(k + 1, a) }",
-            "dup<n, a> : Vec<n, a> ~> Vec<n, a> = v ~> match v { VNil: VNil, VCons(k, x, xs): VCons(k, x, xs) }",
-            "bump<n> : Vec<n, Bool> ~> Vec<n + 1, Bool> = v ~> match v { VNil: VCons(0, true, VNil), VCons(k, x, xs): VCons(k + 1, x, v) }",
+            "dup<n, a> : Vec<n, a> ~> Vec<n, a> := v ~> match v { VNil: VNil, VCons(k, x, xs): VCons(k, x, xs) }",
+            "bump<n> : Vec<n, Bool> ~> Vec<n + 1, Bool> := v ~> match v { VNil: VCons(0, true, VNil), VCons(k, x, xs): VCons(k + 1, x, v) }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -2115,7 +2115,7 @@ fn unannotated_ctor_result_index_is_decided_mismatch() {
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "Vec<n : Nat, a : Type> := { VNil : Vec, VCons : (k : Nat, x : a, xs : Vec(k, a)) ~> Vec }",
-            "v : Vec(5, Bool) = VCons(Zero, true, VNil)",
+            "v : Vec(5, Bool) := VCons(Zero, true, VNil)",
         ],
     );
     let result = typecheck(&lang, ast);

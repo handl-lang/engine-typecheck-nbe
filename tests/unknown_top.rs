@@ -84,7 +84,7 @@ fn ok(src: &str) -> hnl_tool_typecheck::TypecheckResult {
 /// `while` result is an inferred-`unknown` source.
 #[test]
 fn unknown_operand_arith_eq_if() {
-    ok("x : type.unknown = 3\ny := x + 1\nz := x == 1\nw := if x { 1 } else { 2 }");
+    ok("x : type.unknown := 3\ny := x + 1\nz := x == 1\nw := if x { 1 } else { 2 }");
 }
 
 /// `x : type.unknown = v` binds `x` at `type.unknown`: the annotation
@@ -92,7 +92,7 @@ fn unknown_operand_arith_eq_if() {
 /// static typing explicitly).
 #[test]
 fn unknown_annotation_binds_unknown_and_warns() {
-    let res = ok("x : type.unknown = 3\nx + 1");
+    let res = ok("x : type.unknown := 3\nx + 1");
     assert!(
         res.diagnostics
             .iter()
@@ -107,7 +107,7 @@ fn unknown_annotation_binds_unknown_and_warns() {
 /// `unknown` on the *synthesized* side).
 #[test]
 fn unknown_checks_against_concrete_annotation() {
-    ok("x : type.unknown = 3\na : Str = x\nb : Number = x");
+    ok("x : type.unknown := 3\na : Str := x\nb : Number := x");
 }
 
 /// A `while` result (inferred `unknown` — no warning expected) flows
@@ -135,21 +135,21 @@ fn inferred_unknown_from_while_flows() {
 /// field access.
 #[test]
 fn unknown_projection_and_index_stay_unknown() {
-    ok("x : type.unknown = 3\nf := x.field\ni := x[0]\ng := f + 1");
+    ok("x : type.unknown := 3\nf := x.field\ni := x[0]\ng := f + 1");
 }
 
 /// Applying an `unknown` callee yields `unknown` (pre-existing arm),
 /// and passing `unknown` as an argument typechecks.
 #[test]
 fn unknown_callee_and_argument() {
-    ok("x : type.unknown = 3\nf : Number ~> Number = n ~> n\nr := f(x)\ns := x(1)");
+    ok("x : type.unknown := 3\nf : Number ~> Number := n ~> n\nr := f(x)\ns := x(1)");
 }
 
 /// `match` arms of mixed `unknown`/concrete type join — the report's
 /// `toStr` case (`expected Unknown, got Str`).
 #[test]
 fn unknown_match_arm_join() {
-    ok("x : type.unknown = 3\nm := match x { _: \"s\", J: x }");
+    ok("x : type.unknown := 3\nm := match x { _: \"s\", J: x }");
 }
 
 // --- controls: unknown must not mask real mismatches ----------------------
@@ -158,7 +158,7 @@ fn unknown_match_arm_join() {
 /// a blanket wildcard.
 #[test]
 fn concrete_mismatch_still_fails() {
-    let e = err("x : Bool = 3");
+    let e = err("x : Bool := 3");
     assert!(
         e.contains("unify") || e.contains("expected"),
         "unexpected error: {e}"

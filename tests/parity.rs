@@ -271,27 +271,27 @@ fn parity_if_bool() {
 }
 
 // ===========================================================================
-// Part B-7: Block bindings (let was removed in v0.1; use `{ name = value; body }`)
+// Part B-7: Block bindings (let was removed in v0.1; use `{ name := value; body }`)
 // ===========================================================================
 
 #[test]
 fn parity_block_number() {
-    assert_eq!(tc("do { x = 42; x }"), t_number());
+    assert_eq!(tc("do { x := 42; x }"), t_number());
 }
 
 #[test]
 fn parity_block_string() {
-    assert_eq!(tc("do { x = 42; \"hello\" }"), t_string());
+    assert_eq!(tc("do { x := 42; \"hello\" }"), t_string());
 }
 
 #[test]
 fn parity_block_nested() {
-    assert_eq!(tc("do { x = 42; y = \"hello\"; y }"), t_string());
+    assert_eq!(tc("do { x := 42; y := \"hello\"; y }"), t_string());
 }
 
 #[test]
 fn parity_block_shadow() {
-    assert_eq!(tc("do { x = 1; x = \"hello\"; x }"), t_string());
+    assert_eq!(tc("do { x := 1; x := \"hello\"; x }"), t_string());
 }
 
 // ===========================================================================
@@ -317,7 +317,7 @@ fn t_array(element: Value) -> Value {
 
 #[test]
 fn parity_block_annotated_function_type() {
-    // `{ f: ((type.number) ~> type.number) = x ~> x; f }`
+    // `{ f: ((type.number) ~> type.number) := x ~> x; f }`
     // The annotation `((type.number) ~> type.number)` is a compound type
     // expression parsed as a `function` node; interpret_type_expr must
     // recurse into param (paren → field-access) and body (field-access).
@@ -325,18 +325,18 @@ fn parity_block_annotated_function_type() {
     // (bp 10/9), so the function-type annotation must be parenthesized to
     // prevent `~>` from escaping the type-annot's right operand.
     assert_eq!(
-        tc("do { f: ((type.number) ~> type.number) = x ~> x; f }"),
+        tc("do { f: ((type.number) ~> type.number) := x ~> x; f }"),
         t_function(t_number(), t_number())
     );
 }
 
 #[test]
 fn parity_block_annotated_array_type() {
-    // `{ xs: [type.number] = [1, 2, 3]; xs }`
+    // `{ xs: [type.number] := [1, 2, 3]; xs }`
     // The annotation `[type.number]` is a compound type expression parsed
     // as an `array` node; interpret_type_expr must recurse into the element.
     assert_eq!(
-        tc("do { xs: [type.number] = [1, 2, 3]; xs }"),
+        tc("do { xs: [type.number] := [1, 2, 3]; xs }"),
         t_array(t_number())
     );
 }
@@ -346,7 +346,7 @@ fn parity_block_annotated_nested_function_array() {
     // `((type.number) ~> [type.string])` — function returning an array.
     // Parenthesized because `:` (bp 12/13) binds tighter than `~>` (bp 10/9).
     assert_eq!(
-        tc("do { f: ((type.number) ~> [type.string]) = x ~> [\"a\"]; f }"),
+        tc("do { f: ((type.number) ~> [type.string]) := x ~> [\"a\"]; f }"),
         t_function(t_number(), t_array(t_string()))
     );
 }

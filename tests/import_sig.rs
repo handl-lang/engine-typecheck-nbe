@@ -89,7 +89,7 @@ fn tag(v: &Value) -> Option<&str> {
 fn import_binds_sig_record() {
     let lang = canonical_lang();
     // Wrap statements in a block so the module sees them in order.
-    let ast = parse(&lang, "do {\nimport mymod\nx = mymod.double\n}");
+    let ast = parse(&lang, "do {\nimport mymod\nx := mymod.double\n}");
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -109,7 +109,7 @@ fn import_binds_sig_record() {
 #[test]
 fn named_import_binds_field_projection() {
     let lang = canonical_lang();
-    let ast = parse(&lang, "do {\nfrom \"mymod\" import double as d\nx = d\n}");
+    let ast = parse(&lang, "do {\nfrom \"mymod\" import double as d\nx := d\n}");
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -128,7 +128,7 @@ fn star_import_splices_fields() {
     let lang = canonical_lang();
     let ast = parse(
         &lang,
-        "do {\nfrom \"mymod\" import *\nx = flag\ny = mymod.double\n}",
+        "do {\nfrom \"mymod\" import *\nx := flag\ny := mymod.double\n}",
     );
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
@@ -147,7 +147,7 @@ fn dynamic_import_is_unknown() {
     let lang = canonical_lang();
     let ast = parse(
         &lang,
-        "do {\nimport no_such_module_xyz\nx = no_such_module_xyz\n}",
+        "do {\nimport no_such_module_xyz\nx := no_such_module_xyz\n}",
     );
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
@@ -166,7 +166,7 @@ fn dynamic_import_is_unknown() {
 #[test]
 fn export_builds_module_signature() {
     let lang = canonical_lang();
-    let ast = parse(&lang, "do {\nx = 1\nexport x\n}");
+    let ast = parse(&lang, "do {\nx := 1\nexport x\n}");
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -186,7 +186,7 @@ fn export_builds_module_signature() {
 #[test]
 fn export_binding_records_type() {
     let lang = canonical_lang();
-    let ast = parse(&lang, "do {\nexport x :: 2\n}");
+    let ast = parse(&lang, "do {\nexport x := 2\n}");
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -210,7 +210,7 @@ fn module_sig_field_projection() {
     let lang = canonical_lang();
     // `flag` IS in the sig (value export at type.unknown); `double` has
     // a declared signature — both project.
-    let ast = parse(&lang, "do {\nimport mymod\nx = mymod.double(4)\n}");
+    let ast = parse(&lang, "do {\nimport mymod\nx := mymod.double(4)\n}");
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
         .expect("typecheck should succeed");
@@ -233,7 +233,7 @@ fn missing_sig_field_probes_module_chain() {
     // `mymod.flag` is a *value* export — `lookup("mymod.flag")` is None
     // (functions only), so `mymod.unknown_op` is a real miss → error.
     let lang = canonical_lang();
-    let bad = parse(&lang, "do {\nimport mymod\nx = mymod.unknown_op\n}");
+    let bad = parse(&lang, "do {\nimport mymod\nx := mymod.unknown_op\n}");
     let res = engine().typecheck(&lang, &TypecheckRequest::new(bad));
     assert!(
         res.is_err(),
@@ -249,7 +249,7 @@ fn resolve_dynamic_binds_unknown() {
     let lang = canonical_lang();
     let ast = parse(
         &lang,
-        "do {\nfrom \"./local/file.hnl\" import thing\nx = thing\n}",
+        "do {\nfrom \"./local/file.hnl\" import thing\nx := thing\n}",
     );
     let result = engine()
         .typecheck(&lang, &TypecheckRequest::new(ast))
