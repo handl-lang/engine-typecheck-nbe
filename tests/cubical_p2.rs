@@ -411,3 +411,48 @@ fn lowercase_comp_is_still_an_identifier() {
         diags_of(&result)
     );
 }
+
+/// Production parity (ADR-0208 P1 gap): `hnl typecheck` seeds every
+/// prelude wire name — including `i0`/`i1` — as a `type.unknown`
+/// global placeholder. The placeholder must not shadow the endpoints'
+/// `I` sort: `transp`/`hcomp`/`Comp` accept the literals directly,
+/// exactly as the unseeded fixtures above.
+#[test]
+fn transp_accepts_seeded_interval_literals() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            NAT_VEC,
+            "t := transp Pi(I, i ~> Bool), i0, fF, true",
+            "u := transp Pi(I, i ~> Bool), i1, fF, true",
+        ],
+    );
+    let engine = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
+    let mut engine: Box<dyn TypecheckEngine> = Box::new(engine);
+    for name in ["i0", "i1"] {
+        engine = engine.with_global(
+            name,
+            json!({"__tag__": "type.unknown", "__registry__": "handl.canonical"}),
+        );
+    }
+    let req = TypecheckRequest::new(ast);
+    let result = match engine.typecheck(&lang, &req) {
+        Ok(result) => result,
+        Err(e) => hnl_tool_typecheck::TypecheckResult {
+            typ: serde_json::Value::Null,
+            diagnostics: vec![hnl_tool_typecheck::TypecheckDiagnostic {
+                severity: "error".to_string(),
+                message: e.to_string(),
+                span: None,
+            }],
+            node_types: std::collections::HashMap::new(),
+            signature: serde_json::Value::Null,
+        },
+    };
+    assert!(
+        !has_error(&result),
+        "seeded i0/i1 literals should still synthesize type.interval, got {:?}",
+        diags_of(&result)
+    );
+}

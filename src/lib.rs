@@ -1283,9 +1283,27 @@ impl NbeTypecheckEngine {
                             if ty.get("__tag__").and_then(Value::as_str)
                                 == Some("type.unknown")
                                 && ctx.lookup_gamma(name).is_none()
-                                && lang.globals.contains_key(name) =>
+                                && (lang.globals.contains_key(name)
+                                    || matches!(name, "i0" | "i1")) =>
                         {
-                            self.construct_json_type(&lang.globals[name], ctx)
+                            if lang.globals.contains_key(name) {
+                                self.construct_json_type(&lang.globals[name], ctx)
+                            } else {
+                                // `i0`/`i1` arrive as `type.unknown`
+                                // placeholder seeds (they are prelude wire
+                                // names) — but they are the closed terms of
+                                // the `I` sort, so the placeholder must not
+                                // shadow the `type.interval` synthesis the
+                                // unseeded `None` arm below performs
+                                // (ADR-0208 P1).
+                                ctx.registry
+                                    .construct("type.interval", &Value::Null)
+                                    .ok_or_else(|| {
+                                        LangError::engine(
+                                            "lookup: construct type.interval failed",
+                                        )
+                                    })
+                            }
                         }
                         Some(ty) => Ok(ty),
                         // `refl` — the canonical `Path` introduction (ADR-0120):
