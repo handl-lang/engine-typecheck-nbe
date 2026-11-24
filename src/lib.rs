@@ -1800,7 +1800,10 @@ impl NbeTypecheckEngine {
                         "type.number" => payload.is_number(),
                         "type.string" => payload.is_string(),
                         "type.bool" => payload.is_boolean(),
-                        "type.null" => payload.is_null(),
+                        // `type.unit` ≡ `type.null` (T-153): `null` is the
+                        // unit sort's sole inhabitant, so a `null` literal
+                        // satisfies a `Unit` domain exactly as `()` does.
+                        "type.null" | "type.unit" => payload.is_null(),
                         _ => false,
                     };
                     if matches {
@@ -3199,7 +3202,8 @@ impl NbeTypecheckEngine {
                                     "type.number" => value.is_number(),
                                     "type.string" => value.is_string(),
                                     "type.bool" => value.is_boolean(),
-                                    "type.null" => value.is_null(),
+                                    // `type.unit` ≡ `type.null` (T-153).
+                                    "type.null" | "type.unit" => value.is_null(),
                                     "type.array" => value.is_array(),
                                     "type.object" => value.is_object(),
                                     _ => false,
@@ -3956,7 +3960,8 @@ impl NbeTypecheckEngine {
                         "type.number" => value.is_number(),
                         "type.string" => value.is_string(),
                         "type.bool" => value.is_boolean(),
-                        "type.null" => value.is_null(),
+                        // `type.unit` ≡ `type.null` (T-153).
+                        "type.null" | "type.unit" => value.is_null(),
                         "type.array" => value.is_array(),
                         "type.object" => value.is_object(),
                         _ => false,
@@ -4000,7 +4005,8 @@ impl NbeTypecheckEngine {
                         "type.number" => value.is_number(),
                         "type.string" => value.is_string(),
                         "type.bool" => value.is_boolean(),
-                        "type.null" => value.is_null(),
+                        // `type.unit` ≡ `type.null` (T-153).
+                        "type.null" | "type.unit" => value.is_null(),
                         "type.array" => value.is_array(),
                         "type.object" => value.is_object(),
                         _ => false,
@@ -5960,6 +5966,21 @@ impl NbeTypecheckEngine {
             // both the tagged `__tag__` spelling and the domain `__sym__`/
             // `__former__` reification a round-tripped `unknown` arrives in.
             if dependent::is_unknown_ty(a) || dependent::is_unknown_ty(b) {
+                return Ok(());
+            }
+            // `type.unit` ≡ `type.null` (T-153): unit's sole inhabitant is
+            // `null`, so the two sorts unify — a `Unit ~> T` atom accepts
+            // `f(null)` exactly as `f()` does, and a statement's
+            // `type.unit` result satisfies a `type.null` domain. Checked
+            // before the domain-encoded path: these are tagged `__tag__`
+            // spellings, but a unit/null pair reified into `__sym__`
+            // nominals is handled by `Checker::conv`'s matching arm.
+            if let (Some(tag_a), Some(tag_b)) =
+                (ctx.registry.as_type_tag(a), ctx.registry.as_type_tag(b))
+                && tag_a != tag_b
+                && matches!(tag_a, "type.unit" | "type.null")
+                && matches!(tag_b, "type.unit" | "type.null")
+            {
                 return Ok(());
             }
             // Domain-encoded operands (`__former__`/`__sym__`/`__neutral__`/

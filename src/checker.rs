@@ -372,6 +372,23 @@ impl Checker {
         if self.head_is_unknown(a) || self.head_is_unknown(b) {
             return true;
         }
+        // `type.unit` ≡ `type.null` (T-153): the unit sort's sole
+        // inhabitant is `null`, so the two nominals convert — a tagged
+        // `type.unit`/`type.null` pair that crosses the domain bridge
+        // (`domain_lift` → `Nominal(type.Unit)`/`Nominal(type.Null)`)
+        // agrees with the tagged-layer `unify` arm in `lib.rs`.
+        let unit_null = |v: &Val| match v {
+            Val::Nominal(s) => {
+                let h = s.handle();
+                h == type_sym("type.Unit").handle() || h == type_sym("type.Null").handle()
+            }
+            _ => false,
+        };
+        if unit_null(self.metas.force_head_rc(a).as_val())
+            && unit_null(self.metas.force_head_rc(b).as_val())
+        {
+            return true;
+        }
         let lvl = self.lvl();
         nbe::conv(&mut self.metas, lvl, a, b)
     }

@@ -743,7 +743,11 @@ pub(crate) fn is_unknown_ty(v: &Value) -> bool {
 /// A call domain a zero-argument `f()` may peel: literally `Unit`
 /// (`type.unit`) or the dynamic top (`type.unknown`). Meta domains are
 /// *not* unit — `f := (x ~> x); f()` must still report a missing
-/// argument rather than silently discarding the binder.
+/// argument rather than silently discarding the binder. `type.null` is
+/// deliberately *not* peelable even though it unifies with `type.unit`
+/// (T-153): a `Null ~> T` domain asks for the `null` value itself, and
+/// `f()` at eval passes zero args — only the explicit `f(null)` form
+/// supplies it.
 fn nullary_domain(param: &Value) -> bool {
     tag_of(param) == Some("type.unit") || is_unknown_ty(param)
 }
@@ -830,6 +834,7 @@ fn is_builtin_type_name(name: &str) -> bool {
             | "String"
             | "Str"
             | "Unit"
+            | "Null"
             | "IO"
             | "Type"
             | "Universe"
@@ -3335,6 +3340,10 @@ impl NbeTypecheckEngine {
             "Bool" => "type.bool",
             "String" | "Str" => "type.string",
             "Unit" => "type.unit",
+            // `Null` is the null sort (T-153): `type.unit` ≡ `type.null`,
+            // so both spellings resolve — `Unit` stays canonical for the
+            // statement/zero-arg peel, `Null` for explicit null domains.
+            "Null" => "type.null",
             // Bare `IO` = `IO(⊤)` — the arity-0 `Former{type.io}`
             // (any signature) for backward compat (ADR-0153 §4).
             "IO" => {
