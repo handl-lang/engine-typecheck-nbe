@@ -2209,6 +2209,17 @@ impl NbeTypecheckEngine {
                     })?;
                     self.synth_fibrant_judgment(lang, ast, node, ctx)
                 }
+                // Cubical univalence (ADR-0208 P4): the `univalence`
+                // keyword node reaches here via `type.univalence`'s
+                // `synth_univalence` op; `ua`/`Univalence`/`Equiv` are
+                // call-form names handled inside `synth_call_judgment`/
+                // `check_call_judgment`/`dep_synth_call_type`.
+                "synth_univalence" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_univalence: node out of bounds".to_string())
+                    })?;
+                    self.synth_univalence_judgment(lang, ast, node, ctx)
+                }
                 "synth_flow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_flow: node out of bounds".to_string())
@@ -6047,16 +6058,28 @@ impl NbeTypecheckEngine {
                         LangError::engine("typecheck: type value is not an object")
                     })?;
                     // Collect field keys from both objects, excluding the
-                    // `__tag__` and `__registry__` structural keys and the
+                    // `__tag__` and `__registry__` structural keys, the
                     // `body_closure` field (which is an engine-internal closure
                     // marker for dependent Pi/Sigma types — it cannot be
                     // structurally unified; use the `unify_pi` judgment op for
-                    // full closure-based unification, ADR-0054).
+                    // full closure-based unification, ADR-0054), and the
+                    // proof-relevant provenance keys `via`/`equiv`
+                    // (ADR-0208 P4 — the model's `unify_fields` skip list).
                     let keys: std::collections::BTreeSet<String> = obj_a
                         .keys()
-                        .filter(|k| *k != "__tag__" && *k != "__registry__" && *k != "body_closure")
+                        .filter(|k| {
+                            *k != "__tag__"
+                                && *k != "__registry__"
+                                && *k != "body_closure"
+                                && *k != "via"
+                                && *k != "equiv"
+                        })
                         .chain(obj_b.keys().filter(|k| {
-                            *k != "__tag__" && *k != "__registry__" && *k != "body_closure"
+                            *k != "__tag__"
+                                && *k != "__registry__"
+                                && *k != "body_closure"
+                                && *k != "via"
+                                && *k != "equiv"
                         }))
                         .cloned()
                         .collect();

@@ -162,6 +162,136 @@ fn witness_from_type_full(v: &Value) -> Option<(Value, Value, Value, Value)> {
     }
 }
 
+/// The `path.equiv` payload of a path-carrying `type.pi` — the
+/// `{dom, cod, to, fro}` record univalence paths carry (ADR-0208 P4).
+/// `Value::Null` for non-pi carriers and plain `Path`/`type.eq`
+/// witnesses (the model's `ue == null` reading).
+fn path_equiv_of(v: &Value) -> Value {
+    if tag_of(v) == Some("type.pi") {
+        v.get("path")
+            .and_then(|p| p.get("equiv"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    }
+}
+
+/// The model's `transport_term_` (ADR-0208 P4): the *shallow* index
+/// rewrite used on `type.family_app` args during transport — `v ↦ to`
+/// on exact match, otherwise a structural walk that skips the
+/// non-term/provenance keys (`via`/`equiv` are proof-relevant and
+/// never rewritten).
+fn transport_term(frm: &Value, to: &Value, t: &Value) -> Value {
+    if t == frm {
+        return to.clone();
+    }
+    match t {
+        Value::Array(xs) => Value::Array(
+            xs.iter()
+                .map(|x| transport_term(frm, to, x))
+                .collect(),
+        ),
+        Value::Object(m) => {
+            let mut out = Map::new();
+            for (k, x) in m {
+                if matches!(
+                    k.as_str(),
+                    "__tag__"
+                        | "__registry__"
+                        | "__meta__"
+                        | "name"
+                        | "op"
+                        | "body"
+                        | "body_closure"
+                        | "env"
+                        | "via"
+                        | "equiv"
+                ) {
+                    out.insert(k.clone(), x.clone());
+                } else {
+                    out.insert(k.clone(), transport_term(frm, to, x));
+                }
+            }
+            Value::Object(out)
+        }
+        _ => t.clone(),
+    }
+}
+
+/// The model's `subst_index_` (ADR-0208 P4) — the transport-time
+/// dependent rewrite `frm ↦ to` through a *type* value: `type.family_app`
+/// args go through [`transport_term`] (shallow — index terms are data,
+/// not types); other objects walk structurally but never descend into
+/// the proof-relevant/cached carriers (`type.ctor_sig`, `Path`,
+/// `type.eq`, `Lam`, `LamVal`, `CompVal`) or the spelling/provenance
+/// keys. This is deliberately *not* [`subst_index`], which serves
+/// index-term substitution elsewhere and rewrites more aggressively.
+fn subst_transport(frm: &Value, to: &Value, v: &Value) -> Value {
+    if frm.is_null() {
+        return v.clone();
+    }
+    if v == frm {
+        return to.clone();
+    }
+    if tag_of(v) == Some("type.family_app") {
+        let args = v
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|xs| {
+                Value::Array(
+                    xs.iter()
+                        .map(|a| transport_term(frm, to, a))
+                        .collect(),
+                )
+            })
+            .unwrap_or(Value::Array(Vec::new()));
+        let mut m = v.as_object().cloned().unwrap_or_default();
+        m.insert("args".to_string(), args);
+        return Value::Object(m);
+    }
+    match v {
+        Value::Array(xs) => Value::Array(
+            xs.iter()
+                .map(|x| subst_transport(frm, to, x))
+                .collect(),
+        ),
+        Value::Object(m) => {
+            let carrier = matches!(
+                tag_of(v),
+                Some("type.ctor_sig" | "Path" | "type.eq" | "Lam" | "LamVal" | "CompVal")
+            );
+            if carrier {
+                return v.clone();
+            }
+            let mut out = Map::new();
+            for (k, x) in m {
+                if matches!(
+                    k.as_str(),
+                    "__tag__"
+                        | "__registry__"
+                        | "__meta__"
+                        | "name"
+                        | "op"
+                        | "body"
+                        | "body_closure"
+                        | "env"
+                        | "via"
+                        | "equiv"
+                        | "param_name"
+                        | "ctor"
+                ) {
+                    out.insert(k.clone(), x.clone());
+                } else {
+                    out.insert(k.clone(), subst_transport(frm, to, x));
+                }
+            }
+            Value::Object(out)
+        }
+        _ => v.clone(),
+    }
+}
+
 /// A cubical face formula Φ (ADR-0208 P2) — the Rust mirror of the
 /// model's `{"__tag__":"face","op","args"}` records: `Tt`/`Ff` are the
 /// full/empty faces, `Eq0`/`Eq1` the endpoint equations `i = 0`/`i = 1`
@@ -362,6 +492,20 @@ struct CubPathWitness {
     self_ty: Value,
 }
 
+/// A resolved path operand for `#`/`j` — the model's `resolve_path_`
+/// result (ADR-0208 P4): `verdict` is `path`/`refl` (`bad` never
+/// reaches here — it is the `None` case), `frm`/`to` the endpoints,
+/// `equiv` the `path.equiv` payload when the witness is a univalence
+/// path (`Null` otherwise), and `witness` the carrier recorded under
+/// the transport result's `via` (the bound type/value itself).
+struct ResolvedPath {
+    verdict: CubPathVerdict,
+    frm: Value,
+    to: Value,
+    equiv: Value,
+    witness: Value,
+}
+
 /// Does index term `t` mention `var{name}`? Walks record/array
 /// structure, skipping the same non-term fields the model's
 /// `term_has_var_` skips (spelling, identity, provenance, arena
@@ -383,6 +527,7 @@ fn term_has_var(v: &Value, name: &str) -> bool {
                     | "body_closure"
                     | "env"
                     | "via"
+                    | "equiv"
             ) && term_has_var(x, name)
         }),
         Value::Array(xs) => xs.iter().any(|x| term_has_var(x, name)),
@@ -2342,6 +2487,13 @@ fn subst_index(term: &Value, frm: &Value, to: &Value) -> Value {
         Value::Object(m) => {
             let mut out = Map::new();
             for (k, v) in m {
+                // Proof-relevant provenance keys (`via`/`equiv`, ADR-0208
+                // P4) are never rewritten — the model's `subst_index_`
+                // skip list.
+                if matches!(k.as_str(), "via" | "equiv") {
+                    out.insert(k.clone(), v.clone());
+                    continue;
+                }
                 out.insert(k.clone(), subst_index(v, frm, to));
             }
             Value::Object(out)
@@ -2845,6 +2997,35 @@ impl NbeTypecheckEngine {
                     } else {
                         v
                     })
+                }
+                // `univalence(e)` in annotation position (ADR-0208 P4):
+                // the same path-carrying `type.pi` the keyword's term
+                // judgment mints — `ua(e)`'s type-position spelling.
+                "univalence" => {
+                    let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+                    let e_ref = Self::cub_child(lang, ast, node, "equiv", 0);
+                    if kids_len < 1 || e_ref.is_none() {
+                        self.cub_diag(
+                            ctx,
+                            "error",
+                            "univalence: needs an equivalence operand".to_string(),
+                            node.span,
+                        );
+                        Ok(self.cub_open_meta(ctx))
+                    } else {
+                        let v = self.synth_univalence_core(
+                            lang,
+                            ast,
+                            e_ref.unwrap().index(),
+                            node.span,
+                            ctx,
+                        )?;
+                        Ok(if tag_of(&v) == Some("type.unknown") {
+                            self.cub_open_meta(ctx)
+                        } else {
+                            v
+                        })
+                    }
                 }
                 // `fibrant A` in annotation position: the fibrancy
                 // *type* `isFibrant(A)` — `type.fibrant{of}` on a `yes`
@@ -3380,6 +3561,60 @@ impl NbeTypecheckEngine {
                             });
                             Ok(self.cub_open_meta(ctx))
                         }
+                    }
+                }
+                Some("Equiv") => {
+                    // `Equiv(A, B)` — the call-form equivalence type
+                    // former (ADR-0208 P4): mints `type.equiv{dom,cod}`.
+                    // Inhabitants are `{to : A ~> B, fro : B ~> A}`
+                    // records (checked by the `dep_unify`
+                    // `type.equiv`/`type.record` arm).
+                    if arg_indices.len() != 2 {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message:
+                                "synth_type: Equiv needs a domain and a codomain — Equiv(A, B)"
+                                    .to_string(),
+                            span: node.span,
+                        });
+                        Ok(self.cub_open_meta(ctx))
+                    } else {
+                        let d = self.dep_synth_type(lang, ast, arg_indices[0], ctx)?;
+                        let c = self.dep_synth_type(lang, ast, arg_indices[1], ctx)?;
+                        let mut m = Map::new();
+                        m.insert("dom".to_string(), d);
+                        m.insert("cod".to_string(), c);
+                        Ok(make_tag(ctx, "type.equiv", m))
+                    }
+                }
+                Some("ua") | Some("Univalence") => {
+                    // `ua(e)`/`Univalence(e)` in *type* position — the
+                    // same path-carrying `type.pi` the term-position
+                    // call judgment mints (ADR-0208 P4).
+                    if arg_indices.len() != 1 {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message:
+                                "synth_type: ua/Univalence needs exactly one equivalence operand"
+                                    .to_string(),
+                            span: node.span,
+                        });
+                        Ok(self.cub_open_meta(ctx))
+                    } else {
+                        let v = self.synth_univalence_core(
+                            lang,
+                            ast,
+                            arg_indices[0],
+                            node.span,
+                            ctx,
+                        )?;
+                        // Degraded formation (`type.unknown`) reads as
+                        // an open meta in type position.
+                        Ok(if tag_of(&v) == Some("type.unknown") {
+                            self.cub_open_meta(ctx)
+                        } else {
+                            v
+                        })
                     }
                 }
                 Some("IO") => {
@@ -5481,6 +5716,29 @@ impl NbeTypecheckEngine {
                     let sb = b.get("section").cloned().unwrap_or(Value::Null);
                     self.dep_unify(&sa, &sb, ctx)
                 }
+                (Some("type.equiv"), Some("type.equiv")) => {
+                    // `Equiv(A, B)` types (ADR-0208 P4): `dom`/`cod`
+                    // unify as types — the model's
+                    // `unify_dependent_` arm.
+                    let da = a.get("dom").cloned().unwrap_or(Value::Null);
+                    let db = b.get("dom").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&da, &db, ctx)?;
+                    let ca = a.get("cod").cloned().unwrap_or(Value::Null);
+                    let cb = b.get("cod").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&ca, &cb, ctx)
+                }
+                (Some("type.equiv"), Some("type.record"))
+                | (Some("type.record"), Some("type.equiv")) => {
+                    // `Equiv(A, B)` vs a record type — the record must
+                    // carry `to : dom ~> cod` and `fro : cod ~> dom`
+                    // (ADR-0208 P4, `unify_equiv_record_`).
+                    let (equiv_t, record_t) = if tag_of(a) == Some("type.equiv") {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    self.unify_equiv_record(equiv_t, record_t, ctx)
+                }
                 _ => {
                     // `Former{type.io}` — signature subtyping (record-width
                     // on the sig index): `IO(s) <: IO(s')` iff `s'` names
@@ -5689,6 +5947,21 @@ impl NbeTypecheckEngine {
                     } else {
                         None
                     }
+                }
+                // `Equiv(A, B)` (ADR-0208 P4): the record literal
+                // checks through the `type.equiv`/`type.record`
+                // `dep_unify` arm — synthesize then unify, the same
+                // fallback the model's `check_dependent_fallback_`
+                // applies.
+                "type.equiv" => {
+                    let ty = match self.synth_node(lang, ast, node_ref, ctx) {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    return Some(match self.dep_unify(&ty, expected, ctx) {
+                        Ok(()) => Ok(ty),
+                        Err(e) => Err(e),
+                    });
                 }
                 _ => None,
             }
@@ -6679,67 +6952,96 @@ impl NbeTypecheckEngine {
     // `synth_transport` / `synth_j` / `synth_dim_arrow` / `synth_flow`
     // -----------------------------------------------------------------------
 
-    /// Resolve a path operand node to a `Path{frm,to}` value: a
-    /// `results`-bound `eq_<name>` witness, a Γ-bound `p : Path`, or
-    /// `refl` (identity). A metavariable-bound operand is *stuck*, not
-    /// a decided non-path — an unannotated function parameter sits at a
-    /// fresh meta — so it synthesizes an open `Path(?a, ?b)` whose
-    /// endpoints checking resolves against the use site. `None` only
-    /// when the operand is decided-not-a-path (unbound, or bound to a
-    /// concrete non-`Path` value).
-    fn resolve_path(
+    /// The model's `is_univalence_form_` (ADR-0208 P4): a `univalence`
+    /// keyword node, or a `call` whose callee is the bare identifier
+    /// `ua`/`Univalence` — the univalence path former. `ua` stays an
+    /// ordinary identifier everywhere else; only the call *form* is
+    /// intercepted.
+    fn is_univalence_form(&self, lang: &Language, ast: &Ast, node_ref: AstRef) -> bool {
+        let Some(node) = ast.get(node_ref) else {
+            return false;
+        };
+        if node.kind == "univalence" {
+            return true;
+        }
+        if node.kind != "call" {
+            return false;
+        }
+        let Some(callee_ref) = Self::cub_child(lang, ast, node, "callee", 0) else {
+            return false;
+        };
+        let Some(callee) = ast.get(callee_ref) else {
+            return false;
+        };
+        callee.kind == "var"
+            && matches!(node_name(callee).as_deref(), Some("ua" | "Univalence"))
+    }
+
+    /// Resolve a path operand node — the model's `resolve_path_`
+    /// (ADR-0208 P4): `trans`/`symm`/univalence forms synthesize
+    /// through `synth_node` (their types carry the `path` payload);
+    /// a `var` consults its bound witnesses/declared types first
+    /// (`results` then Γ — a `p := ua(e)` binding has no eval rule,
+    /// so the *declared* `type.pi` is the only carrier of the
+    /// endpoints and the `path.equiv` payload), then falls back to
+    /// an open `Path(?a, ?b)` when the binding is an unsolved
+    /// metavariable (stuck, not decided-not-a-path). `refl` is the
+    /// identity witness. `None` only when the operand is
+    /// decided-not-a-path.
+    fn resolve_path_full(
         &self,
         lang: &Language,
         ast: &Ast,
         node_ref: AstRef,
         ctx: &mut TypecheckContext,
-    ) -> Option<Value> {
-        let Some(node) = ast.get(node_ref) else {
-            return None;
-        };
-        // Cubical path algebra (ADR-0208 P2): a `trans`/`symm` node
-        // synthesizes to a path-carrying `type.pi` — route it through
-        // `synth_node` so `trans(p, q) # v` / `j (trans p q), …` see
-        // the composed endpoints (the model's `resolve_path_` special
-        // case).
-        if node.kind == "trans" || node.kind == "symm" {
+    ) -> Option<ResolvedPath> {
+        let node = ast.get(node_ref)?;
+        if node.kind == "trans"
+            || node.kind == "symm"
+            || self.is_univalence_form(lang, ast, node_ref)
+        {
             let ty = self.synth_node(lang, ast, node_ref, ctx).ok()?;
-            let (x, y) = path_witness_endpoints(&ty)?;
-            return Some(path_val(x, y));
+            let (x, y, _, _) = witness_from_type_full(&ty)?;
+            return Some(ResolvedPath {
+                verdict: CubPathVerdict::Path,
+                frm: eval_index(&x, ctx),
+                to: eval_index(&y, ctx),
+                equiv: path_equiv_of(&ty),
+                witness: ty,
+            });
         }
         if node.kind == "var" {
             let name = node_name(node)?;
             if name == "refl" {
                 let mut m = Map::new();
                 m.insert("__tag__".to_string(), Value::String("Refl".to_string()));
-                // Identity path — `Path{refl, refl}` reads as transport
-                // with frm == to; record the refl marker.
-                return Some(path_val(Value::Object(m.clone()), Value::Object(m)));
+                // Identity path — `frm == to` reads as transport with
+                // equal endpoints; record the refl marker.
+                let w = Value::Object(m);
+                return Some(ResolvedPath {
+                    verdict: CubPathVerdict::Refl,
+                    frm: w.clone(),
+                    to: w.clone(),
+                    equiv: Value::Null,
+                    witness: w,
+                });
             }
-            if let Some(w) = ctx.results.get(&name)
-                && tag_of(w) == Some("Path") {
-                    return Some(w.clone());
-                }
-            if let Some(w) = ctx.lookup(&name)
-                && tag_of(w) == Some("Path") {
-                    return Some(w.clone());
-                }
-            // A cubical path type (`type.pi` + `path` payload,
-            // ADR-0208 P1) is a path whose endpoints are the payload's
-            // `x`/`y` — `p : Path(A, x, y)` / `PathP(F, x, y)` /
-            // `Path(a, b)` all resolve through it, so `#`/`j` keep
-            // consuming the `Path{frm,to}` spelling.
+            // Bound witnesses/declared types — `Path{frm,to}` records,
+            // `type.eq`, and path-carrying `type.pi`s (plain `Path`/
+            // `PathP` and univalence paths alike) all resolve through
+            // `witness_from_type_full`.
             for bound in [ctx.results.get(&name), ctx.lookup(&name)]
                 .into_iter()
                 .flatten()
             {
-                if tag_of(bound) == Some("type.pi")
-                    && let Some(p) = bound.get("path")
-                {
-                    return Some(path_val(
-                        p.get("x").cloned().unwrap_or(Value::Null),
-                        p.get("y").cloned().unwrap_or(Value::Null),
-                    ));
+                if let Some((x, y, _, _)) = witness_from_type_full(bound) {
+                    return Some(ResolvedPath {
+                        verdict: CubPathVerdict::Path,
+                        frm: eval_index(&x, ctx),
+                        to: eval_index(&y, ctx),
+                        equiv: path_equiv_of(bound),
+                        witness: bound.clone(),
+                    });
                 }
             }
             let bound = ctx
@@ -6748,17 +7050,31 @@ impl NbeTypecheckEngine {
                 .or_else(|| ctx.lookup(&name))
                 .cloned();
             if bound.as_ref().and_then(extract_meta_id).is_some() {
+                // Stuck path operand — an open `Path(?a, ?b)` whose
+                // endpoints checking resolves against the use site.
                 let frm = meta_value(ctx.fresh_meta());
                 let to = meta_value(ctx.fresh_meta());
-                return Some(path_val(frm, to));
+                return Some(ResolvedPath {
+                    verdict: CubPathVerdict::Path,
+                    frm: frm.clone(),
+                    to: to.clone(),
+                    equiv: Value::Null,
+                    witness: path_val(frm, to),
+                });
             }
         }
         None
     }
 
-    /// `p # v` — transport `v`'s type through the path's index rewrite
-    /// (`frm ↦ to` inside `family_app` args), recording the consumed
-    /// witness under `via` (proof-relevant, not erased).
+    /// `p # v` — transport `v`'s type along the path (the model's
+    /// `synth_transport_`): a *univalence* path (`path.equiv`
+    /// present) first tries a shallow unify of `v`'s type against the
+    /// domain — success yields the codomain; failure falls back to
+    /// the dependent `subst_index_` rewrite and warns when the type
+    /// does not mention the equivalence domain at all. A plain path
+    /// rewrites `frm ↦ to` through the value's type
+    /// ([`subst_transport`]). The consumed witness is recorded under
+    /// `via` (proof-relevant, not erased).
     pub(crate) fn synth_transport_judgment(
         &self,
         lang: &Language,
@@ -6785,7 +7101,7 @@ impl NbeTypecheckEngine {
             .get(AstRef::new(path_idx))
             .ok_or_else(|| LangError::engine("transport: path node out of bounds".to_string()))?;
         let path = self
-            .resolve_path(lang, ast, AstRef::new(path_idx), ctx)
+            .resolve_path_full(lang, ast, AstRef::new(path_idx), ctx)
             .ok_or_else(|| {
                 LangError::engine(format!(
                     "transport: operand is not a Path (kind '{}')",
@@ -6793,40 +7109,48 @@ impl NbeTypecheckEngine {
                 ))
             })?;
         let vty = self.synth_node(lang, ast, AstRef::new(val_idx), ctx)?;
-        let frm = eval_index(&path.get("frm").cloned().unwrap_or(Value::Null), ctx);
-        let to = eval_index(&path.get("to").cloned().unwrap_or(Value::Null), ctx);
-        // Transport: rewrite `frm` → `to` through the value's type.
-        let rewritten = if frm == to {
-            vty.clone()
-        } else if tag_of(&vty) == Some("type.family_app") {
-            let args = vty
-                .get("args")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .map(|a| eval_index(&subst_index(a, &frm, &to), ctx))
-                .collect();
-            let mut m = Map::new();
-            m.insert(
-                "name".to_string(),
-                vty.get("name").cloned().unwrap_or(Value::Null),
-            );
-            m.insert("args".to_string(), Value::Array(args));
-            make_tag(ctx, "type.family_app", m)
+        let transported = if path.verdict == CubPathVerdict::Path {
+            if !path.equiv.is_null() {
+                // Univalence transport (ADR-0208 P4): `p # v` where
+                // `p : ua(e)` for `e : A ≃ B` reads `v : A` as `v : B`.
+                // The shallow `unify` is speculative — a failed attempt
+                // restores the meta store before the subst fallback.
+                let mark = ctx.store_mark();
+                match self.unify(&vty, &path.frm, ctx) {
+                    Ok(()) => zonk_index(&path.to, ctx),
+                    Err(_) => {
+                        ctx.store_restore(mark);
+                        let t1 = subst_transport(&path.frm, &path.to, &vty);
+                        if t1 != vty {
+                            t1
+                        } else {
+                            self.cub_diag(
+                                ctx,
+                                "warning",
+                                "transport along univalence: value type does not mention the equivalence domain — passing through unchanged".to_string(),
+                                node.span,
+                            );
+                            vty.clone()
+                        }
+                    }
+                }
+            } else {
+                subst_transport(&path.frm, &path.to, &vty)
+            }
         } else {
-            subst_index(&vty, &frm, &to)
+            // `refl` — the identity transport.
+            vty.clone()
         };
         // Record the consumed witness (proof-relevant provenance). An
         // open transport over an unsolved meta stays atomic — a `via`
         // field would corrupt the `{"__meta__"}` encoding.
-        if let Value::Object(mut m) = rewritten {
+        if let Value::Object(mut m) = transported {
             if extract_meta_id(&Value::Object(m.clone())).is_none() {
-                m.insert("via".to_string(), path);
+                m.insert("via".to_string(), path.witness);
             }
             return Ok(Value::Object(m));
         }
-        Ok(rewritten)
+        Ok(transported)
     }
 
     /// `j p, motive, base` — the J eliminator: check `base` against the
@@ -6858,10 +7182,10 @@ impl NbeTypecheckEngine {
             .ok_or_else(|| LangError::engine("j: base index not a u64".to_string()))?
             as usize;
         let path = self
-            .resolve_path(lang, ast, AstRef::new(path_idx), ctx)
+            .resolve_path_full(lang, ast, AstRef::new(path_idx), ctx)
             .ok_or_else(|| LangError::engine("j: operand is not a Path".to_string()))?;
-        let frm = eval_index(&path.get("frm").cloned().unwrap_or(Value::Null), ctx);
-        let to = eval_index(&path.get("to").cloned().unwrap_or(Value::Null), ctx);
+        let frm = eval_index(&path.frm, ctx);
+        let to = eval_index(&path.to, ctx);
         let expected_base = self.apply_motive(lang, ast, motive_idx, &[frm], path_idx, ctx)?;
         self.check_node(lang, ast, AstRef::new(base_idx), &expected_base, ctx)?;
         self.apply_motive(lang, ast, motive_idx, &[to], path_idx, ctx)
@@ -6967,14 +7291,21 @@ impl NbeTypecheckEngine {
         cub_face_of_val(&term)
     }
 
-    /// `A(point)` — the model's `fam_at_`: a `type.glue` reads its
-    /// *off-face* family `A` (ADR-0208 P3 — `φ(point)` is undecided
-    /// until P4, so `A(point)` is the documented approximation; on
-    /// `φ` the section agrees with `A` only up to unchecked
-    /// equivalence data). An interval-param `type.pi` (`A : I → Type`)
-    /// applies its `body_closure` at the interval *term* `point`
-    /// (`var{i0}`/`var{i1}`/the dimension `var`); any other type is a
-    /// constant family, `A(point) = A`.
+    /// `A(point)` — the model's `fam_at_` (ADR-0208 P3/P4): a
+    /// `type.glue` reads its *family* `A` off-face, its *section*
+    /// `T̂` on the `φ ≡ 1` face (`tt`), and `A` on every other face —
+    /// including undecided `eq0`/`eq1`/`not`/`or`/`and` formulas, whose
+    /// on-face agreement is only up to unchecked equivalence data.
+    /// A path-carrying `type.pi` whose `path` payload has an `equiv`
+    /// record is a *univalence* family `ua(e)` (ADR-0208 P4):
+    /// `fam(i0) = dom`, `fam(i1) = cod`, and an interior point reads
+    /// the path-Pi Glue `Glue(cod, i=0, dom)` — the `fam_at_`
+    /// path-Pi arm. Any other interval-param `type.pi` (`A : I →
+    /// Type`) applies its `body_closure` at the interval *term*
+    /// `point` (`var{i0}`/`var{i1}`/the dimension `var`); a closure
+    /// that computes to a `type.glue` re-enters `fam_at` on it (the
+    /// applied-glue recursion). Any other type is a constant family,
+    /// `A(point) = A`.
     fn fam_at(
         &self,
         lang: &Language,
@@ -6984,14 +7315,65 @@ impl NbeTypecheckEngine {
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
         if tag_of(fam) == Some("type.glue") {
-            let inner = fam.get("family").cloned().unwrap_or_else(|| fam.clone());
+            // On-face reading: `tt` selects the section, everything
+            // else (including undecided face formulas) the family —
+            // the model's `fam_at_` `type.glue` arm.
+            let fop = fam
+                .get("face")
+                .and_then(|f| f.get("op"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let inner = match fop {
+                "tt" => fam.get("section").cloned().unwrap_or_else(|| fam.clone()),
+                _ => fam.get("family").cloned().unwrap_or_else(|| fam.clone()),
+            };
             return self.fam_at(lang, ast, &inner, point, ctx);
+        }
+        let pld = if tag_of(fam) == Some("type.pi") {
+            fam.get("path").cloned()
+        } else {
+            None
+        };
+        if let Some(pld) = pld
+            && !pld.get("equiv").map(Value::is_null).unwrap_or(true)
+        {
+            // Univalence family `ua(e)` — `fam(i0) = dom`,
+            // `fam(i1) = cod`, interior `Glue(cod, i=0, dom)`.
+            let i0t = var_term("i0");
+            let i1t = var_term("i1");
+            if *point == i0t {
+                return Ok(pld.get("x").cloned().unwrap_or(Value::Null));
+            }
+            if *point == i1t {
+                return Ok(pld.get("y").cloned().unwrap_or(Value::Null));
+            }
+            let mut m = Map::new();
+            m.insert(
+                "family".to_string(),
+                pld.get("y").cloned().unwrap_or(Value::Null),
+            );
+            let mut face_m = Map::new();
+            face_m.insert("__tag__".to_string(), Value::String("face".to_string()));
+            face_m.insert("op".to_string(), Value::String("eq0".to_string()));
+            face_m.insert("args".to_string(), Value::Array(vec![point.clone()]));
+            m.insert("face".to_string(), Value::Object(face_m));
+            m.insert(
+                "section".to_string(),
+                pld.get("x").cloned().unwrap_or(Value::Null),
+            );
+            return Ok(make_tag(ctx, "type.glue", m));
         }
         let is_family = tag_of(fam) == Some("type.pi")
             && tag_of(fam.get("param").unwrap_or(&Value::Null)) == Some("type.interval")
             && fam.get("body_closure").is_some();
         if is_family {
-            self.dep_closure_apply_term(lang, ast, fam, point, ctx)
+            let applied = self.dep_closure_apply_term(lang, ast, fam, point, ctx)?;
+            // An `I → Type` closure may compute to a `type.glue` —
+            // `fam_at` recurses on it (the model's applied-glue arm).
+            if tag_of(&applied) == Some("type.glue") {
+                return self.fam_at(lang, ast, &applied, point, ctx);
+            }
+            Ok(applied)
         } else {
             Ok(fam.clone())
         }
@@ -7415,12 +7797,16 @@ impl NbeTypecheckEngine {
     /// `type.pi` construction shared by `synth_trans_`/`synth_symm_`:
     /// interval param, the first available `body_closure` (or a
     /// constant `type.unknown` body), and the `path{x,y}` payload.
+    /// `equiv` is the composed `path.equiv` record for univalence
+    /// paths (ADR-0208 P4) — `Value::Null` leaves the payload
+    /// `{x, y}`-only.
     fn mint_path_type(
         &self,
         ctx: &mut TypecheckContext,
         x: Value,
         y: Value,
         closure: Value,
+        equiv: Value,
     ) -> Value {
         let mut interval_m = Map::new();
         let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
@@ -7436,10 +7822,16 @@ impl NbeTypecheckEngine {
                 "const_body": unknown,
             })
         };
+        let mut path = serde_json::json!({"x": x, "y": y});
+        if let Value::Object(ref mut pm) = path {
+            if !equiv.is_null() {
+                pm.insert("equiv".to_string(), equiv);
+            }
+        }
         let mut m = Map::new();
         m.insert("param".to_string(), interval);
         m.insert("body_closure".to_string(), closure);
-        m.insert("path".to_string(), serde_json::json!({"x": x, "y": y}));
+        m.insert("path".to_string(), path);
         make_tag(ctx, "type.pi", m)
     }
 
@@ -7521,7 +7913,35 @@ impl NbeTypecheckEngine {
         } else {
             w2.closure.clone()
         };
-        Ok(self.mint_path_type(ctx, w1.x.clone(), w2.y.clone(), closure))
+        // Univalence composition (ADR-0208 P4): when *both* operands
+        // carry `path.equiv` records the composed path keeps the
+        // equivalence — `dom`/`cod` span the outer endpoints while
+        // `to`/`fro` stay deferred (`null`, proof-irrelevant).
+        let w1e = path_equiv_of(&w1.self_ty);
+        let w2e = path_equiv_of(&w2.self_ty);
+        let equiv = if !w1e.is_null() && !w2e.is_null() {
+            let field_or = |e: &Value, k: &str, fallback: &Value| {
+                e.get(k)
+                    .filter(|v| !v.is_null())
+                    .cloned()
+                    .unwrap_or_else(|| fallback.clone())
+            };
+            serde_json::json!({
+                "dom": field_or(&w1e, "dom", &w1.x),
+                "cod": field_or(&w2e, "cod", &w2.y),
+                "to": Value::Null,
+                "fro": Value::Null,
+            })
+        } else {
+            Value::Null
+        };
+        Ok(self.mint_path_type(
+            ctx,
+            w1.x.clone(),
+            w2.y.clone(),
+            closure,
+            equiv,
+        ))
     }
 
     /// `symm p` — derived path symmetry (see the section comment):
@@ -7566,9 +7986,341 @@ impl NbeTypecheckEngine {
                 Ok(self.cub_unknown(ctx))
             }
             CubPathVerdict::Path => {
-                Ok(self.mint_path_type(ctx, w.y.clone(), w.x.clone(), w.closure.clone()))
+                // Univalence symmetry (ADR-0208 P4): `symm` on a
+                // `ua(e)` path swaps the equivalence direction —
+                // `dom ↔ cod`, `to ↔ fro`.
+                let we = path_equiv_of(&w.self_ty);
+                let equiv = if !we.is_null() {
+                    let field_or = |k: &str, fallback: &Value| {
+                        we.get(k)
+                            .filter(|v| !v.is_null())
+                            .cloned()
+                            .unwrap_or_else(|| fallback.clone())
+                    };
+                    serde_json::json!({
+                        "dom": field_or("cod", &w.y),
+                        "cod": field_or("dom", &w.x),
+                        "to": we.get("fro").cloned().unwrap_or(Value::Null),
+                        "fro": we.get("to").cloned().unwrap_or(Value::Null),
+                    })
+                } else {
+                    Value::Null
+                };
+                Ok(self.mint_path_type(
+                    ctx,
+                    w.y.clone(),
+                    w.x.clone(),
+                    w.closure.clone(),
+                    equiv,
+                ))
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Cubical univalence (ADR-0208 P4): ua / Univalence / univalence /
+    // Equiv
+    // -------------------------------------------------------------------
+    //
+    // `ua(e)` / `univalence(e)` for an equivalence `e : A ≃ B`
+    // synthesizes a path-carrying `type.pi` over `I` whose `path`
+    // payload is `{x: A, y: B, equiv: {dom, cod, to, fro}}` —
+    // proof-relevant provenance that `p # v` (transport), `symm`,
+    // `trans`, and `fam_at` read. `Equiv(A, B)` mints the
+    // `type.equiv{dom, cod}` former; `{to : A ~> B, fro : B ~> A}`
+    // record literals check against it through `unify_equiv_record`.
+    // `sect`/`retr` are deferred proof-irrelevant.
+
+    /// `equiv_field_value_` — the provenance value of `field` (`to`/
+    /// `fro`) when the equivalence operand is an *object literal*:
+    /// the entry's value node evaluated through the annotation
+    /// evaluator (`eval_ann_node`, the model's `node_term_` +
+    /// `eval_term_`). `Null` for non-object operands or absent
+    /// fields — proof-irrelevant provenance, best-effort.
+    fn equiv_field_value(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        equiv_idx: usize,
+        field: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Value {
+        let Some(node) = ast.get(AstRef::new(equiv_idx)) else {
+            return Value::Null;
+        };
+        if node.kind != "object" {
+            return Value::Null;
+        }
+        let Some(entries) = children_of(node) else {
+            return Value::Null;
+        };
+        for e in entries {
+            let Some(eidx) = e.as_u64() else {
+                continue;
+            };
+            let Some(entry) = ast.get(AstRef::new(eidx as usize)) else {
+                continue;
+            };
+            let Some(ekids) = children_of(entry) else {
+                continue;
+            };
+            if ekids.len() < 2 {
+                continue;
+            }
+            let (Some(kidx), Some(vidx)) = (ekids[0].as_u64(), ekids[1].as_u64()) else {
+                continue;
+            };
+            let Some(key_node) = ast.get(AstRef::new(kidx as usize)) else {
+                continue;
+            };
+            let key = key_node
+                .payload
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    key_node
+                        .payload
+                        .get("name")
+                        .or_else(|| key_node.payload.get("value"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            if key.as_deref() == Some(field)
+                && let Ok(v) = self.eval_ann_node(lang, ast, vidx as usize, ctx)
+                && !v.is_null()
+            {
+                return v;
+            }
+        }
+        Value::Null
+    }
+
+    /// `arrow_dom_cod_` — `(domain, codomain)` of an arrow *type*:
+    /// `type.function` reads `param`/`body` directly; a `type.pi`
+    /// applies its `body_closure` at its own parameter (the
+    /// dependent-arrow reading). `None` for non-arrows.
+    fn arrow_dom_cod(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        t: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Option<(Value, Value)> {
+        match tag_of(t) {
+            Some("type.function") => Some((
+                t.get("param").cloned().unwrap_or(Value::Null),
+                t.get("body").cloned().unwrap_or(Value::Null),
+            )),
+            Some("type.pi") => {
+                let p = t.get("param").cloned().unwrap_or(Value::Null);
+                let cod = self.dep_closure_apply(lang, ast, t, &p, ctx).ok()?;
+                if cod.is_null() {
+                    None
+                } else {
+                    Some((p, cod))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `equiv_parts_` — read the equivalence operand of `ua`/`univalence`
+    /// as `(dom, cod, to, fro)`: a `type.equiv{dom,cod}` type reads its
+    /// former fields directly; a `type.record` with `to`/`fro` arrow
+    /// fields infers the domain/codomain from them, cross-checking
+    /// that `fro` inverts `to` (`fro.dom ~ to.cod`, `fro.cod ~ to.dom`).
+    /// `to`/`fro` are best-effort eval'd provenance (`Null` when
+    /// unavailable). `Ok(None)` means the operand is not an
+    /// equivalence — the diagnostic is already recorded.
+    fn equiv_parts(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        equiv_idx: usize,
+        span: Option<handl_language::Span>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<(Value, Value, Value, Value)>, LangError> {
+        let et = self.synth_node(lang, ast, AstRef::new(equiv_idx), ctx)?;
+        if tag_of(&et) == Some("type.equiv") {
+            let tv = self.equiv_field_value(lang, ast, equiv_idx, "to", ctx);
+            let fv = self.equiv_field_value(lang, ast, equiv_idx, "fro", ctx);
+            return Ok(Some((
+                et.get("dom").cloned().unwrap_or(Value::Null),
+                et.get("cod").cloned().unwrap_or(Value::Null),
+                tv,
+                fv,
+            )));
+        }
+        let fields = et.get("fields").cloned().unwrap_or(Value::Null);
+        let to_t = fields.get("to").cloned().unwrap_or(Value::Null);
+        let fro_t = fields.get("fro").cloned().unwrap_or(Value::Null);
+        if to_t.is_null() || fro_t.is_null() {
+            self.cub_diag(
+                ctx,
+                "error",
+                "univalence: equivalence operand must be an Equiv(A, B) record — {to : A ~> B, fro : B ~> A}"
+                    .to_string(),
+                span,
+            );
+            return Ok(None);
+        }
+        let Some(ad) = self.arrow_dom_cod(lang, ast, &to_t, ctx) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "univalence: equivalence `to` field is not an arrow type".to_string(),
+                span,
+            );
+            return Ok(None);
+        };
+        let Some(af) = self.arrow_dom_cod(lang, ast, &fro_t, ctx) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "univalence: equivalence `fro` field is not an arrow type".to_string(),
+                span,
+            );
+            return Ok(None);
+        };
+        // Cross-check the inverse direction: `fro : B ~> A`.
+        let mark = ctx.store_mark();
+        let ok = self.dep_unify(&af.0, &ad.1, ctx).is_ok()
+            && self.dep_unify(&af.1, &ad.0, ctx).is_ok();
+        if !ok {
+            ctx.store_restore(mark);
+            self.cub_diag(
+                ctx,
+                "error",
+                "univalence: equivalence `fro` does not invert `to` — expected B ~> A"
+                    .to_string(),
+                span,
+            );
+            return Ok(None);
+        }
+        let tv = self.equiv_field_value(lang, ast, equiv_idx, "to", ctx);
+        let fv = self.equiv_field_value(lang, ast, equiv_idx, "fro", ctx);
+        Ok(Some((ad.0, ad.1, tv, fv)))
+    }
+
+    /// `synth_univalence_core_` — the shared univalence introduction:
+    /// given the equivalence operand's AST index, mint the
+    /// path-carrying `type.pi` — `(i:I) → Type` (universe-level: the
+    /// endpoints are *type values*) with `path{x: A, y: B, equiv:
+    /// {dom, cod, to, fro}}`. Used by the `univalence` keyword node,
+    /// the `ua`/`Univalence` call form (term and type position), and
+    /// `Equiv`-checked annotations.
+    fn synth_univalence_core(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        equiv_idx: usize,
+        span: Option<handl_language::Span>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let Some((dom, cod, to, fro)) =
+            self.equiv_parts(lang, ast, equiv_idx, span, ctx)?
+        else {
+            return Ok(self.cub_unknown(ctx));
+        };
+        if dom.is_null() || cod.is_null() {
+            return Ok(self.cub_unknown(ctx));
+        }
+        let mut interval_m = Map::new();
+        let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
+        let mut universe_m = Map::new();
+        universe_m.insert("level".to_string(), Value::from(0));
+        let universe = make_tag(ctx, "type.universe", universe_m);
+        let mut equiv_m = Map::new();
+        equiv_m.insert("dom".to_string(), dom.clone());
+        equiv_m.insert("cod".to_string(), cod.clone());
+        equiv_m.insert("to".to_string(), to);
+        equiv_m.insert("fro".to_string(), fro);
+        let mut path_m = Map::new();
+        path_m.insert("x".to_string(), dom);
+        path_m.insert("y".to_string(), cod);
+        path_m.insert("equiv".to_string(), Value::Object(equiv_m));
+        let mut m = Map::new();
+        m.insert("param".to_string(), interval);
+        m.insert(
+            "body_closure".to_string(),
+            serde_json::json!({
+                "var_name": "",
+                "body_child_idx": Value::Null,
+                "dep": true,
+                "const_body": universe,
+            }),
+        );
+        m.insert("path".to_string(), Value::Object(path_m));
+        Ok(make_tag(ctx, "type.pi", m))
+    }
+
+    /// `univalence(e)` — the keyword node's judgment (term position):
+    /// child role `equiv` is the equivalence operand.
+    pub(crate) fn synth_univalence_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        let e_ref = Self::cub_child(lang, ast, node, "equiv", 0);
+        if kids_len < 1 || e_ref.is_none() {
+            self.cub_diag(
+                ctx,
+                "error",
+                "univalence: needs an equivalence operand".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        self.synth_univalence_core(lang, ast, e_ref.unwrap().index(), span, ctx)
+    }
+
+    /// `unify_equiv_record_` — unify a `type.equiv{dom,cod}` against a
+    /// `type.record{fields}` (either order): the record must carry
+    /// `to : dom ~> cod` and `fro : cod ~> dom` arrow fields; extra
+    /// fields are ignored. Returns the model's diagnostics as
+    /// `LangError`s (the `dep_unify` failure channel).
+    fn unify_equiv_record(
+        &self,
+        equiv_t: &Value,
+        record_t: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let dom = equiv_t.get("dom").cloned().unwrap_or(Value::Null);
+        let cod = equiv_t.get("cod").cloned().unwrap_or(Value::Null);
+        let fields = record_t.get("fields").cloned().unwrap_or(Value::Null);
+        let to_f = fields.get("to").cloned().unwrap_or(Value::Null);
+        let fro_f = fields.get("fro").cloned().unwrap_or(Value::Null);
+        if to_f.is_null() || fro_f.is_null() {
+            return Err(LangError::engine(
+                "type mismatch: Equiv record needs `to` and `fro` fields".to_string(),
+            ));
+        }
+        let mut to_m = Map::new();
+        to_m.insert("param".to_string(), dom.clone());
+        to_m.insert("body".to_string(), cod.clone());
+        to_m.insert("param_name".to_string(), Value::String(String::new()));
+        let to_arr = make_tag(ctx, "type.function", to_m);
+        let mut fro_m = Map::new();
+        fro_m.insert("param".to_string(), cod.clone());
+        fro_m.insert("body".to_string(), dom.clone());
+        fro_m.insert("param_name".to_string(), Value::String(String::new()));
+        let fro_arr = make_tag(ctx, "type.function", fro_m);
+        let dom_tag = tag_of(&dom).unwrap_or("?");
+        let cod_tag = tag_of(&cod).unwrap_or("?");
+        self.dep_unify(&to_f, &to_arr, ctx).map_err(|_| {
+            LangError::engine(format!(
+                "type mismatch: Equiv `to` field is not {dom_tag} ~> {cod_tag}"
+            ))
+        })?;
+        self.dep_unify(&fro_f, &fro_arr, ctx).map_err(|_| {
+            LangError::engine(format!(
+                "type mismatch: Equiv `fro` field is not {cod_tag} ~> {dom_tag}"
+            ))
+        })
     }
 
     // -------------------------------------------------------------------
@@ -8527,6 +9279,39 @@ impl NbeTypecheckEngine {
             self.dep_unify(&ty, &expected, ctx)?;
             return Ok(ty);
         }
+        // `ua(e)`/`Univalence(e)` in check position (ADR-0208 P4):
+        // synthesize the univalence path type and unify it against
+        // the expected type — the model's `call` judgment intercept.
+        let ua_call = children_of(node)
+            .and_then(|k| k.first())
+            .and_then(Value::as_u64)
+            .and_then(|i| ast.get(AstRef::new(i as usize)))
+            .is_some_and(|c| {
+                c.kind == "var"
+                    && matches!(node_name(c).as_deref(), Some("ua" | "Univalence"))
+            });
+        if ua_call {
+            let kids = children_of(node)
+                .ok_or_else(|| LangError::engine("check_call: no children".to_string()))?;
+            if kids.len() != 2 {
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "ua/Univalence needs exactly one equivalence operand".to_string(),
+                    node.span,
+                );
+                return Ok(self.cub_unknown(ctx));
+            }
+            let arg_idx = kids[1]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("check_call: arg index not a u64".to_string()))?
+                as usize;
+            let ty = self.synth_univalence_core(lang, ast, arg_idx, node.span, ctx)?;
+            if let Some(exp) = incoming {
+                self.dep_unify(&ty, &exp, ctx)?;
+            }
+            return Ok(ty);
+        }
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("check_call: no children".to_string()))?;
         let callee_idx =
@@ -8577,6 +9362,30 @@ impl NbeTypecheckEngine {
         // vocabulary cannot compute a sig record from an op name.
         if self.is_perform_call(ast, node, ctx) {
             return self.synth_perform(lang, ast, node, kids, ctx);
+        }
+        // Cubical univalence call form (ADR-0208 P4): `ua(e)` /
+        // `Univalence(e)` mint the same path-carrying `type.pi` the
+        // `univalence` keyword produces — intercepted by callee name
+        // before ordinary application (`ua` stays an ordinary
+        // identifier everywhere else).
+        if let Some(callee_node) = ast.get(AstRef::new(callee_idx))
+            && callee_node.kind == "var"
+            && matches!(node_name(callee_node).as_deref(), Some("ua" | "Univalence"))
+        {
+            if kids.len() != 2 {
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "ua/Univalence needs exactly one equivalence operand".to_string(),
+                    node.span,
+                );
+                return Ok(self.cub_unknown(ctx));
+            }
+            let arg_idx = kids[1]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("call: arg index not a u64".to_string()))?
+                as usize;
+            return self.synth_univalence_core(lang, ast, arg_idx, node.span, ctx);
         }
         let mut cur = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
         // `f()` — zero-argument application. Legal only when the
