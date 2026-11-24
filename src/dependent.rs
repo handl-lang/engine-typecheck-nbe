@@ -106,6 +106,47 @@ fn path_val(frm: Value, to: Value) -> Value {
     Value::Object(m)
 }
 
+/// Endpoint pair `(frm, to)` of a path witness value: a legacy
+/// `Path{frm,to}` record, a `type.eq{left,right}`, or a cubical
+/// path-carrying `type.pi` (`path{x,y}` payload, ADR-0208 P1).
+/// `None` for non-path carriers.
+fn path_witness_endpoints(v: &Value) -> Option<(Value, Value)> {
+    match tag_of(v) {
+        Some("Path") => Some((
+            v.get("frm").cloned().unwrap_or(Value::Null),
+            v.get("to").cloned().unwrap_or(Value::Null),
+        )),
+        Some("type.eq") => Some((
+            v.get("left").cloned().unwrap_or(Value::Null),
+            v.get("right").cloned().unwrap_or(Value::Null),
+        )),
+        Some("type.pi") => v.get("path").map(|p| {
+            (
+                p.get("x").cloned().unwrap_or(Value::Null),
+                p.get("y").cloned().unwrap_or(Value::Null),
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// The body a `body_closure` stands for when no AST elaboration is
+/// available (dependent unification, ADR-0208 P1): `const_body` /
+/// `apply_type` path closures carry their body as data; a plain
+/// closure's `body` field (implicit pis) reads directly; AST-backed
+/// closures (`body_child_idx`) have no data proxy — `Null`.
+fn closure_body_proxy(ty: &Value) -> Value {
+    if let Some(bc) = ty.get("body_closure") {
+        if let Some(cb) = bc.get("const_body") {
+            return cb.clone();
+        }
+        if let Some(fam) = bc.get("apply_type") {
+            return fam.clone();
+        }
+    }
+    ty.get("body").cloned().unwrap_or(Value::Null)
+}
+
 // ---------------------------------------------------------------------------
 // The `Val`-domain bridge (`veval` → `v*` — phase-1 spec WS-B)
 // ---------------------------------------------------------------------------
@@ -333,6 +374,8 @@ fn is_builtin_type_name(name: &str) -> bool {
             | "Pi"
             | "Sigma"
             | "Forall"
+            | "I"
+            | "Interval"
     )
 }
 
@@ -2731,6 +2774,9 @@ impl NbeTypecheckEngine {
                 ));
             }
             "Type" | "Universe" | "Type0" => "type.universe",
+            // The cubical interval sort (ADR-0208 P1): `I` is the type of
+            // dimension variables and endpoints `i0`/`i1`.
+            "I" | "Interval" => "type.interval",
             // `Sig` — the `IO(sig)` signature-record sort (a row
             // binder's declared sort in `f<s : Sig> : … IO(s)`): an
             // op-name → signature record, i.e. the `Obj` nominal.
@@ -2839,22 +2885,15 @@ impl NbeTypecheckEngine {
                 );
                     Ok(make_tag(ctx, kind, m))
                 }
-                Some("Path") => {
-                    let frm = match arg_indices.first() {
-                        Some(&i) => {
-                            let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                            eval_index(&t, ctx)
-                        }
-                        None => Value::Null,
-                    };
-                    let to = match arg_indices.get(1) {
-                        Some(&i) => {
-                            let t = self.node_index_or_type(lang, ast, i, ctx)?;
-                            eval_index(&t, ctx)
-                        }
-                        None => Value::Null,
-                    };
-                    Ok(path_val(frm, to))
+                Some(former @ ("Path" | "PathP")) => {
+                    // `Path`/`PathP` — cubical path types (ADR-0208 P1):
+                    // `Path(A, x, y)` is the homogeneous interval function
+                    // `(i:I) → A`, `PathP(F, x, y)` the heterogeneous
+                    // `(i:I) → F i` for `F : I → Type`; `Path(a, b)` with
+                    // two arguments stays the index path. All mint
+                    // `type.pi` over `type.interval` with a `path`
+                    // endpoint payload — see `dep_synth_path_type`.
+                    self.dep_synth_path_type(lang, ast, node, &arg_indices, former, ctx)
                 }
                 Some("IO") => {
                     // `IO(sig)` — the typed-effect former (ADR-0153 §4):
@@ -2941,6 +2980,131 @@ impl NbeTypecheckEngine {
                 )),
             }
         })
+    }
+
+    /// `Path`/`PathP` in type position (ADR-0208 P1, port of the model's
+    /// `synth_path_type_`): mints a `type.pi` over the interval sort
+    /// `type.interval` whose `body_closure` is a *type-level* closure —
+    /// `const_body` for the homogeneous `Path` (`(i:I) → A`, `Path` is
+    /// the constant family special case of `PathP`) and `apply_type`
+    /// for the heterogeneous `PathP` (`(i:I) → F i` for `F : I → Type`,
+    /// typically written `Pi(I, i ~> …)`). The `path` payload records
+    /// the endpoint terms `x`/`y` for introduction (`refl`, path
+    /// witnesses) and elimination (`#`, `j`) — proof-relevant, never
+    /// erased.
+    ///
+    /// `Path(a, b)` with exactly two arguments is the legacy *index*
+    /// path: both arguments are index terms and the interval body is
+    /// `type.unknown` (index sorts are not tracked). Its `eq_*`/unify
+    /// witnesses stay `Path{frm,to}` records — only the user-facing
+    /// type former changed meaning.
+    fn dep_synth_path_type(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        arg_indices: &[usize],
+        former_name: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let mut interval_m = Map::new();
+        let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
+        let mut unknown_m = Map::new();
+        let unknown = make_tag(ctx, "type.unknown", std::mem::take(&mut unknown_m));
+        let warn = |ctx: &mut TypecheckContext, msg: String| {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: msg,
+                span: node.span,
+            });
+        };
+        if arg_indices.len() < 2 {
+            warn(
+                ctx,
+                format!("synth_type: {former_name} needs endpoint arguments"),
+            );
+            return Ok(unknown);
+        }
+        // Endpoint arguments elaborate as index *terms* —
+        // `node_to_index_term` + `eval_index`, the same reading
+        // `Path(a, b)`'s legacy arm used for its endpoints through
+        // `node_index_or_type`. The difference matters for term
+        // endpoints that are not types: `true`, `Zero`, `Succ(Zero)`
+        // are `var`/`call` nodes whose `dep_synth_type` reading would
+        // look for a *type* binding (`unbound type variable 'true'`)
+        // — as index atoms they are `var{true}`/`App{Succ, …}` terms
+        // `eval_index` canonicalizes (`Zero ↦ 0`, `Succ(Zero) ↦ 1`
+        // through the declared ctor projections).
+        let endpoint = |i: usize, ctx: &mut TypecheckContext| -> Result<Value, LangError> {
+            let node = ast.get(AstRef::new(i)).ok_or_else(|| {
+                LangError::engine(format!("dep_synth_path_type: endpoint node {i} out of bounds"))
+            })?;
+            Ok(eval_index(&self.node_to_index_term(lang, ast, node, ctx), ctx))
+        };
+        if arg_indices.len() == 2 && former_name == "Path" {
+            // `Path(a, b)` — index path: `a`/`b` are index *terms*.
+            let x = endpoint(arg_indices[0], ctx)?;
+            let y = endpoint(arg_indices[1], ctx)?;
+            let mut m = Map::new();
+            m.insert("param".to_string(), interval);
+            m.insert(
+                "body_closure".to_string(),
+                serde_json::json!({
+                    "var_name": "",
+                    "body_child_idx": Value::Null,
+                    "dep": true,
+                    "const_body": unknown,
+                }),
+            );
+            m.insert(
+                "path".to_string(),
+                serde_json::json!({"x": x, "y": y}),
+            );
+            return Ok(make_tag(ctx, "type.pi", m));
+        }
+        if arg_indices.len() < 3 {
+            warn(
+                ctx,
+                format!(
+                    "synth_type: {former_name} needs a type/family argument and two endpoints"
+                ),
+            );
+            return Ok(unknown);
+        }
+        // `Path(A, x, y)` / `PathP(F, x, y)`: the first argument is a
+        // *type* — synthesized through `dep_synth_type` — and `x`, `y`
+        // are endpoint terms.
+        let fam = self.dep_synth_type(lang, ast, arg_indices[0], ctx)?;
+        let x = endpoint(arg_indices[1], ctx)?;
+        let y = endpoint(arg_indices[2], ctx)?;
+        let fam_is_interval_pi = tag_of(&fam) == Some("type.pi")
+            && tag_of(fam.get("param").unwrap_or(&Value::Null)) == Some("type.interval");
+        let closure = if former_name == "PathP" && fam_is_interval_pi {
+            serde_json::json!({
+                "var_name": "i",
+                "body_child_idx": Value::Null,
+                "dep": true,
+                "apply_type": fam,
+            })
+        } else {
+            // `Path` is always the constant family; a `PathP` whose
+            // family did not synthesize to an interval-Pi degrades to
+            // the same constant reading.
+            serde_json::json!({
+                "var_name": "",
+                "body_child_idx": Value::Null,
+                "dep": true,
+                "const_body": fam,
+            })
+        };
+        let mut m = Map::new();
+        m.insert("param".to_string(), interval);
+        m.insert("body_closure".to_string(), closure);
+        m.insert(
+            "path".to_string(),
+            serde_json::json!({"x": x, "y": y}),
+        );
+        Ok(make_tag(ctx, "type.pi", m))
     }
 
     /// `type.Name` (a `field-access` on the `var "type"` namespace) or
@@ -4733,6 +4897,52 @@ impl NbeTypecheckEngine {
                     }
                     Ok(())
                 }
+                (Some("type.pi"), Some("type.pi")) => {
+                    // Cubical path types (ADR-0208 P1): a `path` payload
+                    // marks the Pi as `Path`/`PathP` — endpoints `x`/`y`
+                    // are part of the type's identity and unify as index
+                    // terms alongside the param; a path type never
+                    // unifies with a plain `type.pi`. Plain pis keep the
+                    // structural `unify` reading (param + payload fields;
+                    // `body_closure` is skipped there as before).
+                    match (a.get("path"), b.get("path")) {
+                        (Some(_), None) | (None, Some(_)) => {
+                            return Err(LangError::engine(
+                                "typecheck: cannot unify — path type vs plain Pi".to_string(),
+                            ));
+                        }
+                        (Some(pa), Some(pb)) => {
+                            for key in ["x", "y"] {
+                                let (ok, _) = unify_index(
+                                    pa.get(key).unwrap_or(&Value::Null),
+                                    pb.get(key).unwrap_or(&Value::Null),
+                                    ctx,
+                                );
+                                if !ok {
+                                    return Err(LangError::engine(
+                                        "typecheck: cannot unify — path endpoints differ"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            let pa_ty = a.get("param").cloned().unwrap_or(Value::Null);
+                            let pb_ty = b.get("param").cloned().unwrap_or(Value::Null);
+                            self.dep_unify(&pa_ty, &pb_ty, ctx)?;
+                            // Bodies compare through their data proxy —
+                            // `const_body` stores the family type
+                            // verbatim, `apply_type` the `I → Type`
+                            // family (full applied-body unification
+                            // needs the AST this judgment does not
+                            // carry; the family's own `type.pi` still
+                            // compares by param).
+                            let ba = closure_body_proxy(a);
+                            let bb = closure_body_proxy(b);
+                            self.dep_unify(&ba, &bb, ctx)?;
+                            Ok(())
+                        }
+                        (None, None) => self.unify(a, b, ctx),
+                    }
+                }
                 (Some("type.function"), Some("type.function")) => {
                     // Recurse dependently: `family_app` codomains unify by
                     // index (`unify_index`), which plain `unify` cannot see
@@ -4829,6 +5039,17 @@ impl NbeTypecheckEngine {
                         // rigidly (Γ + results) and check the same node
                         // against the already-elaborated `body`.
                         Some(self.dep_intro_implicit(lang, ast, node_ref, expected, ctx))
+                    } else if tag == "type.pi"
+                        && expected.get("path").is_some()
+                        && node.kind != "function"
+                    {
+                        // A `type.pi` carrying a `path` payload is a cubical
+                        // path type (ADR-0208 P1): `(i:I) → A`/`(i:I) → F i`
+                        // with endpoints `x`,`y`. `refl` and path witnesses
+                        // check through `dep_check_path_intro`; a `function`
+                        // node is still a genuine Π-introduction (`λi. body`
+                        // IS a path) and falls to `dep_intro_arrow`.
+                        Some(self.dep_check_path_intro(lang, ast, node_ref, expected, ctx))
                     } else if node.kind == "function" {
                         Some(self.dep_intro_arrow(lang, ast, node, expected, ctx))
                     } else if tag == "type.sigma" && node.kind == "array" {
@@ -4958,6 +5179,85 @@ impl NbeTypecheckEngine {
                 _ => None,
             }
         })
+    }
+
+    /// Path introduction against a cubical path type (ADR-0208 P1 — port
+    /// of the model's `check_path_intro_`): `expected` is a `type.pi`
+    /// over `type.interval` carrying a `path{x,y}` endpoint payload.
+    /// `refl` inhabits the reflexive case — the expected endpoints must
+    /// unify — and a path witness (a `Path{frm,to}`/`type.eq` value, a
+    /// path-carrying `type.pi`, bound in `results` as an `eq_<name>`
+    /// witness, in Γ as a path-typed hypothesis, or synthesized as the
+    /// node's own type) inhabits the expected path when its endpoints
+    /// unify with the expected ones. Anything else is not a path.
+    fn dep_check_path_intro(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        expected: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(node_ref).ok_or_else(|| {
+            LangError::engine("dep_check_path_intro: node out of bounds".to_string())
+        })?;
+        let epath = expected.get("path").cloned().unwrap_or(Value::Null);
+        let efrm = zonk_index(epath.get("x").unwrap_or(&Value::Null), ctx);
+        let eto = zonk_index(epath.get("y").unwrap_or(&Value::Null), ctx);
+        if node.kind == "var" && node_name(node).as_deref() == Some("refl") {
+            let (ok, decided) = unify_index(&efrm, &eto, ctx);
+            return if ok {
+                Ok(expected.clone())
+            } else {
+                Err(LangError::engine(format!(
+                    "typecheck: refl cannot prove Path({efrm:?}, {eto:?}){}",
+                    if decided {
+                        " — decided inequality"
+                    } else {
+                        ""
+                    }
+                )))
+            };
+        }
+        // Witness carriers, in the model's pv→gt order: a var's bound
+        // values (`results` `eq_<name>` Path records, then its Γ/global
+        // type — a path-typed hypothesis), then the node's synthesized
+        // type. The first carrier that *is* a path decides; its
+        // endpoints unify once against the expected ones.
+        let mut carriers: Vec<Value> = Vec::new();
+        if node.kind == "var"
+            && let Some(n) = node_name(node)
+        {
+            if let Some(w) = ctx.results.get(&n) {
+                carriers.push(w.clone());
+            }
+            if let Some(w) = ctx.lookup(&n) {
+                carriers.push(w.clone());
+            }
+        }
+        if let Ok(wt) = self.synth_node(lang, ast, node_ref, ctx) {
+            carriers.push(wt);
+        }
+        for cand in &carriers {
+            if let Some((wfrm, wto)) = path_witness_endpoints(cand) {
+                let (uf, _) = unify_index(&wfrm, &efrm, ctx);
+                let (ut, _) = if uf {
+                    unify_index(&wto, &eto, ctx)
+                } else {
+                    (false, false)
+                };
+                return if uf && ut {
+                    Ok(expected.clone())
+                } else {
+                    Err(LangError::engine(
+                        "typecheck: path endpoints do not match the expected Path".to_string(),
+                    ))
+                };
+            }
+        }
+        Err(LangError::engine(
+            "typecheck: term is not a Path witness".to_string(),
+        ))
     }
 
     /// `function` checked against `type.pi`/`type.family` — bind the
@@ -5112,6 +5412,26 @@ impl NbeTypecheckEngine {
         let bc = ty
             .get("body_closure")
             .ok_or_else(|| LangError::engine("dep_closure_apply: no body_closure".to_string()))?;
+        // Cubical path closures (ADR-0208 P1) carry no `body_child_idx`:
+        // `const_body` is a stored type value returned verbatim (the
+        // homogeneous `(i:I) → A` ignores the dimension), and
+        // `apply_type` is a stored `I → Type` family value applied at
+        // the term this closure's `var_name` is bound to in `results`
+        // (set by `dep_intro_arrow` — `(i:I) → F i` has no AST node for
+        // `F i`, so the body is computed by re-entering the term
+        // applicator on the family).
+        if let Some(cb) = bc.get("const_body") {
+            return Ok(cb.clone());
+        }
+        if let Some(fam) = bc.get("apply_type") {
+            let var_name = bc.get("var_name").and_then(Value::as_str).unwrap_or("i");
+            let term = ctx
+                .results
+                .get(var_name)
+                .cloned()
+                .unwrap_or_else(|| var_term(var_name));
+            return self.dep_closure_apply_term(lang, ast, fam, &term, ctx);
+        }
         let var_name = bc.get("var_name").and_then(Value::as_str).unwrap_or("x");
         let body_idx = bc
             .get("body_child_idx")
@@ -5178,6 +5498,16 @@ impl NbeTypecheckEngine {
         let bc = ty
             .get("body_closure")
             .ok_or_else(|| LangError::engine("dep_closure_apply: no body_closure".to_string()))?;
+        // Cubical path closures (ADR-0208 P1): `const_body` returns the
+        // stored type verbatim; `apply_type` re-enters this applicator
+        // on the stored `I → Type` family at the same dimension term —
+        // `(i:I) → F i` has no AST body of its own.
+        if let Some(cb) = bc.get("const_body") {
+            return Ok(cb.clone());
+        }
+        if let Some(fam) = bc.get("apply_type") {
+            return self.dep_closure_apply_term(lang, ast, fam, term, ctx);
+        }
         let var_name = bc
             .get("var_name")
             .and_then(Value::as_str)
@@ -5861,6 +6191,24 @@ impl NbeTypecheckEngine {
                 && tag_of(w) == Some("Path") {
                     return Some(w.clone());
                 }
+            // A cubical path type (`type.pi` + `path` payload,
+            // ADR-0208 P1) is a path whose endpoints are the payload's
+            // `x`/`y` — `p : Path(A, x, y)` / `PathP(F, x, y)` /
+            // `Path(a, b)` all resolve through it, so `#`/`j` keep
+            // consuming the `Path{frm,to}` spelling.
+            for bound in [ctx.results.get(&name), ctx.lookup(&name)]
+                .into_iter()
+                .flatten()
+            {
+                if tag_of(bound) == Some("type.pi")
+                    && let Some(p) = bound.get("path")
+                {
+                    return Some(path_val(
+                        p.get("x").cloned().unwrap_or(Value::Null),
+                        p.get("y").cloned().unwrap_or(Value::Null),
+                    ));
+                }
+            }
             let bound = ctx
                 .results
                 .get(&name)

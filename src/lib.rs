@@ -1287,6 +1287,18 @@ impl NbeTypecheckEngine {
                             .registry
                             .construct("Refl", &Value::Null)
                             .ok_or_else(|| LangError::engine("lookup: construct Refl failed")),
+                        // Cubical interval endpoints (ADR-0208 P1): `i0`/`i1`
+                        // are the closed terms of the `I`/`Interval` sort —
+                        // `type.interval` is their synthesized type, and as
+                        // index atoms `var{i0}`/`var{i1}` they stay distinct
+                        // under `unify_index`, so `refl` cannot inhabit
+                        // `PathP(F, i0, i1)` for a non-constant `F`.
+                        None if name == "i0" || name == "i1" => ctx
+                            .registry
+                            .construct("type.interval", &Value::Null)
+                            .ok_or_else(|| {
+                                LangError::engine("lookup: construct type.interval failed")
+                            }),
                         // Ambient globals (`Language::globals`, globals.yaml)
                         // are ordinary identifiers bound to *values* — e.g.
                         // `true`/`false` are the canonical booleans, not
