@@ -577,13 +577,11 @@ impl Checker {
             FormerSig::Id => match args {
                 [x] => self.infer_id(None, x),
                 [k, x] => self.infer_id(Some(k), x),
-                _ => {
-                    Err(TcError::Arity {
-                        former: head.name().to_string(),
-                        want: 2,
-                        got: args.len(),
-                    })
-                }
+                _ => Err(TcError::Arity {
+                    former: head.name().to_string(),
+                    want: 2,
+                    got: args.len(),
+                }),
             },
         }
     }
@@ -671,36 +669,38 @@ impl Checker {
     /// non-cell.
     fn cell_faces_at(&mut self, v: &Val, vt: &Val, j: u64) -> Result<Option<(Val, Val)>, TcError> {
         if let Val::Former { head, args } = self.metas.force_head(vt)
-            && head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
-                return match self.metas.force_head(&args[0]) {
-                    Val::Const(TaggedValue::Int(m)) => {
-                        let Ok(m) = u64::try_from(*m) else {
-                            return Ok(None);
-                        };
-                        if j + 1 == m {
-                            Ok(Some((args[1].clone(), args[2].clone())))
-                        } else if j + 1 < m {
-                            // Deeper faces live inside the (m-1)-cell
-                            // boundaries — read through the source.
-                            let s = args[1].clone();
-                            match self.infer(&s) {
-                                Ok(st) => self.cell_faces_at(&s, &st, j),
-                                // An uninferrable boundary endpoint —
-                                // stuck, not a decided non-cell.
-                                Err(_) => Ok(None),
-                            }
-                        } else {
-                            Ok(Some((v.clone(), v.clone())))
+            && head.handle() == type_sym("type.hom").handle()
+            && args.len() == 3
+        {
+            return match self.metas.force_head(&args[0]) {
+                Val::Const(TaggedValue::Int(m)) => {
+                    let Ok(m) = u64::try_from(*m) else {
+                        return Ok(None);
+                    };
+                    if j + 1 == m {
+                        Ok(Some((args[1].clone(), args[2].clone())))
+                    } else if j + 1 < m {
+                        // Deeper faces live inside the (m-1)-cell
+                        // boundaries — read through the source.
+                        let s = args[1].clone();
+                        match self.infer(&s) {
+                            Ok(st) => self.cell_faces_at(&s, &st, j),
+                            // An uninferrable boundary endpoint —
+                            // stuck, not a decided non-cell.
+                            Err(_) => Ok(None),
                         }
+                    } else {
+                        Ok(Some((v.clone(), v.clone())))
                     }
-                    // Open dimension: at `j = 0` keep the endpoint's
-                    // own faces (the n=2 rule read `Hom(?m, s, t)`
-                    // boundaries as `(s, t)`); deeper levels can't be
-                    // decided — stuck.
-                    _ if j == 0 => Ok(Some((args[1].clone(), args[2].clone()))),
-                    _ => Ok(None),
-                };
-            }
+                }
+                // Open dimension: at `j = 0` keep the endpoint's
+                // own faces (the n=2 rule read `Hom(?m, s, t)`
+                // boundaries as `(s, t)`); deeper levels can't be
+                // decided — stuck.
+                _ if j == 0 => Ok(Some((args[1].clone(), args[2].clone()))),
+                _ => Ok(None),
+            };
+        }
         match self.metas.force_head(vt) {
             Val::Universe(_) | Val::Nominal(_) => Ok(Some((v.clone(), v.clone()))),
             Val::Flex { .. } | Val::Unfold { .. } => Ok(None),
@@ -729,9 +729,11 @@ impl Checker {
     /// degenerate cell — `(v, v)`. `None` when `vt` is neither.
     fn cell_boundaries(&mut self, v: &Val, vt: &Val) -> Result<(Val, Val), TcError> {
         if let Val::Former { head, args } = self.metas.force_head(vt)
-            && head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
-                return Ok((args[1].clone(), args[2].clone()));
-            }
+            && head.handle() == type_sym("type.hom").handle()
+            && args.len() == 3
+        {
+            return Ok((args[1].clone(), args[2].clone()));
+        }
         // Objects are degenerate cells: `a` is its own boundary.
         if matches!(
             self.metas.force_head(vt),
@@ -746,10 +748,12 @@ impl Checker {
     /// `None` for non-`Hom` types or non-literal `m`.
     fn hom_dim(&self, vt: &Val) -> Option<u64> {
         if let Val::Former { head, args } = self.metas.force_head(vt)
-            && head.handle() == type_sym("type.hom").handle() && args.len() == 3
-                && let Val::Const(TaggedValue::Int(m)) = self.metas.force_head(&args[0]) {
-                    return u64::try_from(*m).ok();
-                }
+            && head.handle() == type_sym("type.hom").handle()
+            && args.len() == 3
+            && let Val::Const(TaggedValue::Int(m)) = self.metas.force_head(&args[0])
+        {
+            return u64::try_from(*m).ok();
+        }
         None
     }
 
@@ -819,9 +823,10 @@ impl Checker {
         // degenerate `d`-cell `id` — faces are the operand itself.
         let face = |v: &Val, vt: &Val, lvl: Option<u64>| -> (Val, Val) {
             if lvl == Some(d)
-                && let Val::Former { args, .. } = self.metas.force_head(vt) {
-                    return (args[1].clone(), args[2].clone());
-                }
+                && let Val::Former { args, .. } = self.metas.force_head(vt)
+            {
+                return (args[1].clone(), args[2].clone());
+            }
             (v.clone(), v.clone())
         };
         let (sa, ta_b) = face(a, ta, ma);
@@ -851,9 +856,11 @@ impl Checker {
                 return None;
             }
             if let Val::Former { head, args } = self.metas.force_head(vt)
-                && head.handle() == type_sym("type.hom").handle() && args.len() == 3 {
-                    return Some(args[0].clone());
-                }
+                && head.handle() == type_sym("type.hom").handle()
+                && args.len() == 3
+            {
+                return Some(args[0].clone());
+            }
             None
         };
         if let Some(dv) = open_dim(ta, ma).or_else(|| open_dim(tb, mb)) {
@@ -1241,17 +1248,18 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                 // [...]}}` (quote's encoding) and `{"__former__": <sym>,
                 // "indices": [...]}` (0152's surface object).
                 if let TaggedValue::Obj(fm) = f
-                    && let Some(TaggedValue::Sym(head)) = fm.get("sym") {
-                        let args = fm
-                            .get("args")
-                            .or_else(|| fm.get("indices"))
-                            .map(|a| lift_list(lvl, a))
-                            .unwrap_or_default();
-                        return Val::Former {
-                            head: head.clone(),
-                            args,
-                        };
-                    }
+                    && let Some(TaggedValue::Sym(head)) = fm.get("sym")
+                {
+                    let args = fm
+                        .get("args")
+                        .or_else(|| fm.get("indices"))
+                        .map(|a| lift_list(lvl, a))
+                        .unwrap_or_default();
+                    return Val::Former {
+                        head: head.clone(),
+                        args,
+                    };
+                }
                 if let TaggedValue::Sym(head) = f {
                     let args = m
                         .get("indices")
@@ -1265,9 +1273,10 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
                 }
             }
             if let Some(t) = m.get("__type__")
-                && let TaggedValue::Int(i) = t {
-                    return Val::Universe((*i).max(0) as u32);
-                }
+                && let TaggedValue::Int(i) = t
+            {
+                return Val::Universe((*i).max(0) as u32);
+            }
             if let Some(TaggedValue::Int(id)) = m.get("__meta__") {
                 return Val::Flex {
                     meta: *id as MetaId,

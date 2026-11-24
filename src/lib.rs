@@ -96,9 +96,7 @@ use handl_plugin_lib_tag::TypeRegistry;
 use handl_value::{TaggedValue, nbe::Val};
 use hnl_engine::TermData;
 use hnl_exec::{EvalEngine, EvalRequest};
-use hnl_tool_typecheck::{
-    TypecheckDiagnostic, TypecheckEngine, TypecheckRequest, TypecheckResult,
-};
+use hnl_tool_typecheck::{TypecheckDiagnostic, TypecheckEngine, TypecheckRequest, TypecheckResult};
 
 pub mod checker;
 mod dependent;
@@ -406,10 +404,10 @@ impl NbeTypecheckEngine {
                 && self
                     .dep_synth_type(lang, ast, node_ref.index(), ctx)
                     .is_ok()
-                {
-                    ctx.node_types.insert(node_ref.index(), expected.clone());
-                    return Ok(());
-                }
+            {
+                ctx.node_types.insert(node_ref.index(), expected.clone());
+                return Ok(());
+            }
             // An unsolved metavariable carries no structure to check
             // against — synthesize and let unification solve it. (The
             // `check` schemes are directed: `type_field` of a meta yields
@@ -830,16 +828,17 @@ impl NbeTypecheckEngine {
                     let base_val =
                         self.eval_type_scheme_td(lang, ast, node_ref, base, ctx, incoming)?;
                     if let Some(tag) = path_val.get("__tag__").and_then(Value::as_str)
-                        && (tag == "Path" || tag == "Rewrite") {
-                            return self.eval_type_scheme_td(
-                                lang,
-                                ast,
-                                node_ref,
-                                motive,
-                                ctx,
-                                Some(base_val),
-                            );
-                        }
+                        && (tag == "Path" || tag == "Rewrite")
+                    {
+                        return self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            motive,
+                            ctx,
+                            Some(base_val),
+                        );
+                    }
                     Ok(base_val)
                 }
                 _ => Ok(incoming.unwrap_or(Value::Null)),
@@ -2690,12 +2689,13 @@ impl NbeTypecheckEngine {
                             // or `(n) -> n % 3 == 0`). Try evaluating it via the
                             // eval engine to get a predicate closure.
                             if self.pure
-                                && let Err(_e) = check_pure(lang, ast, AstRef::new(type_idx)) {
-                                    // Impure type expression — can't evaluate
-                                    // safely. Return the original
-                                    // `interpret_type_expr` error.
-                                    return Err(interp_err);
-                                }
+                                && let Err(_e) = check_pure(lang, ast, AstRef::new(type_idx))
+                            {
+                                // Impure type expression — can't evaluate
+                                // safely. Return the original
+                                // `interpret_type_expr` error.
+                                return Err(interp_err);
+                            }
                             let sub = ast.subtree(AstRef::new(type_idx))?;
                             let req = EvalRequest::new(sub);
                             match self.eval_engine.eval(lang, &req) {
@@ -2781,9 +2781,7 @@ impl NbeTypecheckEngine {
                     // `type.array` and the field is a numeric index, return the
                     // array's element type; if it is `type.record`, look up the
                     // string field name.
-                    let field_value = match lit
-                        .filter(|&v| !v.is_null())
-                    {
+                    let field_value = match lit.filter(|&v| !v.is_null()) {
                         Some(v) => v.clone(),
                         None => incoming.clone().ok_or_else(|| {
                             LangError::engine("record_field_type: no field name in lit or incoming")
@@ -3819,10 +3817,11 @@ impl NbeTypecheckEngine {
                         incoming.clone().unwrap_or(Value::Null)
                     };
                     if let Some(tag) = ctx.registry.as_type_tag(&type_val)
-                        && tag == "type.universe" {
-                            let level = type_val.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
-                            return Ok(Value::from(level));
-                        }
+                        && tag == "type.universe"
+                    {
+                        let level = type_val.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
+                        return Ok(Value::from(level));
+                    }
                     // For other type values, return 0 (base types live in Type_0).
                     Ok(Value::from(0u64))
                 }
@@ -4109,9 +4108,10 @@ impl NbeTypecheckEngine {
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
             if let Some(obj) = v.as_object() {
                 if let Some(meta) = obj.get("__meta__")
-                    && meta.as_u64() == Some(meta_id as u64) {
-                        return true;
-                    }
+                    && meta.as_u64() == Some(meta_id as u64)
+                {
+                    return true;
+                }
                 // Recurse into all object values.
                 for (_, val) in obj {
                     if self.occurs_in(meta_id, val) {
@@ -4218,10 +4218,11 @@ impl NbeTypecheckEngine {
             match pattern_role {
                 Some("leaf") => {
                     if let Some(name) = pattern.payload.as_str()
-                        && name != "_" {
-                            let meta = ctx.fresh_meta();
-                            ctx.extend(name.to_string(), meta_value(meta));
-                        }
+                        && name != "_"
+                    {
+                        let meta = ctx.fresh_meta();
+                        ctx.extend(name.to_string(), meta_value(meta));
+                    }
                     Ok(())
                 }
                 Some("sequence") => {
@@ -4240,40 +4241,40 @@ impl NbeTypecheckEngine {
                     if scrutinee_type.get("__tag__").and_then(Value::as_str) == Some("type.sigma")
                         && let Some(children) =
                             pattern.payload.get("children").and_then(|c| c.as_array())
-                        {
-                            let elem_refs: Vec<AstRef> = children
-                                .iter()
-                                .skip(start)
-                                .filter_map(|e| e.as_u64().map(|i| AstRef::new(i as usize)))
-                                .collect();
-                            let elem_kinds: Vec<&str> = elem_refs
-                                .iter()
-                                .filter_map(|r| ast.get(*r))
-                                .map(|n| {
-                                    lang.ast
-                                        .get_by_identity(&n.kind)
-                                        .and_then(|s| s.pattern_role.as_deref())
-                                        .unwrap_or("")
-                                })
-                                .collect();
-                            if elem_refs.len() == 2 && !elem_kinds.contains(&"rest") {
-                                let witness_node = ast.get(elem_refs[0]).ok_or_else(|| {
-                                    LangError::engine(format!(
-                                        "bind_pattern_vars: sigma witness node {} out of bounds",
-                                        elem_refs[0].index()
-                                    ))
-                                })?;
-                                return self.bind_sigma_destructure(
-                                    lang,
-                                    ast,
-                                    witness_node,
-                                    elem_refs[0],
-                                    elem_refs[1],
-                                    scrutinee_type,
-                                    ctx,
-                                );
-                            }
+                    {
+                        let elem_refs: Vec<AstRef> = children
+                            .iter()
+                            .skip(start)
+                            .filter_map(|e| e.as_u64().map(|i| AstRef::new(i as usize)))
+                            .collect();
+                        let elem_kinds: Vec<&str> = elem_refs
+                            .iter()
+                            .filter_map(|r| ast.get(*r))
+                            .map(|n| {
+                                lang.ast
+                                    .get_by_identity(&n.kind)
+                                    .and_then(|s| s.pattern_role.as_deref())
+                                    .unwrap_or("")
+                            })
+                            .collect();
+                        if elem_refs.len() == 2 && !elem_kinds.contains(&"rest") {
+                            let witness_node = ast.get(elem_refs[0]).ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "bind_pattern_vars: sigma witness node {} out of bounds",
+                                    elem_refs[0].index()
+                                ))
+                            })?;
+                            return self.bind_sigma_destructure(
+                                lang,
+                                ast,
+                                witness_node,
+                                elem_refs[0],
+                                elem_refs[1],
+                                scrutinee_type,
+                                ctx,
+                            );
                         }
+                    }
                     let element_type = scrutinee_type
                         .get("element")
                         .cloned()
@@ -4356,15 +4357,16 @@ impl NbeTypecheckEngine {
                         .unwrap_or(0);
                     if let Some(children) =
                         pattern.payload.get("children").and_then(|c| c.as_array())
-                        && let Some(entry) = children.get(subject_idx).and_then(|v| v.as_u64()) {
-                            self.bind_pattern_vars(
-                                lang,
-                                ast,
-                                AstRef::new(entry as usize),
-                                scrutinee_type,
-                                ctx,
-                            )?;
-                        }
+                        && let Some(entry) = children.get(subject_idx).and_then(|v| v.as_u64())
+                    {
+                        self.bind_pattern_vars(
+                            lang,
+                            ast,
+                            AstRef::new(entry as usize),
+                            scrutinee_type,
+                            ctx,
+                        )?;
+                    }
                     Ok(())
                 }
                 _ => self.bind_pattern_vars_legacy(
@@ -4445,10 +4447,11 @@ impl NbeTypecheckEngine {
         match pattern.kind.as_str() {
             "var" => {
                 if let Some(name) = pattern.payload.as_str()
-                    && name != "_" {
-                        let meta = ctx.fresh_meta();
-                        ctx.extend(name.to_string(), meta_value(meta));
-                    }
+                    && name != "_"
+                {
+                    let meta = ctx.fresh_meta();
+                    ctx.extend(name.to_string(), meta_value(meta));
+                }
                 Ok(())
             }
             "array" => {
@@ -4503,15 +4506,16 @@ impl NbeTypecheckEngine {
             }
             "rest" => {
                 if let Some(children) = pattern.payload.get("children").and_then(|c| c.as_array())
-                    && let Some(first) = children.first().and_then(|v| v.as_u64()) {
-                        self.bind_pattern_vars(
-                            lang,
-                            ast,
-                            AstRef::new(first as usize),
-                            scrutinee_type,
-                            ctx,
-                        )?;
-                    }
+                    && let Some(first) = children.first().and_then(|v| v.as_u64())
+                {
+                    self.bind_pattern_vars(
+                        lang,
+                        ast,
+                        AstRef::new(first as usize),
+                        scrutinee_type,
+                        ctx,
+                    )?;
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -5471,25 +5475,24 @@ impl NbeTypecheckEngine {
                 .first()
                 .and_then(Value::as_u64)
                 .map(|i| AstRef::new(i as usize))
-            {
-                let ty = self.loose_synth_node(lang, ast, vref, ctx)?;
-                ctx.extend(name.to_string(), ty.clone());
-                return Ok(ty);
-            }
+        {
+            let ty = self.loose_synth_node(lang, ast, vref, ctx)?;
+            ctx.extend(name.to_string(), ty.clone());
+            return Ok(ty);
+        }
         if kids.len() == 2
             && let Some((tidx, vidx)) = kids[0].as_u64().zip(kids[1].as_u64())
-                && let Some(lhs) = ast.get(AstRef::new(tidx as usize)) {
-                    let annot_like = role_declared(lang, &lhs.kind, "annot")
-                        || role_declared(lang, &lhs.kind, "subject")
-                        || role_declared(lang, &lhs.kind, "params");
-                    if !annot_like
-                        && let Some(name) = lhs.payload.as_str().map(str::to_string) {
-                            let ty =
-                                self.loose_synth_node(lang, ast, AstRef::new(vidx as usize), ctx)?;
-                            ctx.extend(name, ty.clone());
-                            return Ok(ty);
-                        }
-                }
+            && let Some(lhs) = ast.get(AstRef::new(tidx as usize))
+        {
+            let annot_like = role_declared(lang, &lhs.kind, "annot")
+                || role_declared(lang, &lhs.kind, "subject")
+                || role_declared(lang, &lhs.kind, "params");
+            if !annot_like && let Some(name) = lhs.payload.as_str().map(str::to_string) {
+                let ty = self.loose_synth_node(lang, ast, AstRef::new(vidx as usize), ctx)?;
+                ctx.extend(name, ty.clone());
+                return Ok(ty);
+            }
+        }
         self.synth_assign_judgment(lang, ast, node, ctx)
     }
 
@@ -5980,116 +5983,117 @@ impl NbeTypecheckEngine {
             // recursively unifying the `param` and `body` payload fields.
             if let (Some(tag_a), Some(tag_b)) =
                 (ctx.registry.as_type_tag(a), ctx.registry.as_type_tag(b))
-                && tag_a == tag_b {
-                    // Universe cumulativity (ADR-0054): two `type.universe` values
-                    // unify iff their levels are equal. The cumulative hierarchy
-                    // is `Type_0 ⊆ Type_1 ⊆ ...`; for unification we require
-                    // equality (mirrors the legacy `l1.le(l2) && l2.le(l1)`).
-                    // Subtyping (`Type_n ⊆ Type_m` if `n ≤ m`) is reserved for a
-                    // future subtyping judgment.
-                    if tag_a == "type.universe" {
-                        let level_a = a.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let level_b = b.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
-                        if level_a == level_b {
-                            return Ok(());
-                        } else {
-                            return Err(LangError::engine(format!(
-                                "typecheck: cannot unify Type_{} with Type_{}",
-                                level_a, level_b
-                            )));
-                        }
-                    }
-                    // Row-polymorphic record unification (ADR-0074 ID.7):
-                    // `type.record` values may carry a `rest` field holding a
-                    // row variable (metavariable). When present, the record is
-                    // OPEN and `rest` captures extra fields during unification.
-                    // When absent, the record is CLOSED (exact field match).
-                    // This special case must run BEFORE the general same-tag
-                    // structural unification, which would require identical
-                    // payload keys.
-                    if tag_a == "type.record" {
-                        return self.unify_record(a, b, ctx);
-                    }
-                    // Row-polymorphic effect row unification (ADR-0054 /
-                    // ADR-0076): `type.effects` values carry an `ops` array and
-                    // an optional `rest` row variable. This special case must run
-                    // BEFORE the general same-tag structural unification, which
-                    // would try to unify the `ops` arrays as JSON arrays and the
-                    // `rest` row variables as plain values.
-                    if tag_a == "type.effects" {
-                        return self.unify_effects(a, b, ctx);
-                    }
-                    // Effect row unification (ADR-0054 / ADR-0076):
-                    // `type.function` values may carry an `effects` field holding
-                    // a `type.effects` value (an effect row). When both sides have
-                    // an `effects` field, the rows are unified via
-                    // [`unify_effects`] (row-polymorphic). When one or both sides
-                    // lack `effects`, effect unification is skipped (backward
-                    // compatible — the function's effects are unknown/untracked).
-                    // The `param` and `body` fields are always unified
-                    // structurally. This special case must run BEFORE the general
-                    // same-tag structural unification, which would treat a
-                    // missing `effects` field as `Null` and fail.
-                    if tag_a == "type.function" {
-                        let effects_a = a.get("effects");
-                        let effects_b = b.get("effects");
-                        let param_a = a.get("param").unwrap_or(&Value::Null);
-                        let param_b = b.get("param").unwrap_or(&Value::Null);
-                        self.unify(param_a, param_b, ctx)?;
-                        let body_a = a.get("body").unwrap_or(&Value::Null);
-                        let body_b = b.get("body").unwrap_or(&Value::Null);
-                        self.unify(body_a, body_b, ctx)?;
-                        // Unify effects only when both sides carry an effects field.
-                        if let (Some(ea), Some(eb)) = (effects_a, effects_b) {
-                            self.unify_effects(ea, eb, ctx)?;
-                        }
+                && tag_a == tag_b
+            {
+                // Universe cumulativity (ADR-0054): two `type.universe` values
+                // unify iff their levels are equal. The cumulative hierarchy
+                // is `Type_0 ⊆ Type_1 ⊆ ...`; for unification we require
+                // equality (mirrors the legacy `l1.le(l2) && l2.le(l1)`).
+                // Subtyping (`Type_n ⊆ Type_m` if `n ≤ m`) is reserved for a
+                // future subtyping judgment.
+                if tag_a == "type.universe" {
+                    let level_a = a.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let level_b = b.get("level").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if level_a == level_b {
                         return Ok(());
+                    } else {
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify Type_{} with Type_{}",
+                            level_a, level_b
+                        )));
                     }
-                    // Both are type values with the same tag — unify payload
-                    // fields.  We use `get` (not `as_object`) because the type
-                    // value is always a JSON object (the registry guarantees
-                    // this).  We still guard with `ok_or_else` so a malformed
-                    // (non-object) type value surfaces as a `LangError` instead
-                    // of panicking.
-                    let obj_a = a.as_object().ok_or_else(|| {
-                        LangError::engine("typecheck: type value is not an object")
-                    })?;
-                    let obj_b = b.as_object().ok_or_else(|| {
-                        LangError::engine("typecheck: type value is not an object")
-                    })?;
-                    // Collect field keys from both objects, excluding the
-                    // `__tag__` and `__registry__` structural keys, the
-                    // `body_closure` field (which is an engine-internal closure
-                    // marker for dependent Pi/Sigma types — it cannot be
-                    // structurally unified; use the `unify_pi` judgment op for
-                    // full closure-based unification, ADR-0054), and the
-                    // proof-relevant provenance keys `via`/`equiv`
-                    // (ADR-0208 P4 — the model's `unify_fields` skip list).
-                    let keys: std::collections::BTreeSet<String> = obj_a
-                        .keys()
-                        .filter(|k| {
-                            *k != "__tag__"
-                                && *k != "__registry__"
-                                && *k != "body_closure"
-                                && *k != "via"
-                                && *k != "equiv"
-                        })
-                        .chain(obj_b.keys().filter(|k| {
-                            *k != "__tag__"
-                                && *k != "__registry__"
-                                && *k != "body_closure"
-                                && *k != "via"
-                                && *k != "equiv"
-                        }))
-                        .cloned()
-                        .collect();
-                    for key in keys {
-                        let va = obj_a.get(&key).unwrap_or(&Value::Null);
-                        let vb = obj_b.get(&key).unwrap_or(&Value::Null);
-                        self.unify(va, vb, ctx)?;
+                }
+                // Row-polymorphic record unification (ADR-0074 ID.7):
+                // `type.record` values may carry a `rest` field holding a
+                // row variable (metavariable). When present, the record is
+                // OPEN and `rest` captures extra fields during unification.
+                // When absent, the record is CLOSED (exact field match).
+                // This special case must run BEFORE the general same-tag
+                // structural unification, which would require identical
+                // payload keys.
+                if tag_a == "type.record" {
+                    return self.unify_record(a, b, ctx);
+                }
+                // Row-polymorphic effect row unification (ADR-0054 /
+                // ADR-0076): `type.effects` values carry an `ops` array and
+                // an optional `rest` row variable. This special case must run
+                // BEFORE the general same-tag structural unification, which
+                // would try to unify the `ops` arrays as JSON arrays and the
+                // `rest` row variables as plain values.
+                if tag_a == "type.effects" {
+                    return self.unify_effects(a, b, ctx);
+                }
+                // Effect row unification (ADR-0054 / ADR-0076):
+                // `type.function` values may carry an `effects` field holding
+                // a `type.effects` value (an effect row). When both sides have
+                // an `effects` field, the rows are unified via
+                // [`unify_effects`] (row-polymorphic). When one or both sides
+                // lack `effects`, effect unification is skipped (backward
+                // compatible — the function's effects are unknown/untracked).
+                // The `param` and `body` fields are always unified
+                // structurally. This special case must run BEFORE the general
+                // same-tag structural unification, which would treat a
+                // missing `effects` field as `Null` and fail.
+                if tag_a == "type.function" {
+                    let effects_a = a.get("effects");
+                    let effects_b = b.get("effects");
+                    let param_a = a.get("param").unwrap_or(&Value::Null);
+                    let param_b = b.get("param").unwrap_or(&Value::Null);
+                    self.unify(param_a, param_b, ctx)?;
+                    let body_a = a.get("body").unwrap_or(&Value::Null);
+                    let body_b = b.get("body").unwrap_or(&Value::Null);
+                    self.unify(body_a, body_b, ctx)?;
+                    // Unify effects only when both sides carry an effects field.
+                    if let (Some(ea), Some(eb)) = (effects_a, effects_b) {
+                        self.unify_effects(ea, eb, ctx)?;
                     }
                     return Ok(());
                 }
+                // Both are type values with the same tag — unify payload
+                // fields.  We use `get` (not `as_object`) because the type
+                // value is always a JSON object (the registry guarantees
+                // this).  We still guard with `ok_or_else` so a malformed
+                // (non-object) type value surfaces as a `LangError` instead
+                // of panicking.
+                let obj_a = a
+                    .as_object()
+                    .ok_or_else(|| LangError::engine("typecheck: type value is not an object"))?;
+                let obj_b = b
+                    .as_object()
+                    .ok_or_else(|| LangError::engine("typecheck: type value is not an object"))?;
+                // Collect field keys from both objects, excluding the
+                // `__tag__` and `__registry__` structural keys, the
+                // `body_closure` field (which is an engine-internal closure
+                // marker for dependent Pi/Sigma types — it cannot be
+                // structurally unified; use the `unify_pi` judgment op for
+                // full closure-based unification, ADR-0054), and the
+                // proof-relevant provenance keys `via`/`equiv`
+                // (ADR-0208 P4 — the model's `unify_fields` skip list).
+                let keys: std::collections::BTreeSet<String> = obj_a
+                    .keys()
+                    .filter(|k| {
+                        *k != "__tag__"
+                            && *k != "__registry__"
+                            && *k != "body_closure"
+                            && *k != "via"
+                            && *k != "equiv"
+                    })
+                    .chain(obj_b.keys().filter(|k| {
+                        *k != "__tag__"
+                            && *k != "__registry__"
+                            && *k != "body_closure"
+                            && *k != "via"
+                            && *k != "equiv"
+                    }))
+                    .cloned()
+                    .collect();
+                for key in keys {
+                    let va = obj_a.get(&key).unwrap_or(&Value::Null);
+                    let vb = obj_b.get(&key).unwrap_or(&Value::Null);
+                    self.unify(va, vb, ctx)?;
+                }
+                return Ok(());
+            }
             Err(LangError::engine(format!(
                 "typecheck: cannot unify — expected {}, got {}",
                 dependent::display_type(b, ctx),
@@ -6413,9 +6417,10 @@ impl TypecheckContext {
             // fill made `0 ≡ ?j + 1` look satisfiable and broke
             // coverage's decided-impossible arm).
             if self.nonneg_metas.contains(&id)
-                && let Some(other) = extract_meta_id(&val) {
-                    self.nonneg_metas.insert(other);
-                }
+                && let Some(other) = extract_meta_id(&val)
+            {
+                self.nonneg_metas.insert(other);
+            }
             self.metas[id as usize] = Some(val);
         }
     }
@@ -7134,12 +7139,13 @@ impl TypeModel {
 
         // Fall back to the language-level handler keyed by grade.
         if impl_json.is_none()
-            && let Some(ref grade) = required_grade {
-                impl_json = ctx
-                    .lang
-                    .handler_for_grade(grade)
-                    .and_then(|h| h.get("impls").and_then(|m| m.get(op)).cloned());
-            }
+            && let Some(ref grade) = required_grade
+        {
+            impl_json = ctx
+                .lang
+                .handler_for_grade(grade)
+                .and_then(|h| h.get("impls").and_then(|m| m.get(op)).cloned());
+        }
 
         // No handler found — let the caller fall back to native dispatch.
         let Some(impl_json) = impl_json else {

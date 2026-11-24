@@ -187,11 +187,7 @@ fn transport_term(frm: &Value, to: &Value, t: &Value) -> Value {
         return to.clone();
     }
     match t {
-        Value::Array(xs) => Value::Array(
-            xs.iter()
-                .map(|x| transport_term(frm, to, x))
-                .collect(),
-        ),
+        Value::Array(xs) => Value::Array(xs.iter().map(|x| transport_term(frm, to, x)).collect()),
         Value::Object(m) => {
             let mut out = Map::new();
             for (k, x) in m {
@@ -238,24 +234,14 @@ fn subst_transport(frm: &Value, to: &Value, v: &Value) -> Value {
         let args = v
             .get("args")
             .and_then(Value::as_array)
-            .map(|xs| {
-                Value::Array(
-                    xs.iter()
-                        .map(|a| transport_term(frm, to, a))
-                        .collect(),
-                )
-            })
+            .map(|xs| Value::Array(xs.iter().map(|a| transport_term(frm, to, a)).collect()))
             .unwrap_or(Value::Array(Vec::new()));
         let mut m = v.as_object().cloned().unwrap_or_default();
         m.insert("args".to_string(), args);
         return Value::Object(m);
     }
     match v {
-        Value::Array(xs) => Value::Array(
-            xs.iter()
-                .map(|x| subst_transport(frm, to, x))
-                .collect(),
-        ),
+        Value::Array(xs) => Value::Array(xs.iter().map(|x| subst_transport(frm, to, x)).collect()),
         Value::Object(m) => {
             let carrier = matches!(
                 tag_of(v),
@@ -787,10 +773,12 @@ fn dim_meta(ctx: &mut TypecheckContext) -> Val {
 /// `Some(m)` when `v` is `Hom(m, ·, ·)` with a literal `m`.
 fn hom_dim_lit(v: &Val) -> Option<u64> {
     if let Val::Former { head, args } = v
-        && head.handle() == checker::type_sym("type.hom").handle() && args.len() == 3
-            && let Val::Const(TaggedValue::Int(m)) = &args[0] {
-                return u64::try_from(*m).ok();
-            }
+        && head.handle() == checker::type_sym("type.hom").handle()
+        && args.len() == 3
+        && let Val::Const(TaggedValue::Int(m)) = &args[0]
+    {
+        return u64::try_from(*m).ok();
+    }
     None
 }
 
@@ -1317,10 +1305,11 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
         // naming a registered nullary ctor (`Zero`) reads as its
         // template (`0`). A `results` binding shadows — checked above.
         if let Some(p) = ctx.ctor_proj.get(name)
-            && p.arity == 0 {
-                let t = p.template.clone();
-                return eval_index_fuel(&t, ctx, fuel - 1);
-            }
+            && p.arity == 0
+        {
+            let t = p.template.clone();
+            return eval_index_fuel(&t, ctx, fuel - 1);
+        }
         return v.clone();
     }
     if tag_of(v) == Some("App") {
@@ -1341,11 +1330,12 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
         // `App{F, 1}`).
         if tag_of(&callee) == Some("var")
             && let Some(cname) = callee.get("name").and_then(Value::as_str)
-                && let Some(p) = ctx.ctor_proj.get(cname)
-                    && p.arity == args.len() {
-                        let t = proj_instantiate(&p.template, &args);
-                        return eval_index_fuel(&t, ctx, fuel - 1);
-                    }
+            && let Some(p) = ctx.ctor_proj.get(cname)
+            && p.arity == args.len()
+        {
+            let t = proj_instantiate(&p.template, &args);
+            return eval_index_fuel(&t, ctx, fuel - 1);
+        }
         return app_term(callee, args);
     }
     if tag_of(v) == Some("Bin") {
@@ -1375,9 +1365,10 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
         let o = eval_index_fuel(v.get("operand").unwrap_or(&Value::Null), ctx, fuel - 1);
         if op == "unary.neg"
-            && let Some(n) = num_val(&o) {
-                return Value::from(-n);
-            }
+            && let Some(n) = num_val(&o)
+        {
+            return Value::from(-n);
+        }
         return ring_canon(un_term(op, o));
     }
     v.clone()
@@ -1997,13 +1988,14 @@ impl IndexSolver for BuiltinIndexSolver {
         }
         for (target, term) in [(num_val(&eb), &ea), (num_val(&ea), &eb)] {
             if let Some(t) = target
-                && t.fract() == 0.0 {
-                    return match solve_index(term, t as i64, ctx) {
-                        Solve::Ok => IndexVerdict::Proven,
-                        Solve::Decided => IndexVerdict::Disproven,
-                        Solve::Stuck => IndexVerdict::Unknown,
-                    };
-                }
+                && t.fract() == 0.0
+            {
+                return match solve_index(term, t as i64, ctx) {
+                    Solve::Ok => IndexVerdict::Proven,
+                    Solve::Decided => IndexVerdict::Disproven,
+                    Solve::Stuck => IndexVerdict::Unknown,
+                };
+            }
         }
         IndexVerdict::Unknown
     }
@@ -2760,9 +2752,10 @@ fn occurs_name(ast: &Ast, node: &AstNode, name: &str) -> bool {
         });
     }
     if let Some(b) = node.payload.get("body").and_then(Value::as_u64)
-        && let Some(n) = ast.get(AstRef::new(b as usize)) {
-            return occurs_name(ast, n, name);
-        }
+        && let Some(n) = ast.get(AstRef::new(b as usize))
+    {
+        return occurs_name(ast, n, name);
+    }
     false
 }
 
@@ -2896,9 +2889,10 @@ impl NbeTypecheckEngine {
                     // type namespace (`type.Name := body`); expands
                     // transparently when Γ-bound, else the builtin table.
                     if let Some(bound) = ctx.lookup(&field).cloned()
-                        && tag_of(&bound) == Some("type.alias") {
-                            return self.expand_alias(lang, ast, &bound, &[], ctx);
-                        }
+                        && tag_of(&bound) == Some("type.alias")
+                    {
+                        return self.expand_alias(lang, ast, &bound, &[], ctx);
+                    }
                     self.dep_builtin_or_tag(&field, ctx)
                 }
                 "array" => {
@@ -3043,13 +3037,7 @@ impl NbeTypecheckEngine {
                         );
                         return Ok(self.cub_open_meta(ctx));
                     }
-                    self.dep_synth_fibrant_former(
-                        lang,
-                        ast,
-                        t_ref.unwrap().index(),
-                        node.span,
-                        ctx,
-                    )
+                    self.dep_synth_fibrant_former(lang, ast, t_ref.unwrap().index(), node.span, ctx)
                 }
                 // `forall b, T` / `exists b, T` — parse-level `Pi`/`Sigma`
                 // aliases (phase-2 WS-C sugar; `exists` is the existential
@@ -3269,9 +3257,10 @@ impl NbeTypecheckEngine {
         // `assign`s, pattern binders) — legitimately shadow builtin names:
         // `data Bool :: …` must rebind `Bool` away from `type.bool`.
         if let Some(bound) = ctx.lookup_gamma(name).cloned()
-            && let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
-                return Ok(ty);
-            }
+            && let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)?
+        {
+            return Ok(ty);
+        }
         // Builtin type names resolve before *injected* globals: `hnl
         // typecheck` seeds the whole wire-prelude name set as
         // `type.unknown` placeholders, which would otherwise report
@@ -3282,9 +3271,10 @@ impl NbeTypecheckEngine {
             return self.dep_builtin_or_tag(name, ctx);
         }
         if let Some(bound) = ctx.lookup_global(name).cloned()
-            && let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)? {
-                return Ok(ty);
-            }
+            && let Some(ty) = self.dep_bound_var_type(lang, ast, &bound, name, ctx)?
+        {
+            return Ok(ty);
+        }
         self.dep_builtin_or_tag(name, ctx)
     }
 
@@ -3524,13 +3514,7 @@ impl NbeTypecheckEngine {
                         });
                         Ok(self.cub_open_meta(ctx))
                     } else {
-                        self.dep_synth_fibrant_former(
-                            lang,
-                            ast,
-                            arg_indices[0],
-                            node.span,
-                            ctx,
-                        )
+                        self.dep_synth_fibrant_former(lang, ast, arg_indices[0], node.span, ctx)
                     }
                 }
                 Some("unglue") => {
@@ -3540,18 +3524,17 @@ impl NbeTypecheckEngine {
                     if arg_indices.len() != 1 {
                         ctx.diagnostics.push(TypecheckDiagnostic {
                             severity: "warning".to_string(),
-                            message:
-                                "synth_type: unglue needs exactly one Glue-type argument"
-                                    .to_string(),
+                            message: "synth_type: unglue needs exactly one Glue-type argument"
+                                .to_string(),
                             span: node.span,
                         });
                         Ok(self.cub_open_meta(ctx))
                     } else {
                         let u = self.dep_synth_type(lang, ast, arg_indices[0], ctx)?;
                         if tag_of(&u) == Some("type.glue") {
-                            Ok(u.get("family").cloned().unwrap_or_else(|| {
-                                self.cub_open_meta(ctx)
-                            }))
+                            Ok(u.get("family")
+                                .cloned()
+                                .unwrap_or_else(|| self.cub_open_meta(ctx)))
                         } else {
                             ctx.diagnostics.push(TypecheckDiagnostic {
                                 severity: "error".to_string(),
@@ -3601,13 +3584,8 @@ impl NbeTypecheckEngine {
                         });
                         Ok(self.cub_open_meta(ctx))
                     } else {
-                        let v = self.synth_univalence_core(
-                            lang,
-                            ast,
-                            arg_indices[0],
-                            node.span,
-                            ctx,
-                        )?;
+                        let v =
+                            self.synth_univalence_core(lang, ast, arg_indices[0], node.span, ctx)?;
                         // Degraded formation (`type.unknown`) reads as
                         // an open meta in type position.
                         Ok(if tag_of(&v) == Some("type.unknown") {
@@ -3759,9 +3737,14 @@ impl NbeTypecheckEngine {
         // through the declared ctor projections).
         let endpoint = |i: usize, ctx: &mut TypecheckContext| -> Result<Value, LangError> {
             let node = ast.get(AstRef::new(i)).ok_or_else(|| {
-                LangError::engine(format!("dep_synth_path_type: endpoint node {i} out of bounds"))
+                LangError::engine(format!(
+                    "dep_synth_path_type: endpoint node {i} out of bounds"
+                ))
             })?;
-            Ok(eval_index(&self.node_to_index_term(lang, ast, node, ctx), ctx))
+            Ok(eval_index(
+                &self.node_to_index_term(lang, ast, node, ctx),
+                ctx,
+            ))
         };
         if arg_indices.len() == 2 && former_name == "Path" {
             // `Path(a, b)` — index path: `a`/`b` are index *terms*.
@@ -3778,18 +3761,13 @@ impl NbeTypecheckEngine {
                     "const_body": unknown,
                 }),
             );
-            m.insert(
-                "path".to_string(),
-                serde_json::json!({"x": x, "y": y}),
-            );
+            m.insert("path".to_string(), serde_json::json!({"x": x, "y": y}));
             return Ok(make_tag(ctx, "type.pi", m));
         }
         if arg_indices.len() < 3 {
             warn(
                 ctx,
-                format!(
-                    "synth_type: {former_name} needs a type/family argument and two endpoints"
-                ),
+                format!("synth_type: {former_name} needs a type/family argument and two endpoints"),
             );
             return Ok(unknown);
         }
@@ -3822,10 +3800,7 @@ impl NbeTypecheckEngine {
         let mut m = Map::new();
         m.insert("param".to_string(), interval);
         m.insert("body_closure".to_string(), closure);
-        m.insert(
-            "path".to_string(),
-            serde_json::json!({"x": x, "y": y}),
-        );
+        m.insert("path".to_string(), serde_json::json!({"x": x, "y": y}));
         Ok(make_tag(ctx, "type.pi", m))
     }
 
@@ -4132,15 +4107,16 @@ impl NbeTypecheckEngine {
             // var would instantiate the ctor *signature* (its type), which
             // is not an index term.
             if node.kind == "var"
-                && let Some(cname) = node_name(node) {
-                    let cname = fam_scoped(&cname, ctx);
-                    if ctx
-                        .lookup(&cname)
-                        .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
-                    {
-                        return Ok(var_term(&cname));
-                    }
+                && let Some(cname) = node_name(node)
+            {
+                let cname = fam_scoped(&cname, ctx);
+                if ctx
+                    .lookup(&cname)
+                    .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                {
+                    return Ok(var_term(&cname));
                 }
+            }
             self.dep_synth_type(lang, ast, idx, ctx)
         })
     }
@@ -4290,13 +4266,14 @@ impl NbeTypecheckEngine {
             for (_, ty_idx) in &c.args {
                 if let Some(ti) = ty_idx
                     && let Some(n) = ast.get(AstRef::new(*ti))
-                        && !positivity_ok(ast, n, &name) {
-                            return Err(LangError::engine(format!(
-                                "synth_data: strict positivity violated: constructor '{}' \
+                    && !positivity_ok(ast, n, &name)
+                {
+                    return Err(LangError::engine(format!(
+                        "synth_data: strict positivity violated: constructor '{}' \
                                  mentions '{name}' in a negative position",
-                                c.name
-                            )));
-                        }
+                        c.name
+                    )));
+                }
             }
         }
         // `base` = the parameter sorts (`type.array` of them).
@@ -5288,15 +5265,16 @@ impl NbeTypecheckEngine {
             .and_then(|b| b.get("elements").cloned())
             .and_then(|e| e.as_array().map(|a| a.len()));
         if let Some(n) = declared_arity
-            && n != args.len() {
-                return Err(LangError::engine_node(
-                    format!(
-                        "synth_instance: instance constraint `{head}` takes {n} index argument(s), got {}",
-                        args.len()
-                    ),
-                    node,
-                ));
-            }
+            && n != args.len()
+        {
+            return Err(LangError::engine_node(
+                format!(
+                    "synth_instance: instance constraint `{head}` takes {n} index argument(s), got {}",
+                    args.len()
+                ),
+                node,
+            ));
+        }
         // Unsolved metas in the shape (the bare `instance Eq` catch-all)
         // become per-instance rigid vars — a lookup must instantiate the
         // *shape*, never solve the shared meta cell.
@@ -5782,13 +5760,14 @@ impl NbeTypecheckEngine {
             // type), checking each arm body against it rather than joining
             // synthesized body types.
             if let Some(node) = ast.get(node_ref)
-                && node.kind == "match" {
-                    match self.dep_check_match(lang, ast, node, expected, ctx) {
-                        Ok(Some(ty)) => return Some(Ok(ty)),
-                        Ok(None) => {}
-                        Err(e) => return Some(Err(e)),
-                    }
+                && node.kind == "match"
+            {
+                match self.dep_check_match(lang, ast, node, expected, ctx) {
+                    Ok(Some(ty)) => return Some(Ok(ty)),
+                    Ok(None) => {}
+                    Err(e) => return Some(Err(e)),
                 }
+            }
             let tag = tag_of(expected)?;
             if tag == "type.family_app" {
                 // Family applications check through index unification, not
@@ -6575,14 +6554,15 @@ impl NbeTypecheckEngine {
                         } else {
                             let (ok, decided) = unify_index(&ea, &eb, ctx);
                             if !ok
-                                && (decided || (num_val(&ea).is_some() && num_val(&eb).is_some())) {
-                                    // Decided-unsatisfiable index
-                                    // equation: the arm can never fire.
-                                    // No diagnostic — the arm is
-                                    // auto-discharged below.
-                                    impossible = true;
-                                    index_decided = true;
-                                }
+                                && (decided || (num_val(&ea).is_some() && num_val(&eb).is_some()))
+                            {
+                                // Decided-unsatisfiable index
+                                // equation: the arm can never fire.
+                                // No diagnostic — the arm is
+                                // auto-discharged below.
+                                impossible = true;
+                                index_decided = true;
+                            }
                             idx_args.push(eb);
                         }
                     }
@@ -6662,7 +6642,8 @@ impl NbeTypecheckEngine {
             if let Some("sequence" | "entries" | "entry" | "rest") = lang
                 .ast
                 .get_by_identity(&pattern.kind)
-                .and_then(|s| s.pattern_role.as_deref()) {
+                .and_then(|s| s.pattern_role.as_deref())
+            {
                 self.bind_pattern_vars(lang, ast, AstRef::new(pat_idx), scrutinee_type, ctx)?;
             }
 
@@ -6973,8 +6954,7 @@ impl NbeTypecheckEngine {
         let Some(callee) = ast.get(callee_ref) else {
             return false;
         };
-        callee.kind == "var"
-            && matches!(node_name(callee).as_deref(), Some("ua" | "Univalence"))
+        callee.kind == "var" && matches!(node_name(callee).as_deref(), Some("ua" | "Univalence"))
     }
 
     /// Resolve a path operand node — the model's `resolve_path_`
@@ -7935,13 +7915,7 @@ impl NbeTypecheckEngine {
         } else {
             Value::Null
         };
-        Ok(self.mint_path_type(
-            ctx,
-            w1.x.clone(),
-            w2.y.clone(),
-            closure,
-            equiv,
-        ))
+        Ok(self.mint_path_type(ctx, w1.x.clone(), w2.y.clone(), closure, equiv))
     }
 
     /// `symm p` — derived path symmetry (see the section comment):
@@ -8006,13 +7980,7 @@ impl NbeTypecheckEngine {
                 } else {
                     Value::Null
                 };
-                Ok(self.mint_path_type(
-                    ctx,
-                    w.y.clone(),
-                    w.x.clone(),
-                    w.closure.clone(),
-                    equiv,
-                ))
+                Ok(self.mint_path_type(ctx, w.y.clone(), w.x.clone(), w.closure.clone(), equiv))
             }
         }
     }
@@ -8073,18 +8041,14 @@ impl NbeTypecheckEngine {
             let Some(key_node) = ast.get(AstRef::new(kidx as usize)) else {
                 continue;
             };
-            let key = key_node
-                .payload
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| {
-                    key_node
-                        .payload
-                        .get("name")
-                        .or_else(|| key_node.payload.get("value"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
+            let key = key_node.payload.as_str().map(str::to_string).or_else(|| {
+                key_node
+                    .payload
+                    .get("name")
+                    .or_else(|| key_node.payload.get("value"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
             if key.as_deref() == Some(field)
                 && let Ok(v) = self.eval_ann_node(lang, ast, vidx as usize, ctx)
                 && !v.is_null()
@@ -8114,11 +8078,7 @@ impl NbeTypecheckEngine {
             Some("type.pi") => {
                 let p = t.get("param").cloned().unwrap_or(Value::Null);
                 let cod = self.dep_closure_apply(lang, ast, t, &p, ctx).ok()?;
-                if cod.is_null() {
-                    None
-                } else {
-                    Some((p, cod))
-                }
+                if cod.is_null() { None } else { Some((p, cod)) }
             }
             _ => None,
         }
@@ -8184,15 +8144,14 @@ impl NbeTypecheckEngine {
         };
         // Cross-check the inverse direction: `fro : B ~> A`.
         let mark = ctx.store_mark();
-        let ok = self.dep_unify(&af.0, &ad.1, ctx).is_ok()
-            && self.dep_unify(&af.1, &ad.0, ctx).is_ok();
+        let ok =
+            self.dep_unify(&af.0, &ad.1, ctx).is_ok() && self.dep_unify(&af.1, &ad.0, ctx).is_ok();
         if !ok {
             ctx.store_restore(mark);
             self.cub_diag(
                 ctx,
                 "error",
-                "univalence: equivalence `fro` does not invert `to` — expected B ~> A"
-                    .to_string(),
+                "univalence: equivalence `fro` does not invert `to` — expected B ~> A".to_string(),
                 span,
             );
             return Ok(None);
@@ -8217,9 +8176,7 @@ impl NbeTypecheckEngine {
         span: Option<handl_language::Span>,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
-        let Some((dom, cod, to, fro)) =
-            self.equiv_parts(lang, ast, equiv_idx, span, ctx)?
-        else {
+        let Some((dom, cod, to, fro)) = self.equiv_parts(lang, ast, equiv_idx, span, ctx)? else {
             return Ok(self.cub_unknown(ctx));
         };
         if dom.is_null() || cod.is_null() {
@@ -8388,13 +8345,15 @@ impl NbeTypecheckEngine {
             CubFace::Tt => self.cub_diag(
                 ctx,
                 "warning",
-                "glue: face φ ≡ 1 — Glue agrees with the section on every dimension (degenerate)".to_string(),
+                "glue: face φ ≡ 1 — Glue agrees with the section on every dimension (degenerate)"
+                    .to_string(),
                 span,
             ),
             CubFace::Ff => self.cub_diag(
                 ctx,
                 "warning",
-                "glue: face φ ≡ 0 — Glue agrees with the family on every dimension (degenerate)".to_string(),
+                "glue: face φ ≡ 0 — Glue agrees with the family on every dimension (degenerate)"
+                    .to_string(),
                 span,
             ),
             _ => {}
@@ -8528,10 +8487,14 @@ impl NbeTypecheckEngine {
             };
             match tag {
                 "type.universe" => Ok(FibrantVerdict::No),
-                "type.number" | "type.bool" | "type.string" | "type.unit"
-                | "type.interval" | "type.null" | "type.fibrant" => Ok(FibrantVerdict::Yes),
+                "type.number" | "type.bool" | "type.string" | "type.unit" | "type.interval"
+                | "type.null" | "type.fibrant" => Ok(FibrantVerdict::Yes),
                 "type.pi" | "type.sigma" | "type.forall" => {
-                    let dom_field = if tag == "type.forall" { "kind" } else { "param" };
+                    let dom_field = if tag == "type.forall" {
+                        "kind"
+                    } else {
+                        "param"
+                    };
                     let dom = t.get(dom_field).cloned().unwrap_or(Value::Null);
                     let dv = self.fibrant_verdict(lang, ast, &dom, ctx)?;
                     if dv != FibrantVerdict::Yes {
@@ -8566,12 +8529,7 @@ impl NbeTypecheckEngine {
                     if fv != FibrantVerdict::Yes {
                         return Ok(fv);
                     }
-                    self.fibrant_verdict(
-                        lang,
-                        ast,
-                        t.get("section").unwrap_or(&Value::Null),
-                        ctx,
-                    )
+                    self.fibrant_verdict(lang, ast, t.get("section").unwrap_or(&Value::Null), ctx)
                 }
                 "type.array" => {
                     // NBE mints both spellings: `element` (the `array`
@@ -8610,8 +8568,9 @@ impl NbeTypecheckEngine {
                                 (FibrantVerdict::No, _) | (_, FibrantVerdict::No) => {
                                     FibrantVerdict::No
                                 }
-                                (FibrantVerdict::Unknown, _)
-                                | (_, FibrantVerdict::Unknown) => FibrantVerdict::Unknown,
+                                (FibrantVerdict::Unknown, _) | (_, FibrantVerdict::Unknown) => {
+                                    FibrantVerdict::Unknown
+                                }
                                 _ => FibrantVerdict::Yes,
                             };
                             if verdict == FibrantVerdict::No {
@@ -8840,9 +8799,10 @@ impl NbeTypecheckEngine {
             if let Some(kids) = children_of(node) {
                 for cv in kids {
                     if let Some(i) = cv.as_u64()
-                        && let Some(child) = ast.get(AstRef::new(i as usize)) {
-                            self.bind_law_pattern_vars(lang, ast, child, ctx);
-                        }
+                        && let Some(child) = ast.get(AstRef::new(i as usize))
+                    {
+                        self.bind_law_pattern_vars(lang, ast, child, ctx);
+                    }
                 }
             }
         })
@@ -9287,8 +9247,7 @@ impl NbeTypecheckEngine {
             .and_then(Value::as_u64)
             .and_then(|i| ast.get(AstRef::new(i as usize)))
             .is_some_and(|c| {
-                c.kind == "var"
-                    && matches!(node_name(c).as_deref(), Some("ua" | "Univalence"))
+                c.kind == "var" && matches!(node_name(c).as_deref(), Some("ua" | "Univalence"))
             });
         if ua_call {
             let kids = children_of(node)
@@ -9871,13 +9830,15 @@ impl NbeTypecheckEngine {
         let mut out = io_val.as_object().cloned().unwrap_or_default();
         if let Some(f) = out.get_mut("__former__").and_then(Value::as_object_mut) {
             if let Some(args) = f.get_mut("args").and_then(Value::as_array_mut)
-                && let Some(slot) = args.first_mut() {
-                    *slot = Value::Object(out_sig);
-                }
-        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut)
-            && let Some(slot) = indices.first_mut() {
+                && let Some(slot) = args.first_mut()
+            {
                 *slot = Value::Object(out_sig);
             }
+        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut)
+            && let Some(slot) = indices.first_mut()
+        {
+            *slot = Value::Object(out_sig);
+        }
         Ok(Value::Object(out))
     }
 }
@@ -10356,9 +10317,10 @@ impl NbeTypecheckEngine {
         // `tc_bind_result`). `var{name}` inside a call annotation resolves
         // to this term (e.g. `inc ↦ Lam{params, body}`).
         if let Some(vn) = ast.get(value_ref)
-            && let Some(t) = self.node_to_ann_term(lang, ast, vn) {
-                ctx.bind_result(name.clone(), t);
-            }
+            && let Some(t) = self.node_to_ann_term(lang, ast, vn)
+        {
+            ctx.bind_result(name.clone(), t);
+        }
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
     }
@@ -10556,13 +10518,13 @@ fn collect_unbound_index_vars(
     if node.kind == "var" {
         if let Some(name) = node_name(node)
             && !name.is_empty()
-                && !ctx.results.contains_key(&name)
-                && ctx.lookup(&name).is_none()
-                && !is_builtin_type_name(&name)
-                && !out.contains(&name)
-            {
-                out.push(name);
-            }
+            && !ctx.results.contains_key(&name)
+            && ctx.lookup(&name).is_none()
+            && !is_builtin_type_name(&name)
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
         return;
     }
     if let Some(kids) = children_of(node) {

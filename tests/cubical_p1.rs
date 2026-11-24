@@ -181,10 +181,7 @@ fn refl_rejects_non_refl_endpoints() {
     let lang = canonical_lang();
     let bad_index = parse_block(&lang, &[NAT_VEC, "bad : Path(2, 3) := refl"]);
     let result = typecheck(&lang, bad_index);
-    assert!(
-        has_error(&result),
-        "refl should not inhabit Path(2, 3)"
-    );
+    assert!(has_error(&result), "refl should not inhabit Path(2, 3)");
 
     let bad_term = parse_block(
         &lang,
@@ -247,10 +244,7 @@ fn interval_endpoints_have_interval_type() {
 #[test]
 fn pathp_heterogeneous_family() {
     let lang = canonical_lang();
-    let ok = parse_block(
-        &lang,
-        &["p : PathP(Pi(I, i ~> Bool), true, true) := refl"],
-    );
+    let ok = parse_block(&lang, &["p : PathP(Pi(I, i ~> Bool), true, true) := refl"]);
     let result = typecheck(&lang, ok);
     assert!(
         !has_error(&result),
@@ -262,7 +256,10 @@ fn pathp_heterogeneous_family() {
     // cannot prove them equal.
     let bad = parse_block(
         &lang,
-        &[NAT_VEC, "p : PathP(Pi(I, i ~> Nat), Zero, Succ(Zero)) := refl"],
+        &[
+            NAT_VEC,
+            "p : PathP(Pi(I, i ~> Nat), Zero, Succ(Zero)) := refl",
+        ],
     );
     let result = typecheck(&lang, bad);
     assert!(

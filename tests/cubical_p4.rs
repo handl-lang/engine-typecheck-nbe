@@ -271,10 +271,7 @@ fn symm_swaps_univalence_direction() {
         ],
     );
     let result = typecheck(&lang, bad);
-    assert!(
-        has_error(&result),
-        "symm(ua e) # w should not inhabit Nat"
-    );
+    assert!(has_error(&result), "symm(ua e) # w should not inhabit Nat");
 }
 
 /// `trans` composes recorded equivalences: `ua(e₁) : Bool ~ Nat` and

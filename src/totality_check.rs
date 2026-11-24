@@ -220,9 +220,10 @@ fn find_assign_for_name(ast: &Ast, lang: &Language, name: &str) -> Option<AstRef
         };
         if is_binding
             && let Some(n) = extract_assign_name(ast, lang, node)
-                && n == name {
-                    return Some(AstRef::new(idx));
-                }
+            && n == name
+        {
+            return Some(AstRef::new(idx));
+        }
     }
     None
 }
@@ -337,9 +338,10 @@ fn call_decreases_on_params(ast: &Ast, call_ref: AstRef, param_names: &[String])
     // Skip child 0 (the callee); check children 1..N (the arguments).
     for arg_val in children.iter().skip(1) {
         if let Some(arg_idx) = arg_val.as_u64()
-            && is_strict_sub_structure(ast, AstRef::new(arg_idx as usize), param_names) {
-                return true;
-            }
+            && is_strict_sub_structure(ast, AstRef::new(arg_idx as usize), param_names)
+        {
+            return true;
+        }
     }
     false
 }
