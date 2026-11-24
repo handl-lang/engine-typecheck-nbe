@@ -273,6 +273,16 @@ impl NbeTypecheckEngine {
                     )
                     .unwrap_or(Value::Null),
                 Value::Object(o) => {
+                    // P-013 T-148: a seeded `type.*` type value (e.g. a
+                    // `type.module_sig` record minted for a host-module
+                    // global) is already a type — pass it through
+                    // verbatim instead of collapsing it to `type.unknown`
+                    // via the `__`-key rule below. The registry check
+                    // keeps foreign/mismatched tagged data on the
+                    // unknown path.
+                    if self.registry.is_type_value(val) {
+                        return val.clone();
+                    }
                     // Tagged engine/runtime values (e.g. `self`) are not record
                     // types; treat them as unknown.
                     if o.keys().any(|k| k.starts_with("__")) {
@@ -2180,6 +2190,24 @@ impl NbeTypecheckEngine {
                         LangError::engine("synth_symm: node out of bounds".to_string())
                     })?;
                     self.synth_symm_judgment(lang, ast, node, ctx)
+                }
+                // Cubical Glue & fibrancy (ADR-0208 P3): `glue`/`fibrant`
+                // keyword nodes reach here via their `type.glue`/
+                // `type.fibrant` rules' `synth_*` ops; `Glue`/
+                // `isFibrant`/`unglue` are call-form type names handled
+                // inside `dep_synth_call_type` (the `Path`/`PathP`
+                // precedent).
+                "synth_glue" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_glue: node out of bounds".to_string())
+                    })?;
+                    self.synth_glue_judgment(lang, ast, node, ctx)
+                }
+                "synth_fibrant" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_fibrant: node out of bounds".to_string())
+                    })?;
+                    self.synth_fibrant_judgment(lang, ast, node, ctx)
                 }
                 "synth_flow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {

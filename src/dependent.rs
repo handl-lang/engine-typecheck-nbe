@@ -413,6 +413,48 @@ fn face_has_dim(dim: &Value, f: &CubFace) -> bool {
     }
 }
 
+/// Serialize a normalized [`CubFace`] back to the model's
+/// `{"__tag__":"face","op","args"}` record shape (ADR-0208 P3) — the
+/// `face` field of a `type.glue` value. `op` is `tt`/`ff`/`eq0`/`eq1`/
+/// `not`/`or`/`and`; `args` carries the dimension term for the
+/// endpoint equations and the sub-faces for the connectives.
+fn cub_face_to_val(ctx: &TypecheckContext, f: &CubFace) -> Value {
+    fn ser_args(ctx: &TypecheckContext, f: &CubFace) -> Vec<Value> {
+        match f {
+            CubFace::Eq0(d) | CubFace::Eq1(d) => vec![d.clone()],
+            CubFace::Not(a) => vec![cub_face_to_val(ctx, a)],
+            CubFace::Or(a, b) | CubFace::And(a, b) => {
+                vec![cub_face_to_val(ctx, a), cub_face_to_val(ctx, b)]
+            }
+            _ => vec![],
+        }
+    }
+    let op = match f {
+        CubFace::Tt => "tt",
+        CubFace::Ff => "ff",
+        CubFace::Eq0(_) => "eq0",
+        CubFace::Eq1(_) => "eq1",
+        CubFace::Not(_) => "not",
+        CubFace::Or(_, _) => "or",
+        CubFace::And(_, _) => "and",
+    };
+    let mut m = Map::new();
+    m.insert("op".to_string(), Value::String(op.to_string()));
+    m.insert("args".to_string(), Value::Array(ser_args(ctx, f)));
+    make_tag(ctx, "face", m)
+}
+
+/// The structural fibrancy verdict (ADR-0208 P3) — the model's
+/// `fibrant_verdict_` tri-state: `Yes` derives the fibrancy type,
+/// `No` is a hard rejection, `Unknown` warns but never fails silently
+/// (indexed families, metas, and unhandled formers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FibrantVerdict {
+    Yes,
+    No,
+    Unknown,
+}
+
 /// The body a `body_closure` stands for when no AST elaboration is
 /// available (dependent unification, ADR-0208 P1): `const_body` /
 /// `apply_type` path closures carry their body as data; a plain
@@ -2759,6 +2801,75 @@ impl NbeTypecheckEngine {
                 "call" | "index_app" | "dimension" => {
                     self.dep_synth_call_type(lang, ast, node, ctx)
                 }
+                // `glue A, φ, T̂` in annotation position (ADR-0208 P3):
+                // the glue type former — the same formation check the
+                // `synth_glue` judgment runs in term position, yielding
+                // the `type.glue{family, face, section}` it forms.
+                "glue" => {
+                    let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+                    if kids_len < 3 {
+                        self.cub_diag(
+                            ctx,
+                            "error",
+                            "glue: needs family, face, and section operands".to_string(),
+                            node.span,
+                        );
+                        return Ok(self.cub_open_meta(ctx));
+                    }
+                    let (Some(fam_ref), Some(face_ref), Some(sec_ref)) = (
+                        Self::cub_child(lang, ast, node, "family", 0),
+                        Self::cub_child(lang, ast, node, "face", 1),
+                        Self::cub_child(lang, ast, node, "section", 2),
+                    ) else {
+                        self.cub_diag(
+                            ctx,
+                            "error",
+                            "glue: needs family, face, and section operands".to_string(),
+                            node.span,
+                        );
+                        return Ok(self.cub_open_meta(ctx));
+                    };
+                    let v = self.dep_synth_glue_type(
+                        lang,
+                        ast,
+                        fam_ref.index(),
+                        face_ref.index(),
+                        sec_ref.index(),
+                        node.span,
+                        ctx,
+                    )?;
+                    // A degraded formation (`type.unknown`) reads as an
+                    // open meta in type position — see `cub_open_meta`.
+                    Ok(if tag_of(&v) == Some("type.unknown") {
+                        self.cub_open_meta(ctx)
+                    } else {
+                        v
+                    })
+                }
+                // `fibrant A` in annotation position: the fibrancy
+                // *type* `isFibrant(A)` — `type.fibrant{of}` on a `yes`
+                // verdict, `type.unknown` + warning otherwise (the
+                // model's `synth_fibrant_former_`).
+                "fibrant" => {
+                    let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+                    let t_ref = Self::cub_child(lang, ast, node, "target", 0);
+                    if kids_len < 1 || t_ref.is_none() {
+                        self.cub_diag(
+                            ctx,
+                            "warning",
+                            "synth_type: fibrant needs a type operand".to_string(),
+                            node.span,
+                        );
+                        return Ok(self.cub_open_meta(ctx));
+                    }
+                    self.dep_synth_fibrant_former(
+                        lang,
+                        ast,
+                        t_ref.unwrap().index(),
+                        node.span,
+                        ctx,
+                    )
+                }
                 // `forall b, T` / `exists b, T` — parse-level `Pi`/`Sigma`
                 // aliases (phase-2 WS-C sugar; `exists` is the existential
                 // twin). The binder child is `type-annot(var, A)` or a bare
@@ -3185,6 +3296,91 @@ impl NbeTypecheckEngine {
                     // `type.pi` over `type.interval` with a `path`
                     // endpoint payload — see `dep_synth_path_type`.
                     self.dep_synth_path_type(lang, ast, node, &arg_indices, former, ctx)
+                }
+                Some("Glue") => {
+                    // `Glue(A, φ, T̂)` — cubical glue type former
+                    // (ADR-0208 P3): ordinary call-form identifier, no
+                    // keyword (the `Path`/`PathP` precedent). Exactly
+                    // three arguments — the `glue` keyword's
+                    // `family`/`face`/`section`.
+                    if arg_indices.len() != 3 {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message:
+                                "synth_type: Glue needs a family, a face, and a section — Glue(A, φ, T̂)"
+                                    .to_string(),
+                            span: node.span,
+                        });
+                        Ok(self.cub_open_meta(ctx))
+                    } else {
+                        let v = self.dep_synth_glue_type(
+                            lang,
+                            ast,
+                            arg_indices[0],
+                            arg_indices[1],
+                            arg_indices[2],
+                            node.span,
+                            ctx,
+                        )?;
+                        // Degraded formation (`type.unknown`) reads as an
+                        // open meta in type position — `cub_open_meta`.
+                        Ok(if tag_of(&v) == Some("type.unknown") {
+                            self.cub_open_meta(ctx)
+                        } else {
+                            v
+                        })
+                    }
+                }
+                Some("isFibrant") => {
+                    // `isFibrant(A)` — the fibrancy *type*
+                    // `type.fibrant{of}` (ADR-0208 P3).
+                    if arg_indices.len() != 1 {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message: "synth_type: isFibrant needs exactly one type argument"
+                                .to_string(),
+                            span: node.span,
+                        });
+                        Ok(self.cub_open_meta(ctx))
+                    } else {
+                        self.dep_synth_fibrant_former(
+                            lang,
+                            ast,
+                            arg_indices[0],
+                            node.span,
+                            ctx,
+                        )
+                    }
+                }
+                Some("unglue") => {
+                    // `unglue(G)` — the type-level projection back to
+                    // the underlying family `A` of `Glue A φ T̂`
+                    // (ADR-0208 P3).
+                    if arg_indices.len() != 1 {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message:
+                                "synth_type: unglue needs exactly one Glue-type argument"
+                                    .to_string(),
+                            span: node.span,
+                        });
+                        Ok(self.cub_open_meta(ctx))
+                    } else {
+                        let u = self.dep_synth_type(lang, ast, arg_indices[0], ctx)?;
+                        if tag_of(&u) == Some("type.glue") {
+                            Ok(u.get("family").cloned().unwrap_or_else(|| {
+                                self.cub_open_meta(ctx)
+                            }))
+                        } else {
+                            ctx.diagnostics.push(TypecheckDiagnostic {
+                                severity: "error".to_string(),
+                                message: "unglue: operand is not a Glue type — expected glue(A, φ, T̂) or Glue(A, φ, T̂)"
+                                    .to_string(),
+                                span: node.span,
+                            });
+                            Ok(self.cub_open_meta(ctx))
+                        }
+                    }
                 }
                 Some("IO") => {
                     // `IO(sig)` — the typed-effect former (ADR-0153 §4):
@@ -5258,6 +5454,33 @@ impl NbeTypecheckEngine {
                         display_type(a, ctx)
                     )))
                 }
+                (Some("type.fibrant"), Some("type.fibrant")) => {
+                    // `isFibrant(A)` types (ADR-0208 P3): equality is
+                    // equality of the fibrant target, routed through
+                    // `dep_unify` so a `Pi`/`Glue` target compares
+                    // bodies, not just domains (the model's
+                    // `unify_dependent_` arm).
+                    let oa = a.get("of").cloned().unwrap_or(Value::Null);
+                    let ob = b.get("of").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&oa, &ob, ctx)
+                }
+                (Some("type.glue"), Some("type.glue")) => {
+                    // `Glue A φ T̂` types (ADR-0208 P3): `family`/
+                    // `section` unify as types; the face `φ` is a
+                    // `face` record compared structurally (the model's
+                    // `==` — unification cannot see inside it).
+                    let fa = a.get("family").cloned().unwrap_or(Value::Null);
+                    let fb = b.get("family").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&fa, &fb, ctx)?;
+                    if a.get("face") != b.get("face") {
+                        return Err(LangError::engine(
+                            "typecheck: cannot unify — glue faces differ".to_string(),
+                        ));
+                    }
+                    let sa = a.get("section").cloned().unwrap_or(Value::Null);
+                    let sb = b.get("section").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&sa, &sb, ctx)
+                }
                 _ => {
                     // `Former{type.io}` — signature subtyping (record-width
                     // on the sig index): `IO(s) <: IO(s')` iff `s'` names
@@ -6694,6 +6917,18 @@ impl NbeTypecheckEngine {
         make_tag(ctx, "type.unknown", std::mem::take(&mut m))
     }
 
+    /// The *type-position* spelling of a degraded cubical former
+    /// (ADR-0208 P3): the model returns `type.unknown` ("left open"),
+    /// but NBE's assign layer re-evaluates a `type.unknown` annotation
+    /// as a *term* (`eval_ann_node` — the ordered value-annotation
+    /// fallback), which would replace the honest unknown with a stuck
+    /// application term and fail unification. A fresh metavariable is
+    /// the same "accept anything" reading without tripping that
+    /// fallback: unification solves it to the checked type.
+    fn cub_open_meta(&self, ctx: &mut TypecheckContext) -> Value {
+        meta_value(ctx.fresh_meta())
+    }
+
     /// Resolve a cubical operand child by declared role with the
     /// positional fallback (same discipline as the model's
     /// `child_role_index` + `at(children, n)`).
@@ -6732,10 +6967,14 @@ impl NbeTypecheckEngine {
         cub_face_of_val(&term)
     }
 
-    /// `A(point)` — the model's `fam_at_`: an interval-param `type.pi`
-    /// (`A : I → Type`) applies its `body_closure` at the interval
-    /// *term* `point` (`var{i0}`/`var{i1}`/the dimension `var`); any
-    /// other type is a constant family, `A(point) = A`.
+    /// `A(point)` — the model's `fam_at_`: a `type.glue` reads its
+    /// *off-face* family `A` (ADR-0208 P3 — `φ(point)` is undecided
+    /// until P4, so `A(point)` is the documented approximation; on
+    /// `φ` the section agrees with `A` only up to unchecked
+    /// equivalence data). An interval-param `type.pi` (`A : I → Type`)
+    /// applies its `body_closure` at the interval *term* `point`
+    /// (`var{i0}`/`var{i1}`/the dimension `var`); any other type is a
+    /// constant family, `A(point) = A`.
     fn fam_at(
         &self,
         lang: &Language,
@@ -6744,6 +6983,10 @@ impl NbeTypecheckEngine {
         point: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
+        if tag_of(fam) == Some("type.glue") {
+            let inner = fam.get("family").cloned().unwrap_or_else(|| fam.clone());
+            return self.fam_at(lang, ast, &inner, point, ctx);
+        }
         let is_family = tag_of(fam) == Some("type.pi")
             && tag_of(fam.get("param").unwrap_or(&Value::Null)) == Some("type.interval")
             && fam.get("body_closure").is_some();
@@ -7324,6 +7567,397 @@ impl NbeTypecheckEngine {
             }
             CubPathVerdict::Path => {
                 Ok(self.mint_path_type(ctx, w.y.clone(), w.x.clone(), w.closure.clone()))
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Cubical Glue & fibrancy (ADR-0208 P3): glue / Glue / unglue /
+    // isFibrant / fibrant
+    // -------------------------------------------------------------------
+    //
+    // CCHM-style glue types over the P1 interval and P2 faces — a
+    // *typechecker*, not a cubical kernel: `Glue A φ T̂` is represented
+    // and checked structurally as `type.glue{family, face, section}`;
+    // the interval-computational content (transport computing through
+    // the glued type, `ua`'s `transp (ua e) ≡ e`) is deferred to P4.
+    // What IS checked: the face operand must normalize to a face
+    // formula (`cub_face_of_node`/`face_norm`), the section should be
+    // an `I → Type` family (a non-family section warns — the
+    // `Partial φ (Σ T:Type, T ≃ A i)` obligation is approximated), and
+    // degenerate faces (`φ ≡ 0`/`φ ≡ 1`) warn. `unglue(G)` projects a
+    // `type.glue` back to its `family`. `isFibrant(A)`/`fibrant A`
+    // form/inhabit `type.fibrant{of}` via the structural
+    // `fibrant_verdict` below.
+
+    /// `Glue A φ T̂` formation — the model's `synth_glue_type_`, shared
+    /// by the `glue` keyword node and the `Glue(...)` call form.
+    /// `A` synthesizes as a type (a plain type is the constant
+    /// family); `φ` evaluates through the P2 face machinery; `T̂`
+    /// should synthesize as an interval `type.pi`. Mints
+    /// `type.glue{family, face, section}` with the face stored as the
+    /// model's `face{op, args}` record.
+    fn dep_synth_glue_type(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        fam_idx: usize,
+        face_idx: usize,
+        sec_idx: usize,
+        span: Option<handl_language::Span>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let fam = self.dep_synth_type(lang, ast, fam_idx, ctx)?;
+        let face_node = ast.get(AstRef::new(face_idx)).ok_or_else(|| {
+            LangError::engine("dep_synth_glue_type: face node out of bounds".to_string())
+        })?;
+        let Some(phi_raw) = self.cub_face_of_node(lang, ast, face_node, ctx) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "glue: face operand is not a face formula — expected f0(i), f1(i), fnot φ, f_or φ ψ, f_and φ ψ, fT, or fF".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        };
+        let phi = face_norm(phi_raw);
+        let sec = self.dep_synth_type(lang, ast, sec_idx, ctx)?;
+        let sec_is_pi = tag_of(&sec) == Some("type.pi")
+            && tag_of(sec.get("param").unwrap_or(&Value::Null)) == Some("type.interval");
+        if !sec_is_pi {
+            self.cub_diag(
+                ctx,
+                "warning",
+                "glue: section is not an I → Type family — expected `Pi(I, i ~> T i)`; the `Partial φ (Σ T:Type, T ≃ A i)` obligation is approximated, treating the section as constant".to_string(),
+                span,
+            );
+        }
+        match phi {
+            CubFace::Tt => self.cub_diag(
+                ctx,
+                "warning",
+                "glue: face φ ≡ 1 — Glue agrees with the section on every dimension (degenerate)".to_string(),
+                span,
+            ),
+            CubFace::Ff => self.cub_diag(
+                ctx,
+                "warning",
+                "glue: face φ ≡ 0 — Glue agrees with the family on every dimension (degenerate)".to_string(),
+                span,
+            ),
+            _ => {}
+        }
+        let mut m = Map::new();
+        m.insert("family".to_string(), fam);
+        m.insert("face".to_string(), cub_face_to_val(ctx, &phi));
+        m.insert("section".to_string(), sec);
+        Ok(make_tag(ctx, "type.glue", m))
+    }
+
+    /// `glue A, φ, T̂` — the keyword node's judgment (term position):
+    /// runs the same formation checks and returns the `type.glue` it
+    /// forms as the node's type (type formers are their own type
+    /// here — the `Nat : Family` reading — which keeps `G := glue …`
+    /// aliases working).
+    pub(crate) fn synth_glue_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        if kids_len < 3 {
+            self.cub_diag(
+                ctx,
+                "error",
+                "glue: needs family, face, and section operands".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let (Some(fam_ref), Some(face_ref), Some(sec_ref)) = (
+            Self::cub_child(lang, ast, node, "family", 0),
+            Self::cub_child(lang, ast, node, "face", 1),
+            Self::cub_child(lang, ast, node, "section", 2),
+        ) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "glue: needs family, face, and section operands".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        };
+        self.dep_synth_glue_type(
+            lang,
+            ast,
+            fam_ref.index(),
+            face_ref.index(),
+            sec_ref.index(),
+            span,
+            ctx,
+        )
+    }
+
+    /// The codomain type of a dependent `type.pi`/`type.sigma`/
+    /// `type.forall` at its own bound variable — the model's
+    /// `apply_dep_closure_` reading inside `fibrant_verdict_`: the
+    /// closure applies at `var{var_name}` so the body reads the binder
+    /// rigidly. A closure with no computable body (`body_closure`
+    /// absent, or neither `const_body`/`apply_type`/`body_child_idx`)
+    /// yields `type.unknown`, whose verdict is `Unknown`.
+    fn fibrant_codomain(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        ty: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let unknown = |ctx: &mut TypecheckContext| {
+            let mut m = Map::new();
+            make_tag(ctx, "type.unknown", std::mem::take(&mut m))
+        };
+        let Some(bc) = ty.get("body_closure") else {
+            return Ok(unknown(ctx));
+        };
+        if bc.get("const_body").is_none()
+            && bc.get("apply_type").is_none()
+            && bc.get("body_child_idx").and_then(Value::as_u64).is_none()
+        {
+            return Ok(unknown(ctx));
+        }
+        let var_name = bc
+            .get("var_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // The model binds `var{var_name}` as the argument term (or no
+        // term at all for an unnamed closure); `dep_closure_apply_term`
+        // records `results[var_name] = eval_index(term)` — pass the
+        // rigid var atom so the body sees the binder.
+        let term = if var_name.is_empty() {
+            Value::Null
+        } else {
+            var_term(&var_name)
+        };
+        self.dep_closure_apply_term(lang, ast, ty, &term, ctx)
+    }
+
+    /// Structural fibrancy verdict — the model's `fibrant_verdict_`:
+    /// base sorts (`type.number`/`type.bool`/`type.string`/
+    /// `type.unit`/`type.interval`/`type.null`), `type.fibrant`,
+    /// dependent `type.pi`/`type.sigma`/`type.forall`/`type.glue`
+    /// whose parts are fibrant (codomains computed through
+    /// `fibrant_codomain`), `type.function`, and `type.array`/
+    /// `type.record` with all-fibrant elements/fields are `Yes`;
+    /// `type.universe` (`Type` is not fibrant) and non-types are `No`;
+    /// `type.unknown`, metas, `type.family`/`type.family_app`
+    /// (indexed data — fibrancy depends on the indices),
+    /// `type.constructor`, legacy `Path`/`type.eq`, and anything else
+    /// are `Unknown`.
+    fn fibrant_verdict(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        t: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<FibrantVerdict, LangError> {
+        // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
+        stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
+            if extract_meta_id(t).is_some() || tag_of(t) == Some("type.unknown") {
+                return Ok(FibrantVerdict::Unknown);
+            }
+            let Some(tag) = tag_of(t) else {
+                // Non-types (untagged values, `tag == ""` in the model)
+                // are not fibrant.
+                return Ok(FibrantVerdict::No);
+            };
+            match tag {
+                "type.universe" => Ok(FibrantVerdict::No),
+                "type.number" | "type.bool" | "type.string" | "type.unit"
+                | "type.interval" | "type.null" | "type.fibrant" => Ok(FibrantVerdict::Yes),
+                "type.pi" | "type.sigma" | "type.forall" => {
+                    let dom_field = if tag == "type.forall" { "kind" } else { "param" };
+                    let dom = t.get(dom_field).cloned().unwrap_or(Value::Null);
+                    let dv = self.fibrant_verdict(lang, ast, &dom, ctx)?;
+                    if dv != FibrantVerdict::Yes {
+                        return Ok(dv);
+                    }
+                    let cod = self.fibrant_codomain(lang, ast, t, ctx)?;
+                    self.fibrant_verdict(lang, ast, &cod, ctx)
+                }
+                "type.function" => {
+                    let pv = self.fibrant_verdict(
+                        lang,
+                        ast,
+                        t.get("param").unwrap_or(&Value::Null),
+                        ctx,
+                    )?;
+                    if pv != FibrantVerdict::Yes {
+                        return Ok(pv);
+                    }
+                    self.fibrant_verdict(lang, ast, t.get("body").unwrap_or(&Value::Null), ctx)
+                }
+                "type.glue" => {
+                    // `Glue A φ T̂` is fibrant when the family `A` and
+                    // the section `T̂` are (CCHM: Glue of fibrant data
+                    // is fibrant). The face `φ` carries no fibrancy
+                    // content.
+                    let fv = self.fibrant_verdict(
+                        lang,
+                        ast,
+                        t.get("family").unwrap_or(&Value::Null),
+                        ctx,
+                    )?;
+                    if fv != FibrantVerdict::Yes {
+                        return Ok(fv);
+                    }
+                    self.fibrant_verdict(
+                        lang,
+                        ast,
+                        t.get("section").unwrap_or(&Value::Null),
+                        ctx,
+                    )
+                }
+                "type.array" => {
+                    // NBE mints both spellings: `element` (the `array`
+                    // kind) and `elements` (the `paren` tuple) — fold
+                    // over whichever is present.
+                    let mut verdict = FibrantVerdict::Yes;
+                    let mut els: Vec<Value> = t
+                        .get("elements")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(el) = t.get("element") {
+                        els.push(el.clone());
+                    }
+                    for el in els {
+                        let ev = self.fibrant_verdict(lang, ast, &el, ctx)?;
+                        verdict = match (verdict, ev) {
+                            (FibrantVerdict::No, _) | (_, FibrantVerdict::No) => FibrantVerdict::No,
+                            (FibrantVerdict::Unknown, _) | (_, FibrantVerdict::Unknown) => {
+                                FibrantVerdict::Unknown
+                            }
+                            _ => FibrantVerdict::Yes,
+                        };
+                        if verdict == FibrantVerdict::No {
+                            break;
+                        }
+                    }
+                    Ok(verdict)
+                }
+                "type.record" => {
+                    let mut verdict = FibrantVerdict::Yes;
+                    if let Some(fields) = t.get("fields").and_then(Value::as_object) {
+                        for (_, fv) in fields {
+                            let ev = self.fibrant_verdict(lang, ast, fv, ctx)?;
+                            verdict = match (verdict, ev) {
+                                (FibrantVerdict::No, _) | (_, FibrantVerdict::No) => {
+                                    FibrantVerdict::No
+                                }
+                                (FibrantVerdict::Unknown, _)
+                                | (_, FibrantVerdict::Unknown) => FibrantVerdict::Unknown,
+                                _ => FibrantVerdict::Yes,
+                            };
+                            if verdict == FibrantVerdict::No {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(verdict)
+                }
+                _ => Ok(FibrantVerdict::Unknown),
+            }
+        })
+    }
+
+    /// `isFibrant(A)` / `fibrant A` in *type* position — the model's
+    /// `synth_fibrant_former_`: mints `type.fibrant{of}` on a `Yes`
+    /// verdict; `No`/`Unknown` degrade to `type.unknown` + warning so
+    /// unsupported formers are never silently accepted.
+    fn dep_synth_fibrant_former(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        arg_idx: usize,
+        span: Option<handl_language::Span>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let a = self.dep_synth_type(lang, ast, arg_idx, ctx)?;
+        let fv = self.fibrant_verdict(lang, ast, &a, ctx)?;
+        if fv == FibrantVerdict::Yes {
+            let mut m = Map::new();
+            m.insert("of".to_string(), a);
+            return Ok(make_tag(ctx, "type.fibrant", m));
+        }
+        let tag = tag_of(&a).unwrap_or("");
+        let msg = if fv == FibrantVerdict::No {
+            format!("isFibrant: {tag} is not fibrant")
+        } else {
+            format!(
+                "isFibrant: fibrancy of {tag} is undecided — the fibrancy type is left open (type.unknown)"
+            )
+        };
+        self.cub_diag(ctx, "warning", msg, span);
+        Ok(self.cub_open_meta(ctx))
+    }
+
+    /// `fibrant A` — the keyword node's judgment (term position): the
+    /// fibrancy *witness*. Its type is `type.fibrant{of}` on `Yes` and
+    /// on `Unknown` (optimistic — the P2 `Partial` approximation); a
+    /// `No` verdict is a hard error.
+    pub(crate) fn synth_fibrant_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        let t_ref = Self::cub_child(lang, ast, node, "target", 0);
+        if kids_len < 1 || t_ref.is_none() {
+            self.cub_diag(
+                ctx,
+                "error",
+                "fibrant: needs a type operand".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let a = self.dep_synth_type(lang, ast, t_ref.unwrap().index(), ctx)?;
+        let fv = self.fibrant_verdict(lang, ast, &a, ctx)?;
+        let mut m = Map::new();
+        m.insert("of".to_string(), a.clone());
+        let fibrant_t = make_tag(ctx, "type.fibrant", m);
+        match fv {
+            FibrantVerdict::Yes => Ok(fibrant_t),
+            FibrantVerdict::No => {
+                let tag = tag_of(&a).unwrap_or("");
+                self.cub_diag(
+                    ctx,
+                    "error",
+                    format!(
+                        "fibrant: {tag} is not fibrant — no homogeneous-composition witness exists"
+                    ),
+                    span,
+                );
+                Ok(self.cub_unknown(ctx))
+            }
+            FibrantVerdict::Unknown => {
+                let tag = tag_of(&a).unwrap_or("");
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    format!(
+                        "fibrant: fibrancy of {tag} is undecided — accepting the witness optimistically"
+                    ),
+                    span,
+                );
+                Ok(fibrant_t)
             }
         }
     }
