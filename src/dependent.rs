@@ -284,6 +284,14 @@ pub(crate) fn is_unknown_ty(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// A call domain a zero-argument `f()` may peel: literally `Unit`
+/// (`type.unit`) or the dynamic top (`type.unknown`). Meta domains are
+/// *not* unit — `f := (x ~> x); f()` must still report a missing
+/// argument rather than silently discarding the binder.
+fn nullary_domain(param: &Value) -> bool {
+    tag_of(param) == Some("type.unit") || is_unknown_ty(param)
+}
+
 /// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
 /// as boundary JSON (the `__former__` encoding).
 fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
@@ -6907,9 +6915,14 @@ impl NbeTypecheckEngine {
                 LangError::engine("check_call: callee index not a u64".to_string())
             })? as usize;
         let funtype = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
-        let arg_idx = kids
-            .get(1)
-            .and_then(Value::as_u64)
+        // `f()` in check position — delegate to the zero-argument peel
+        // (`Unit`/unknown domain only; anything else is a missing
+        // argument, same as `synth_call`).
+        let Some(arg_raw) = kids.get(1) else {
+            return self.synth_call_no_args(lang, ast, &funtype, ctx);
+        };
+        let arg_idx = arg_raw
+            .as_u64()
             .ok_or_else(|| LangError::engine("check_call: arg index not a u64".to_string()))?
             as usize;
         let param = funtype.get("param").cloned().unwrap_or(Value::Null);
@@ -6930,8 +6943,8 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         let kids =
             children_of(node).ok_or_else(|| LangError::engine("call: no children".to_string()))?;
-        if kids.len() < 2 {
-            return Err(LangError::engine("call: needs callee and args".to_string()));
+        if kids.is_empty() {
+            return Err(LangError::engine("call: needs callee".to_string()));
         }
         let callee_idx = kids[0]
             .as_u64()
@@ -6947,6 +6960,16 @@ impl NbeTypecheckEngine {
             return self.synth_perform(lang, ast, node, kids, ctx);
         }
         let mut cur = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
+        // `f()` — zero-argument application. Legal only when the
+        // callee's next domain is `Unit`/unknown (host ops declare
+        // `Unit -> T` signatures for nullary ops — `math.e()`,
+        // `proc.pid()`); `()` at eval passes zero args to the op.
+        // Anything else is a missing argument.
+        if kids.len() == 1 {
+            let out = self.synth_call_no_args(lang, ast, &cur, ctx)?;
+            self.retry_pending_instances(ctx, false)?;
+            return Ok(zonk_index(&out, ctx));
+        }
         // `<>` index application — `f<i, …>` (`dimension` post-migration,
         // `index_app` for pre-desugar/hand-built trees): each argument
         // fills the next implicit `type.pi` as an index term.
@@ -7139,6 +7162,79 @@ impl NbeTypecheckEngine {
         // end-of-module drain owns the error.
         self.retry_pending_instances(ctx, false)?;
         Ok(zonk_index(&cur, ctx))
+    }
+
+    /// `f()` — zero-argument application. Peels exactly one domain iff
+    /// it is `Unit` (`type.unit`) or unresolved (`type.unknown`): host
+    /// ops declare `Unit -> T` signatures for nullary ops (`math.e()`,
+    /// `proc.pid()`), and `()` at eval passes zero args to the op, so
+    /// the type-level peel mirrors that. A non-unit domain is a
+    /// missing argument — the same failure the per-argument
+    /// `check_node` reports for `f(x)` on a non-function.
+    fn synth_call_no_args(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        callee: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let cur = zonk_index(callee, ctx);
+        let missing = |domain: &Value| {
+            LangError::engine(format!(
+                "call: missing argument — callee domain is {}",
+                display_type(domain, ctx)
+            ))
+        };
+        match tag_of(&cur) {
+            // Constructor telescope: instantiate, then re-dispatch —
+            // an empty telescope lands on `type.family_app` (a bare
+            // type, passthrough below), a `Unit`-headed one peels, and
+            // anything else reports its first domain.
+            Some("type.ctor_sig") => {
+                let inst = self.instantiate_ctor_full(lang, ast, &cur, ctx)?;
+                self.synth_call_no_args(lang, ast, &inst, ctx)
+            }
+            Some("type.function") => {
+                let param = cur.get("param").cloned().unwrap_or(Value::Null);
+                let param = zonk_index(&param, ctx);
+                if nullary_domain(&param) {
+                    Ok(cur.get("body").cloned().unwrap_or(Value::Null))
+                } else {
+                    Err(missing(&param))
+                }
+            }
+            Some("type.pi") | Some("type.forall") => {
+                let param = cur
+                    .get("param")
+                    .or_else(|| cur.get("kind"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let param = zonk_index(&param, ctx);
+                if nullary_domain(&param) {
+                    // Dependent codomain applied at the unit term —
+                    // `()` carries no index information, so `Null` is
+                    // the canonical "no argument" term.
+                    self.dep_closure_apply_term(lang, ast, &cur, &Value::Null, ctx)
+                } else {
+                    Err(missing(&param))
+                }
+            }
+            // `family`/`family_app`/`unknown` aren't functions — a
+            // zero-arg "call" of one is just the type itself (the same
+            // leniency the arg loop gives `type.unknown` callees).
+            Some("type.family") | Some("type.family_app") | Some("type.unknown") => Ok(cur),
+            _ => {
+                if extract_meta_id(&cur).is_some() || is_unknown_ty(&cur) {
+                    // Unresolved callee — stay permissive.
+                    Ok(cur)
+                } else {
+                    Err(LangError::engine(format!(
+                        "call: callee is not applicable (type {})",
+                        display_type(&cur, ctx)
+                    )))
+                }
+            }
+        }
     }
 
     /// `synth_handle` — `handle <body> with <h>` typed-effect handler

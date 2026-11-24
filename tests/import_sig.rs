@@ -36,14 +36,14 @@ impl handl_platform::Module for TestModule {
         "mymod"
     }
     fn function(&self, name: &str) -> Option<&dyn handl_platform::Function> {
-        if name == "double" {
-            Some(&DOUBLE)
-        } else {
-            None
+        match name {
+            "double" => Some(&DOUBLE),
+            "unit_op" => Some(&UNIT_OP),
+            _ => None,
         }
     }
     fn functions(&self) -> Vec<(&str, &dyn handl_platform::Function)> {
-        vec![("double", &DOUBLE)]
+        vec![("double", &DOUBLE), ("unit_op", &UNIT_OP)]
     }
     fn value_names(&self) -> Vec<String> {
         vec!["flag".to_string()]
@@ -72,6 +72,28 @@ impl handl_platform::TypeSignature for Double {
     }
 }
 static DOUBLE: Double = Double;
+
+/// A nullary host op — signature domain `Unit`, like `math.e()` /
+/// `proc.pid()`: `unit_op() : Number`.
+struct UnitOp;
+impl handl_platform::Function for UnitOp {
+    fn call(
+        &self,
+        _args: &[Value],
+        _ctx: &mut handl_platform::EvalContext,
+    ) -> Result<Value, handl_platform::EvalError> {
+        Ok(Value::Null)
+    }
+    fn as_type_signature(&self) -> Option<&dyn handl_platform::TypeSignature> {
+        Some(self)
+    }
+}
+impl handl_platform::TypeSignature for UnitOp {
+    fn type_signature(&self) -> Value {
+        serde_json::json!({"__tag__":"type.function","__registry__":"handl.canonical","param":{"__tag__":"type.unit","__registry__":"handl.canonical"},"body":{"__tag__":"type.number","__registry__":"handl.canonical"}})
+    }
+}
+static UNIT_OP: UnitOp = UnitOp;
 
 fn engine() -> Box<dyn TypecheckEngine> {
     let registry = handl_plugin_module::ModuleRegistry::new().with(TestModule);
@@ -259,6 +281,51 @@ fn resolve_dynamic_binds_unknown() {
             .node_types
             .values()
             .any(|v| tag(v) == Some("type.unknown"))
+    );
+}
+
+/// `f()` on a `Unit -> T` signature peels the unit domain — host ops
+/// like `math.e()`/`proc.pid()` declare nullary signatures this way,
+/// and `()` at eval passes zero args to the op.
+#[test]
+fn zero_arg_call_on_unit_domain() {
+    let lang = canonical_lang();
+    let ast = parse(&lang, "do {\nimport mymod\nx := mymod.unit_op()\n}");
+    let result = engine()
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect("typecheck should succeed");
+    assert!(
+        result
+            .node_types
+            .values()
+            .any(|v| tag(v) == Some("type.number")),
+        "mymod.unit_op() should synth type.number: {result:?}"
+    );
+}
+
+/// `f()` on a non-unit domain is a missing argument — `double :
+/// Number -> Number` cannot be applied with zero args.
+#[test]
+fn zero_arg_call_on_non_unit_domain_fails() {
+    let lang = canonical_lang();
+    let ast = parse(&lang, "do {\nimport mymod\nx := mymod.double()\n}");
+    let res = engine().typecheck(&lang, &TypecheckRequest::new(ast));
+    assert!(
+        res.is_err(),
+        "mymod.double() should fail with a missing argument: {res:?}"
+    );
+}
+
+/// `f()` where the domain is an unsolved meta is still a missing
+/// argument — a meta is not `Unit`.
+#[test]
+fn zero_arg_call_on_meta_domain_fails() {
+    let lang = canonical_lang();
+    let ast = parse(&lang, "do {\nf := (x ~> x)\ny := f()\n}");
+    let res = engine().typecheck(&lang, &TypecheckRequest::new(ast));
+    assert!(
+        res.is_err(),
+        "f() on a meta domain should fail with a missing argument: {res:?}"
     );
 }
 
