@@ -2147,6 +2147,40 @@ impl NbeTypecheckEngine {
                     })?;
                     self.synth_j_judgment(lang, ast, node, ctx)
                 }
+                // Cubical judgments (ADR-0208 P2): `transp`/`hcomp`/
+                // `comp` are prefix-call nodes; `trans`/`symm` are the
+                // derived path-algebra forms. All reach here via their
+                // `type.*` rules' `synth_*` ops.
+                "synth_transp" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_transp: node out of bounds".to_string())
+                    })?;
+                    self.synth_transp_judgment(lang, ast, node, ctx)
+                }
+                "synth_hcomp" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_hcomp: node out of bounds".to_string())
+                    })?;
+                    self.synth_hcomp_judgment(lang, ast, node, ctx)
+                }
+                "synth_comp" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_comp: node out of bounds".to_string())
+                    })?;
+                    self.synth_comp_judgment(lang, ast, node, ctx)
+                }
+                "synth_trans" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_trans: node out of bounds".to_string())
+                    })?;
+                    self.synth_trans_judgment(lang, ast, node, ctx)
+                }
+                "synth_symm" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_symm: node out of bounds".to_string())
+                    })?;
+                    self.synth_symm_judgment(lang, ast, node, ctx)
+                }
                 "synth_flow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_flow: node out of bounds".to_string())

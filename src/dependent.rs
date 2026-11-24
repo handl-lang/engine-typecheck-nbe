@@ -130,6 +130,289 @@ fn path_witness_endpoints(v: &Value) -> Option<(Value, Value)> {
     }
 }
 
+/// Full path-witness reading of a *type/value* carrier (ADR-0208 P2 —
+/// the model's `witness_from_type_`): `(x, y, closure, self)` where
+/// `x`/`y` are the endpoint terms, `closure` the carrier's
+/// `body_closure` (`Null` for `Path`/`type.eq` records, which carry
+/// none), and `self` the carrier itself when it is a `type.pi`
+/// (`Null` otherwise — `trans`/`symm` reuse it for the identity cases).
+fn witness_from_type_full(v: &Value) -> Option<(Value, Value, Value, Value)> {
+    match tag_of(v) {
+        Some("type.pi") => v.get("path").map(|p| {
+            (
+                p.get("x").cloned().unwrap_or(Value::Null),
+                p.get("y").cloned().unwrap_or(Value::Null),
+                v.get("body_closure").cloned().unwrap_or(Value::Null),
+                v.clone(),
+            )
+        }),
+        Some("Path") => Some((
+            v.get("frm").cloned().unwrap_or(Value::Null),
+            v.get("to").cloned().unwrap_or(Value::Null),
+            Value::Null,
+            Value::Null,
+        )),
+        Some("type.eq") => Some((
+            v.get("left").cloned().unwrap_or(Value::Null),
+            v.get("right").cloned().unwrap_or(Value::Null),
+            Value::Null,
+            Value::Null,
+        )),
+        _ => None,
+    }
+}
+
+/// A cubical face formula Φ (ADR-0208 P2) — the Rust mirror of the
+/// model's `{"__tag__":"face","op","args"}` records: `Tt`/`Ff` are the
+/// full/empty faces, `Eq0`/`Eq1` the endpoint equations `i = 0`/`i = 1`
+/// (the payload is the evaluated dimension *term*), and
+/// `Not`/`Or`/`And` the connectives `~φ`, `φ ∨ ψ`, `φ ∧ ψ`.
+#[derive(Debug, Clone, PartialEq)]
+enum CubFace {
+    Tt,
+    Ff,
+    Eq0(Value),
+    Eq1(Value),
+    Not(Box<CubFace>),
+    Or(Box<CubFace>, Box<CubFace>),
+    And(Box<CubFace>, Box<CubFace>),
+}
+
+/// Interpret an evaluated term as a face Φ — the model's
+/// `face_of_val_`. The surface constructors `f0(i)`/`f1(i)`/`fnot φ`/
+/// `f_or φ ψ`/`f_and φ ψ` evaluate to symbolic `App{var{f*}, args}`
+/// terms (the names are unbound); `fT`/`fF`/`true`/`false` stay `var`
+/// atoms; `0`/`1`/`true`/`false` literals read as the empty/full
+/// faces. `None` for anything else (a non-face operand).
+fn cub_face_of_val(v: &Value) -> Option<CubFace> {
+    // Literal payloads can arrive wrapped as `{"value": x[, …]}`
+    // (the `value`/`lit` node payload shape) — unwrap before tagging.
+    if let Value::Object(m) = v
+        && m.get("__tag__").is_none()
+        && let Some(inner) = m.get("value")
+    {
+        return cub_face_of_val(inner);
+    }
+    match tag_of(v) {
+        Some("App") => {
+            let callee = v.get("callee").cloned().unwrap_or(Value::Null);
+            let cname = if tag_of(&callee) == Some("var") {
+                callee.get("name").and_then(Value::as_str).unwrap_or("")
+            } else {
+                ""
+            };
+            let args = v.get("args").and_then(Value::as_array);
+            match cname {
+                "f0" | "f1" => args.and_then(|a| a.first()).map(|d| {
+                    if cname == "f0" {
+                        CubFace::Eq0(d.clone())
+                    } else {
+                        CubFace::Eq1(d.clone())
+                    }
+                }),
+                "fnot" => args
+                    .and_then(|a| a.first())
+                    .and_then(|a0| cub_face_of_val(a0))
+                    .map(|a| CubFace::Not(Box::new(a))),
+                "f_or" | "f_and" => {
+                    let (Some(a0), Some(a1)) =
+                        (args.and_then(|a| a.first()), args.and_then(|a| a.get(1)))
+                    else {
+                        return None;
+                    };
+                    let fa = cub_face_of_val(a0)?;
+                    let fb = cub_face_of_val(a1)?;
+                    Some(if cname == "f_or" {
+                        CubFace::Or(Box::new(fa), Box::new(fb))
+                    } else {
+                        CubFace::And(Box::new(fa), Box::new(fb))
+                    })
+                }
+                _ => None,
+            }
+        }
+        Some("var") => match v.get("name").and_then(Value::as_str).unwrap_or("") {
+            "fT" | "true" => Some(CubFace::Tt),
+            "fF" | "false" => Some(CubFace::Ff),
+            _ => None,
+        },
+        _ => {
+            if let Some(b) = v.as_bool() {
+                Some(if b { CubFace::Tt } else { CubFace::Ff })
+            } else {
+                match num_val(v) {
+                    Some(n) if n == 1.0 => Some(CubFace::Tt),
+                    Some(n) if n == 0.0 => Some(CubFace::Ff),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+/// Endpoint-equation normalization shared by `face_norm`'s `eq0`/`eq1`
+/// arms: `i = 0` holds at `i0` and fails at `i1` (and dually).
+fn face_norm_eq(d: Value, is_eq0: bool) -> CubFace {
+    let (holds, fails) = if is_eq0 {
+        (d == var_term("i0"), d == var_term("i1"))
+    } else {
+        (d == var_term("i1"), d == var_term("i0"))
+    };
+    if holds {
+        CubFace::Tt
+    } else if fails {
+        CubFace::Ff
+    } else if is_eq0 {
+        CubFace::Eq0(d)
+    } else {
+        CubFace::Eq1(d)
+    }
+}
+
+/// Normalize a face — the model's `face_norm_`: endpoint equations
+/// against the `i0`/`i1` terms (`i0 = 0 → tt`, `i1 = 0 → ff`), `not`
+/// over constants, and the `∧`/`∨` unit/annihilator, idempotence,
+/// `φ ∧ ¬φ → ff` / `φ ∨ ¬φ → tt`, and `i=0 ∧ i=1 → ff` laws — enough
+/// for the `i ∉ φ` side conditions. Endpoint *substitution* is
+/// deferred, as in the model.
+fn face_norm(f: CubFace) -> CubFace {
+    let is_or = matches!(f, CubFace::Or(_, _));
+    match f {
+        CubFace::Tt | CubFace::Ff => f,
+        CubFace::Eq0(d) => face_norm_eq(d, true),
+        CubFace::Eq1(d) => face_norm_eq(d, false),
+        CubFace::Not(a) => {
+            let a = face_norm(*a);
+            match a {
+                CubFace::Tt => CubFace::Ff,
+                CubFace::Ff => CubFace::Tt,
+                a => CubFace::Not(Box::new(a)),
+            }
+        }
+        CubFace::Or(a, b) | CubFace::And(a, b) => {
+            let a = face_norm(*a);
+            let b = face_norm(*b);
+            let (unit, annih) = if is_or {
+                (CubFace::Ff, CubFace::Tt)
+            } else {
+                (CubFace::Tt, CubFace::Ff)
+            };
+            if a == annih || b == annih {
+                if is_or { CubFace::Tt } else { CubFace::Ff }
+            } else if a == unit {
+                b
+            } else if b == unit {
+                a
+            } else {
+                let a_inner = match &a {
+                    CubFace::Not(x) => Some(&**x),
+                    _ => None,
+                };
+                let b_inner = match &b {
+                    CubFace::Not(x) => Some(&**x),
+                    _ => None,
+                };
+                let complemented =
+                    a_inner.is_some_and(|x| *x == b) || b_inner.is_some_and(|x| *x == a);
+                if a == b {
+                    a
+                } else if complemented {
+                    if is_or { CubFace::Tt } else { CubFace::Ff }
+                } else {
+                    // `i=0 ∧ i=1 → ff` — contradictory endpoint equations
+                    // over the *same* dimension term.
+                    let contra = !is_or
+                        && matches!(
+                            (&a, &b),
+                            (CubFace::Eq0(d1), CubFace::Eq1(d2))
+                                | (CubFace::Eq1(d1), CubFace::Eq0(d2))
+                                if d1 == d2
+                        );
+                    if contra {
+                        CubFace::Ff
+                    } else if is_or {
+                        CubFace::Or(Box::new(a), Box::new(b))
+                    } else {
+                        CubFace::And(Box::new(a), Box::new(b))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The verdict of [`NbeTypecheckEngine::path_witness`] — the model's
+/// `path`/`refl`/`bad` classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CubPathVerdict {
+    Path,
+    Refl,
+    Bad,
+}
+
+/// A resolved path operand for `trans`/`symm` — the model's
+/// `path_witness_` result: endpoints `x`/`y`, the witness's
+/// `body_closure` (`Null` for `Path`/`type.eq` carriers), and `self`
+/// the path-carrying `type.pi` itself (`Null` otherwise).
+struct CubPathWitness {
+    verdict: CubPathVerdict,
+    x: Value,
+    y: Value,
+    closure: Value,
+    self_ty: Value,
+}
+
+/// Does index term `t` mention `var{name}`? Walks record/array
+/// structure, skipping the same non-term fields the model's
+/// `term_has_var_` skips (spelling, identity, provenance, arena
+/// positions).
+fn term_has_var(v: &Value, name: &str) -> bool {
+    if tag_of(v) == Some("var") {
+        return v.get("name").and_then(Value::as_str) == Some(name);
+    }
+    match v {
+        Value::Object(m) => m.iter().any(|(k, x)| {
+            !matches!(
+                k.as_str(),
+                "__tag__"
+                    | "__registry__"
+                    | "__meta__"
+                    | "name"
+                    | "op"
+                    | "body"
+                    | "body_closure"
+                    | "env"
+                    | "via"
+            ) && term_has_var(x, name)
+        }),
+        Value::Array(xs) => xs.iter().any(|x| term_has_var(x, name)),
+        _ => false,
+    }
+}
+
+/// Does dimension term `dim` occur in face `f`? `Eq0`/`Eq1` arguments
+/// are dimension terms — occurrence is structural equality, or a
+/// `var{name}` mention inside a compound term when `dim` is itself a
+/// variable (the model's `face_has_dim_`).
+fn face_has_dim(dim: &Value, f: &CubFace) -> bool {
+    match f {
+        CubFace::Eq0(d) | CubFace::Eq1(d) => {
+            if d == dim {
+                return true;
+            }
+            let dname = if tag_of(dim) == Some("var") {
+                dim.get("name").and_then(Value::as_str).unwrap_or("")
+            } else {
+                ""
+            };
+            !dname.is_empty() && term_has_var(d, dname)
+        }
+        CubFace::Not(a) => face_has_dim(dim, a),
+        CubFace::Or(a, b) | CubFace::And(a, b) => face_has_dim(dim, a) || face_has_dim(dim, b),
+        _ => false,
+    }
+}
+
 /// The body a `body_closure` stands for when no AST elaboration is
 /// available (dependent unification, ADR-0208 P1): `const_body` /
 /// `apply_type` path closures carry their body as data; a plain
@@ -6181,7 +6464,26 @@ impl NbeTypecheckEngine {
     /// endpoints checking resolves against the use site. `None` only
     /// when the operand is decided-not-a-path (unbound, or bound to a
     /// concrete non-`Path` value).
-    fn resolve_path(&self, node: &AstNode, ctx: &mut TypecheckContext) -> Option<Value> {
+    fn resolve_path(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        ctx: &mut TypecheckContext,
+    ) -> Option<Value> {
+        let Some(node) = ast.get(node_ref) else {
+            return None;
+        };
+        // Cubical path algebra (ADR-0208 P2): a `trans`/`symm` node
+        // synthesizes to a path-carrying `type.pi` — route it through
+        // `synth_node` so `trans(p, q) # v` / `j (trans p q), …` see
+        // the composed endpoints (the model's `resolve_path_` special
+        // case).
+        if node.kind == "trans" || node.kind == "symm" {
+            let ty = self.synth_node(lang, ast, node_ref, ctx).ok()?;
+            let (x, y) = path_witness_endpoints(&ty)?;
+            return Some(path_val(x, y));
+        }
         if node.kind == "var" {
             let name = node_name(node)?;
             if name == "refl" {
@@ -6259,12 +6561,14 @@ impl NbeTypecheckEngine {
         let path_node = ast
             .get(AstRef::new(path_idx))
             .ok_or_else(|| LangError::engine("transport: path node out of bounds".to_string()))?;
-        let path = self.resolve_path(path_node, ctx).ok_or_else(|| {
-            LangError::engine(format!(
-                "transport: operand is not a Path (kind '{}')",
-                path_node.kind
-            ))
-        })?;
+        let path = self
+            .resolve_path(lang, ast, AstRef::new(path_idx), ctx)
+            .ok_or_else(|| {
+                LangError::engine(format!(
+                    "transport: operand is not a Path (kind '{}')",
+                    path_node.kind
+                ))
+            })?;
         let vty = self.synth_node(lang, ast, AstRef::new(val_idx), ctx)?;
         let frm = eval_index(&path.get("frm").cloned().unwrap_or(Value::Null), ctx);
         let to = eval_index(&path.get("to").cloned().unwrap_or(Value::Null), ctx);
@@ -6330,17 +6634,698 @@ impl NbeTypecheckEngine {
             .as_u64()
             .ok_or_else(|| LangError::engine("j: base index not a u64".to_string()))?
             as usize;
-        let path_node = ast
-            .get(AstRef::new(path_idx))
-            .ok_or_else(|| LangError::engine("j: path node out of bounds".to_string()))?;
         let path = self
-            .resolve_path(path_node, ctx)
+            .resolve_path(lang, ast, AstRef::new(path_idx), ctx)
             .ok_or_else(|| LangError::engine("j: operand is not a Path".to_string()))?;
         let frm = eval_index(&path.get("frm").cloned().unwrap_or(Value::Null), ctx);
         let to = eval_index(&path.get("to").cloned().unwrap_or(Value::Null), ctx);
         let expected_base = self.apply_motive(lang, ast, motive_idx, &[frm], path_idx, ctx)?;
         self.check_node(lang, ast, AstRef::new(base_idx), &expected_base, ctx)?;
         self.apply_motive(lang, ast, motive_idx, &[to], path_idx, ctx)
+    }
+
+    // -----------------------------------------------------------------------
+    // Cubical judgments (ADR-0208 P2): transp / hcomp / comp / trans / symm
+    // -----------------------------------------------------------------------
+    //
+    // CCHM-style cubical operations over the interval sort `I` (P1).
+    // This is a *typechecker*, not a cubical evaluator: faces and
+    // partiality are represented and checked structurally, and the
+    // interval-computational content is deferred. What IS checked:
+    //
+    //   * `transp A, i, φ, u` — transport in the family `A : I → Type`
+    //     along dimension `i`, partial on face `φ`. CCHM direction:
+    //     `transp^i_φ A u : A(i1) → A(i0)`. `u` is checked against the
+    //     full fibre `A(i)` — genuine `Partial φ A` checking is
+    //     approximated (mismatch is a warning, not an error).
+    //   * `hcomp A, i, φ, u, cap` — homogeneous composition over a
+    //     single type `A` (NOT an `I → Type` family — `comp` is the
+    //     heterogeneous form), `cap : A` the `i = 0` face.
+    //   * `comp F, i, φ, u, cap` — heterogeneous composition over
+    //     `F : I → Type`: `cap : F(i0)`, result `: F(i1)`.
+    //   * All three require `i : I` and `i ∉ φ` (`face_has_dim`).
+    //   * `trans p, q` / `symm p` — derived path algebra on cubical
+    //     path witnesses (P1 `type.pi` + `path` payloads; legacy
+    //     `Path{frm,to}`/`type.eq` records).
+
+    /// Record a judgment diagnostic — the model threads a diagnostic
+    /// state rather than aborting, so failures here push onto
+    /// `ctx.diagnostics` and return `type.unknown` (the same
+    /// error-diagnostic-and-continue discipline `synth_match_arms`
+    /// uses).
+    fn cub_diag(
+        &self,
+        ctx: &mut TypecheckContext,
+        severity: &str,
+        msg: String,
+        span: Option<handl_language::Span>,
+    ) {
+        ctx.diagnostics.push(TypecheckDiagnostic {
+            severity: severity.to_string(),
+            message: msg,
+            span,
+        });
+    }
+
+    /// `type.unknown` — the failure/degenerate result the model's
+    /// judgments return alongside their diagnostics.
+    fn cub_unknown(&self, ctx: &mut TypecheckContext) -> Value {
+        let mut m = Map::new();
+        make_tag(ctx, "type.unknown", std::mem::take(&mut m))
+    }
+
+    /// Resolve a cubical operand child by declared role with the
+    /// positional fallback (same discipline as the model's
+    /// `child_role_index` + `at(children, n)`).
+    fn cub_child(
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        role: &str,
+        pos: usize,
+    ) -> Option<AstRef> {
+        role_child_ref(lang, node, role).or_else(|| child_at(ast, node, pos))
+    }
+
+    /// Evaluate a face-operand node to a [`CubFace`] — the model's
+    /// `eval_node_` + `face_of_val_` reading. `value`/`lit` payloads
+    /// unwrap their literal; every other node goes through
+    /// `node_to_index_term` + `eval_index`, which leaves the unbound
+    /// `f0`/`f1`/`fnot`/`f_or`/`f_and` constructor applications as
+    /// symbolic `App` terms and `fT`/`fF`/`true`/`false`/`i0`/`i1` as
+    /// `var` atoms.
+    fn cub_face_of_node(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Option<CubFace> {
+        let term = if matches!(node.kind.as_str(), "value" | "lit") {
+            match &node.payload {
+                Value::Object(m) => m.get("value").cloned().unwrap_or(Value::Null),
+                p => p.clone(),
+            }
+        } else {
+            eval_index(&self.node_to_index_term(lang, ast, node, ctx), ctx)
+        };
+        cub_face_of_val(&term)
+    }
+
+    /// `A(point)` — the model's `fam_at_`: an interval-param `type.pi`
+    /// (`A : I → Type`) applies its `body_closure` at the interval
+    /// *term* `point` (`var{i0}`/`var{i1}`/the dimension `var`); any
+    /// other type is a constant family, `A(point) = A`.
+    fn fam_at(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        fam: &Value,
+        point: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let is_family = tag_of(fam) == Some("type.pi")
+            && tag_of(fam.get("param").unwrap_or(&Value::Null)) == Some("type.interval")
+            && fam.get("body_closure").is_some();
+        if is_family {
+            self.dep_closure_apply_term(lang, ast, fam, point, ctx)
+        } else {
+            Ok(fam.clone())
+        }
+    }
+
+    /// Shared prologue for `hcomp`/`comp` — the model's
+    /// `cubical_prologue_`: synthesize the family/type argument,
+    /// check the dimension against `I`, evaluate it, read and
+    /// normalize the face, and enforce `i ∉ φ`. `Ok(None)` means the
+    /// prologue already recorded its error diagnostic.
+    fn cubical_prologue(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        kind: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<(Value, Value)>, LangError> {
+        let span = node.span;
+        let (Some(fam_ref), Some(dim_ref), Some(face_ref)) = (
+            Self::cub_child(lang, ast, node, "family", 0),
+            Self::cub_child(lang, ast, node, "dim", 1),
+            Self::cub_child(lang, ast, node, "face", 2),
+        ) else {
+            return Ok(None);
+        };
+        let fam = self.dep_synth_type(lang, ast, fam_ref.index(), ctx)?;
+        let mut interval_m = Map::new();
+        let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
+        let dim_ty = self.synth_node(lang, ast, dim_ref, ctx)?;
+        let (dim_ok, _) = unify_index(&dim_ty, &interval, ctx);
+        if !dim_ok {
+            self.cub_diag(
+                ctx,
+                "error",
+                format!("{kind}: dimension operand must have type I"),
+                span,
+            );
+            return Ok(None);
+        }
+        let dim_node = ast
+            .get(dim_ref)
+            .ok_or_else(|| LangError::engine(format!("{kind}: dim node out of bounds")))?;
+        let dim_val = eval_index(&self.node_to_index_term(lang, ast, dim_node, ctx), ctx);
+        let face_node = ast
+            .get(face_ref)
+            .ok_or_else(|| LangError::engine(format!("{kind}: face node out of bounds")))?;
+        let Some(phi_raw) = self.cub_face_of_node(lang, ast, face_node, ctx) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                format!(
+                    "{kind}: face operand is not a face formula — expected f0(i), f1(i), fnot φ, f_or φ ψ, f_and φ ψ, fT, or fF"
+                ),
+                span,
+            );
+            return Ok(None);
+        };
+        let phi = face_norm(phi_raw);
+        if face_has_dim(&dim_val, &phi) {
+            self.cub_diag(
+                ctx,
+                "error",
+                format!("{kind}: the dimension must not occur in the face φ"),
+                span,
+            );
+            return Ok(None);
+        }
+        Ok(Some((fam, dim_val)))
+    }
+
+    /// `transp A, i, φ, u` — see the section comment. The partial
+    /// element `u` is checked against the full fibre `A(i)` (the
+    /// `Partial φ A` approximation — mismatch warns, never errors);
+    /// the result is the non-dependent arrow `A(i1) → A(i0)`.
+    pub(crate) fn synth_transp_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        if kids_len < 4 {
+            self.cub_diag(
+                ctx,
+                "error",
+                "transp: needs family, dimension, face, and partial operands".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let (Some(fam_ref), Some(dim_ref), Some(face_ref), Some(part_ref)) = (
+            Self::cub_child(lang, ast, node, "family", 0),
+            Self::cub_child(lang, ast, node, "dim", 1),
+            Self::cub_child(lang, ast, node, "face", 2),
+            Self::cub_child(lang, ast, node, "partial", 3),
+        ) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "transp: needs family, dimension, face, and partial operands".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        };
+        let fam = self.dep_synth_type(lang, ast, fam_ref.index(), ctx)?;
+        let mut interval_m = Map::new();
+        let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
+        let dim_ty = self.synth_node(lang, ast, dim_ref, ctx)?;
+        let (dim_ok, _) = unify_index(&dim_ty, &interval, ctx);
+        if !dim_ok {
+            self.cub_diag(
+                ctx,
+                "error",
+                "transp: dimension operand must have type I".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let dim_node = ast
+            .get(dim_ref)
+            .ok_or_else(|| LangError::engine("transp: dim node out of bounds".to_string()))?;
+        let dim_val = eval_index(&self.node_to_index_term(lang, ast, dim_node, ctx), ctx);
+        let face_node = ast
+            .get(face_ref)
+            .ok_or_else(|| LangError::engine("transp: face node out of bounds".to_string()))?;
+        let Some(phi_raw) = self.cub_face_of_node(lang, ast, face_node, ctx) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "transp: face operand is not a face formula — expected f0(i), f1(i), fnot φ, f_or φ ψ, f_and φ ψ, fT, or fF".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        };
+        let phi = face_norm(phi_raw);
+        if face_has_dim(&dim_val, &phi) {
+            self.cub_diag(
+                ctx,
+                "error",
+                "transp: the dimension must not occur in the face φ".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let u_ty = self.synth_node(lang, ast, part_ref, ctx)?;
+        let fam_dim = self.fam_at(lang, ast, &fam, &dim_val, ctx)?;
+        // `Partial φ A` is approximated by the full fibre: a failed
+        // unify warns and its meta bindings are rolled back (the
+        // model discards `uu.metas` on the warning path).
+        let mark = ctx.store_mark();
+        let (uu_ok, _) = unify_index(&u_ty, &fam_dim, ctx);
+        if !uu_ok {
+            ctx.store_restore(mark);
+            self.cub_diag(
+                ctx,
+                "warning",
+                "transp: partial element does not obviously inhabit the family on φ — `Partial φ A` is approximated by the full fibre".to_string(),
+                span,
+            );
+        }
+        let i1 = var_term("i1");
+        let i0 = var_term("i0");
+        let a1 = self.fam_at(lang, ast, &fam, &i1, ctx)?;
+        let a0 = self.fam_at(lang, ast, &fam, &i0, ctx)?;
+        let mut m = Map::new();
+        m.insert("param".to_string(), a1);
+        m.insert("body".to_string(), a0);
+        m.insert("param_name".to_string(), Value::String(String::new()));
+        Ok(make_tag(ctx, "type.function", m))
+    }
+
+    /// `hcomp A, i, φ, u, cap` — homogeneous composition (see the
+    /// section comment): `A` is read as a *single type*, `cap : A` is
+    /// the `i = 0` face (checked strictly), `u` the partial on `φ`
+    /// (approximated by the full type — mismatch warns); the result
+    /// is `: A`.
+    pub(crate) fn synth_hcomp_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        self.synth_hcomp_comp_judgment(lang, ast, node, "hcomp", ctx)
+    }
+
+    /// `comp F, i, φ, u, cap` — heterogeneous composition over
+    /// `F : I → Type` (see the section comment): `cap : F(i0)`
+    /// (checked strictly), `u` the partial on `φ` (approximated by the
+    /// fibre `F(i)` — mismatch warns); the result is `: F(i1)`.
+    pub(crate) fn synth_comp_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        self.synth_hcomp_comp_judgment(lang, ast, node, "comp", ctx)
+    }
+
+    /// Shared body of `hcomp`/`comp` — the model's `synth_hcomp_` /
+    /// `synth_comp_` over `cubical_prologue_`.
+    fn synth_hcomp_comp_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        kind: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        if kids_len < 5 {
+            self.cub_diag(
+                ctx,
+                "error",
+                format!("{kind}: needs family, dimension, face, partial, and cap operands"),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let Some((fam, dim_val)) = self.cubical_prologue(lang, ast, node, kind, ctx)? else {
+            return Ok(self.cub_unknown(ctx));
+        };
+        let (Some(part_ref), Some(cap_ref)) = (
+            Self::cub_child(lang, ast, node, "partial", 3),
+            Self::cub_child(lang, ast, node, "cap", 4),
+        ) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                format!("{kind}: needs family, dimension, face, partial, and cap operands"),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        };
+        let u_ty = self.synth_node(lang, ast, part_ref, ctx)?;
+        if kind == "hcomp" {
+            // Homogeneous: `u` inhabits the single type `A` on `φ`.
+            let mark = ctx.store_mark();
+            let (uu_ok, _) = unify_index(&u_ty, &fam, ctx);
+            if !uu_ok {
+                ctx.store_restore(mark);
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "hcomp: partial element does not obviously inhabit A on φ — `Partial φ A` is approximated by the full type".to_string(),
+                    span,
+                );
+            }
+            let cap_ty = self.synth_node(lang, ast, cap_ref, ctx)?;
+            let (cu_ok, _) = unify_index(&cap_ty, &fam, ctx);
+            if !cu_ok {
+                self.cub_diag(
+                    ctx,
+                    "error",
+                    "hcomp: cap does not inhabit A — the i = 0 face must have type A".to_string(),
+                    span,
+                );
+                return Ok(self.cub_unknown(ctx));
+            }
+            // A family-looking `A` is almost certainly a `comp` mistake.
+            if tag_of(&fam) == Some("type.pi")
+                && tag_of(fam.get("param").unwrap_or(&Value::Null)) == Some("type.interval")
+            {
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "hcomp: A looks like an I → Type family — `comp` is the heterogeneous composition form".to_string(),
+                    span,
+                );
+            }
+            Ok(fam)
+        } else {
+            // Heterogeneous: `u` inhabits the fibre `F(i)` on `φ`,
+            // `cap : F(i0)`, result `: F(i1)`.
+            let fam_dim = self.fam_at(lang, ast, &fam, &dim_val, ctx)?;
+            let mark = ctx.store_mark();
+            let (uu_ok, _) = unify_index(&u_ty, &fam_dim, ctx);
+            if !uu_ok {
+                ctx.store_restore(mark);
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "comp: partial element does not obviously inhabit the family on φ — `Partial φ F` is approximated by the full fibre".to_string(),
+                    span,
+                );
+            }
+            let cap_ty = self.synth_node(lang, ast, cap_ref, ctx)?;
+            let i0 = var_term("i0");
+            let i1 = var_term("i1");
+            let fam_i0 = self.fam_at(lang, ast, &fam, &i0, ctx)?;
+            let (cu_ok, _) = unify_index(&cap_ty, &fam_i0, ctx);
+            if !cu_ok {
+                self.cub_diag(
+                    ctx,
+                    "error",
+                    "comp: cap does not inhabit F(i0) — the i = 0 face must have type F(i0)"
+                        .to_string(),
+                    span,
+                );
+                return Ok(self.cub_unknown(ctx));
+            }
+            self.fam_at(lang, ast, &fam, &i1, ctx)
+        }
+    }
+
+    /// Resolve a path *operand* (the `p`/`q` in `trans p, q`, the `p`
+    /// in `symm p`) to its endpoints — the model's `path_witness_`:
+    /// a `var`'s declared type (Γ) and bound witness values
+    /// (`results`) are consulted before synthesis, which is what
+    /// admits `trans`/`symm` nodes and any other path-typed
+    /// expression as operands. `refl` is the identity witness.
+    fn path_witness(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_ref: AstRef,
+        ctx: &mut TypecheckContext,
+    ) -> Result<CubPathWitness, LangError> {
+        let node = ast
+            .get(node_ref)
+            .ok_or_else(|| LangError::engine("path_witness: node out of bounds".to_string()))?;
+        if node.kind == "var"
+            && let Some(name) = node_name(node)
+        {
+            if name == "refl" {
+                return Ok(CubPathWitness {
+                    verdict: CubPathVerdict::Refl,
+                    x: Value::Null,
+                    y: Value::Null,
+                    closure: Value::Null,
+                    self_ty: Value::Null,
+                });
+            }
+            // A `var` operand's *declared* type is consulted first: it
+            // carries the path endpoints even when the bound value is
+            // `refl` (`p : Path(2, 2) := refl` is a path 2 ~ 2, not
+            // the undetermined identity). Bound witness *values*
+            // (`Path{frm,to}` records, `eq_*` refinements) read
+            // through the same `witness_from_type_` lens.
+            for bound in [ctx.lookup(&name).cloned(), ctx.results.get(&name).cloned()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some((x, y, closure, self_ty)) = witness_from_type_full(&bound) {
+                    return Ok(CubPathWitness {
+                        verdict: CubPathVerdict::Path,
+                        x,
+                        y,
+                        closure,
+                        self_ty,
+                    });
+                }
+            }
+        }
+        let ty = self.synth_node(lang, ast, node_ref, ctx)?;
+        // The `Refl` marker type is the identity witness — `refl`
+        // synthesizes to it (the model reads `type.refl`/`var{refl}`
+        // off the evaluated term).
+        if matches!(tag_of(&ty), Some("Refl" | "type.refl")) {
+            return Ok(CubPathWitness {
+                verdict: CubPathVerdict::Refl,
+                x: Value::Null,
+                y: Value::Null,
+                closure: Value::Null,
+                self_ty: Value::Null,
+            });
+        }
+        if let Some((x, y, closure, self_ty)) = witness_from_type_full(&ty) {
+            return Ok(CubPathWitness {
+                verdict: CubPathVerdict::Path,
+                x,
+                y,
+                closure,
+                self_ty,
+            });
+        }
+        Ok(CubPathWitness {
+            verdict: CubPathVerdict::Bad,
+            x: Value::Null,
+            y: Value::Null,
+            closure: Value::Null,
+            self_ty: Value::Null,
+        })
+    }
+
+    /// The path *type* denoted by a [`CubPathWitness`] — the model's
+    /// `witness_path_type_`: the witness's own `type.pi` when it is
+    /// one (identity cases — `trans(refl, q)`), else a fresh interval
+    /// `type.pi` over `type.unknown` with the `path{x,y}` payload.
+    fn witness_path_type(&self, ctx: &mut TypecheckContext, w: &CubPathWitness) -> Value {
+        if tag_of(&w.self_ty) == Some("type.pi") {
+            return w.self_ty.clone();
+        }
+        let mut interval_m = Map::new();
+        let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
+        let mut unknown_m = Map::new();
+        let unknown = make_tag(ctx, "type.unknown", std::mem::take(&mut unknown_m));
+        let closure = if !w.closure.is_null() {
+            w.closure.clone()
+        } else {
+            serde_json::json!({
+                "var_name": "",
+                "body_child_idx": Value::Null,
+                "dep": true,
+                "const_body": unknown,
+            })
+        };
+        let mut m = Map::new();
+        m.insert("param".to_string(), interval);
+        m.insert("body_closure".to_string(), closure);
+        m.insert("path".to_string(), serde_json::json!({"x": w.x, "y": w.y}));
+        make_tag(ctx, "type.pi", m)
+    }
+
+    /// Mint the composed/symmetric path type — the model's
+    /// `type.pi` construction shared by `synth_trans_`/`synth_symm_`:
+    /// interval param, the first available `body_closure` (or a
+    /// constant `type.unknown` body), and the `path{x,y}` payload.
+    fn mint_path_type(
+        &self,
+        ctx: &mut TypecheckContext,
+        x: Value,
+        y: Value,
+        closure: Value,
+    ) -> Value {
+        let mut interval_m = Map::new();
+        let interval = make_tag(ctx, "type.interval", std::mem::take(&mut interval_m));
+        let mut unknown_m = Map::new();
+        let unknown = make_tag(ctx, "type.unknown", std::mem::take(&mut unknown_m));
+        let closure = if !closure.is_null() {
+            closure
+        } else {
+            serde_json::json!({
+                "var_name": "",
+                "body_child_idx": Value::Null,
+                "dep": true,
+                "const_body": unknown,
+            })
+        };
+        let mut m = Map::new();
+        m.insert("param".to_string(), interval);
+        m.insert("body_closure".to_string(), closure);
+        m.insert("path".to_string(), serde_json::json!({"x": x, "y": y}));
+        make_tag(ctx, "type.pi", m)
+    }
+
+    /// `trans p, q` — derived path composition (see the section
+    /// comment): unify `p.y` with `q.x`, yield the path type
+    /// `x ~ z` over the first operand's family. `refl` is the
+    /// identity — `trans(refl, q) = q`, `trans(p, refl) = p`.
+    pub(crate) fn synth_trans_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        if kids_len < 2 {
+            self.cub_diag(
+                ctx,
+                "error",
+                "trans: needs two path operands".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        let (Some(f_ref), Some(s_ref)) = (
+            Self::cub_child(lang, ast, node, "first", 0),
+            Self::cub_child(lang, ast, node, "second", 1),
+        ) else {
+            self.cub_diag(
+                ctx,
+                "error",
+                "trans: needs two path operands".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        };
+        let w1 = self.path_witness(lang, ast, f_ref, ctx)?;
+        let w2 = self.path_witness(lang, ast, s_ref, ctx)?;
+        if w1.verdict == CubPathVerdict::Bad || w2.verdict == CubPathVerdict::Bad {
+            self.cub_diag(
+                ctx,
+                "error",
+                "trans: operand is not a Path".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        if w1.verdict == CubPathVerdict::Refl && w2.verdict == CubPathVerdict::Refl {
+            self.cub_diag(
+                ctx,
+                "warning",
+                "trans: refl · refl — endpoints undetermined".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        if w1.verdict == CubPathVerdict::Refl {
+            return Ok(self.witness_path_type(ctx, &w2));
+        }
+        if w2.verdict == CubPathVerdict::Refl {
+            return Ok(self.witness_path_type(ctx, &w1));
+        }
+        let (u_ok, _) = unify_index(&w1.y, &w2.x, ctx);
+        if !u_ok {
+            self.cub_diag(
+                ctx,
+                "error",
+                "trans: path endpoints do not compose — the first path's target is not the second path's source".to_string(),
+                span,
+            );
+            return Ok(self.cub_unknown(ctx));
+        }
+        // The composed path lives over the first operand's family —
+        // `w1.closure`, falling back to `w2.closure`, then a constant
+        // `type.unknown` body (the model's closure selection).
+        let closure = if !w1.closure.is_null() {
+            w1.closure.clone()
+        } else {
+            w2.closure.clone()
+        };
+        Ok(self.mint_path_type(ctx, w1.x.clone(), w2.y.clone(), closure))
+    }
+
+    /// `symm p` — derived path symmetry (see the section comment):
+    /// swaps the endpoints of `p : x ~ y` into `y ~ x` over the same
+    /// family. `refl` has no determined endpoints — a warning, not a
+    /// silent `Path(?, ?)`.
+    pub(crate) fn synth_symm_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let span = node.span;
+        let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
+        if kids_len < 1 {
+            self.cub_diag(ctx, "error", "symm: needs a path operand".to_string(), span);
+            return Ok(self.cub_unknown(ctx));
+        }
+        let Some(p_ref) = Self::cub_child(lang, ast, node, "path", 0) else {
+            self.cub_diag(ctx, "error", "symm: needs a path operand".to_string(), span);
+            return Ok(self.cub_unknown(ctx));
+        };
+        let w = self.path_witness(lang, ast, p_ref, ctx)?;
+        match w.verdict {
+            CubPathVerdict::Bad => {
+                self.cub_diag(
+                    ctx,
+                    "error",
+                    "symm: operand is not a Path".to_string(),
+                    span,
+                );
+                Ok(self.cub_unknown(ctx))
+            }
+            CubPathVerdict::Refl => {
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "symm: refl has no determined endpoints".to_string(),
+                    span,
+                );
+                Ok(self.cub_unknown(ctx))
+            }
+            CubPathVerdict::Path => {
+                Ok(self.mint_path_type(ctx, w.y.clone(), w.x.clone(), w.closure.clone()))
+            }
+        }
     }
 
     /// `A ~[N]~> B` — the `Arrow` record `{inputs, grade, output, dim}`.
