@@ -502,3 +502,62 @@ fn transport_unrelated_type_warns() {
         diags_of(&result)
     );
 }
+
+/// `transport(p, v)` — the call-form alias for `p # v`
+/// (apply-forms-unification §9, decided: both spellings exist): the
+/// judge intercepts the callee *name* and runs the same transport
+/// judgment. `p : Bool ~ Nat`, `v : Bool` transports to `Nat`.
+#[test]
+fn transport_call_form_matches_infix() {
+    let lang = canonical_lang();
+    let ok = parse_block(
+        &lang,
+        &[
+            NAT_VEC,
+            BOOL_NAT_EQUIV,
+            "p := ua(e)",
+            "v : Bool := true",
+            "t : Nat := transport(p, v)",
+        ],
+    );
+    let result = typecheck(&lang, ok);
+    assert!(
+        !has_error(&result),
+        "transport(p, v) should inhabit the codomain Nat, got {:?}",
+        diags_of(&result)
+    );
+
+    let bad = parse_block(
+        &lang,
+        &[
+            NAT_VEC,
+            BOOL_NAT_EQUIV,
+            "p := ua(e)",
+            "v : Bool := true",
+            "t : Bool := transport(p, v)",
+        ],
+    );
+    let result = typecheck(&lang, bad);
+    assert!(
+        has_error(&result),
+        "transport(p, v) should not inhabit the domain Bool"
+    );
+}
+
+/// `transport` stays an ordinary identifier outside the 2-argument
+/// call form: a wrong-arity `transport(...)` call warns instead of
+/// silently capturing a binding (the `ua` precedent).
+#[test]
+fn transport_call_form_arity_warning() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[NAT_VEC, BOOL_NAT_EQUIV, "p := ua(e)", "t := transport(p)"],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_warning(&result, "transport(p, v) needs exactly two operands"),
+        "transport(p) should warn about arity, got {:?}",
+        diags_of(&result)
+    );
+}

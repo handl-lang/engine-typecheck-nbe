@@ -3830,6 +3830,22 @@ impl NbeTypecheckEngine {
                         })
                     }
                 }
+                Some("transport") => {
+                    // `transport(p, v)` in *type* position — `p # v`
+                    // is a term-level eliminator; the `transport` node
+                    // reads as `type.unknown` in annotations, so the
+                    // call form does the same (an open meta — the
+                    // degraded-formation reading).
+                    if arg_indices.len() != 2 {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message: "synth_type: transport(p, v) needs a path and a value operand"
+                                .to_string(),
+                            span: node.span,
+                        });
+                    }
+                    Ok(self.cub_open_meta(ctx))
+                }
                 Some("IO") => {
                     // `IO(sig)` — the typed-effect former (ADR-0153 §4):
                     // canonical `Former{type.io}` data. The sig index is
@@ -7477,6 +7493,23 @@ impl NbeTypecheckEngine {
             .as_u64()
             .ok_or_else(|| LangError::engine("transport: value index not a u64".to_string()))?
             as usize;
+        self.transport_judgment_at(lang, ast, path_idx, val_idx, node.span, ctx)
+    }
+
+    /// The transport judgment over explicit operand indices — shared by
+    /// the `p # v` node ([`Self::synth_transport_judgment`]) and the
+    /// `transport(p, v)` call form intercepted in `synth_call_judgment`
+    /// /`check_call_judgment` (the `ua`/`Univalence` precedent: the same
+    /// judgment under a plain identifier, no new node kind).
+    fn transport_judgment_at(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        path_idx: usize,
+        val_idx: usize,
+        span: Option<handl_language::Span>,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
         let path_node = ast
             .get(AstRef::new(path_idx))
             .ok_or_else(|| LangError::engine("transport: path node out of bounds".to_string()))?;
@@ -7508,7 +7541,7 @@ impl NbeTypecheckEngine {
                                 ctx,
                                 "warning",
                                 "transport along univalence: value type does not mention the equivalence domain — passing through unchanged".to_string(),
-                                node.span,
+                                span,
                             );
                             vty.clone()
                         }
@@ -9718,6 +9751,40 @@ impl NbeTypecheckEngine {
             }
             return Ok(ty);
         }
+        // `transport(p, v)` call form in check position — synthesize
+        // the transport type and unify it against the expected type
+        // (the model's `call` judgment intercept, `ua` precedent).
+        let transport_call = children_of(node)
+            .and_then(|k| k.first())
+            .and_then(Value::as_u64)
+            .and_then(|i| ast.get(AstRef::new(i as usize)))
+            .is_some_and(|c| c.kind == "var" && node_name(c).as_deref() == Some("transport"));
+        if transport_call {
+            let kids = children_of(node)
+                .ok_or_else(|| LangError::engine("check_call: no children".to_string()))?;
+            if kids.len() != 3 {
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "transport(p, v) needs exactly two operands — a path and a value".to_string(),
+                    node.span,
+                );
+                return Ok(self.cub_unknown(ctx));
+            }
+            let path_idx = kids[1]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("check_call: path index not a u64".to_string()))?
+                as usize;
+            let val_idx = kids[2]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("check_call: value index not a u64".to_string()))?
+                as usize;
+            let ty = self.transport_judgment_at(lang, ast, path_idx, val_idx, node.span, ctx)?;
+            if let Some(exp) = incoming {
+                self.dep_unify(&ty, &exp, ctx)?;
+            }
+            return Ok(ty);
+        }
         let kids = children_of(node)
             .ok_or_else(|| LangError::engine("check_call: no children".to_string()))?;
         let callee_idx =
@@ -9792,6 +9859,36 @@ impl NbeTypecheckEngine {
                 .ok_or_else(|| LangError::engine("call: arg index not a u64".to_string()))?
                 as usize;
             return self.synth_univalence_core(lang, ast, arg_idx, node.span, ctx);
+        }
+        // `transport(p, v)` call form — the `p # v` transport
+        // eliminator under a plain identifier (apply-forms-unification
+        // §9, decided: both spellings exist). Intercepted by callee
+        // name before ordinary application — the `ua`/`Univalence`
+        // precedent: `transport` stays an ordinary identifier
+        // everywhere else (bare uses, other arities warn here rather
+        // than silently capturing a binding — same as `ua`).
+        if let Some(callee_node) = ast.get(AstRef::new(callee_idx))
+            && callee_node.kind == "var"
+            && node_name(callee_node).as_deref() == Some("transport")
+        {
+            if kids.len() != 3 {
+                self.cub_diag(
+                    ctx,
+                    "warning",
+                    "transport(p, v) needs exactly two operands — a path and a value".to_string(),
+                    node.span,
+                );
+                return Ok(self.cub_unknown(ctx));
+            }
+            let path_idx = kids[1]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("call: path index not a u64".to_string()))?
+                as usize;
+            let val_idx = kids[2]
+                .as_u64()
+                .ok_or_else(|| LangError::engine("call: value index not a u64".to_string()))?
+                as usize;
+            return self.transport_judgment_at(lang, ast, path_idx, val_idx, node.span, ctx);
         }
         let mut cur = self.synth_node(lang, ast, AstRef::new(callee_idx), ctx)?;
         // `f()` — zero-argument application. Legal only when the
