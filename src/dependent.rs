@@ -2962,6 +2962,67 @@ impl NbeTypecheckEngine {
                     let kids = children_of(node)
                         .ok_or_else(|| LangError::engine("dep_synth_type: empty paren"))?;
                     if kids.len() > 1 {
+                        // Dependent pair `(x : A, y : B(x), …)` — every
+                        // child a typed name binder (`type-annot(var, T)`)
+                        // and some later annotation mentioning an earlier
+                        // binder name mints a right-nested `type.sigma`
+                        // chain (the same value `Sigma(A, x ~> Sigma(B,
+                        // y ~> …))` produces; `[w, v]`/`[w, [v, u]]`
+                        // literals check through `dep_intro_sigma`).
+                        // Non-dependent binder lists and mixed/untyped
+                        // children keep the `type.array{elements}`
+                        // product convention below.
+                        let binder_nodes: Vec<usize> = kids
+                            .iter()
+                            .filter_map(Value::as_u64)
+                            .map(|v| v as usize)
+                            .collect();
+                        let binders: Option<Vec<(String, usize)>> = binder_nodes
+                            .iter()
+                            .map(|&i| Self::typed_binder(lang, ast, i))
+                            .collect();
+                        if let Some(bs) = binders {
+                            // Dependence: binder `j`'s annotation mentions
+                            // an earlier binder name (conservative —
+                            // `occurs_name` ignores binder shadowing,
+                            // which only over-approximates toward sigma,
+                            // and a constant-body sigma still accepts the
+                            // same `[w, v]` intro).
+                            let dependent = bs.iter().enumerate().any(|(j, (_, a))| {
+                                j > 0
+                                    && bs[..j].iter().any(|(n, _)| {
+                                        ast.get(AstRef::new(*a))
+                                            .is_some_and(|an| occurs_name(ast, an, n))
+                                    })
+                            });
+                            if dependent {
+                                let param =
+                                    self.dep_synth_type(lang, ast, bs[0].1, ctx)?;
+                                let rest: Vec<Value> = bs[1..]
+                                    .iter()
+                                    .map(|(n, a)| {
+                                        serde_json::json!({"name": n, "annot": a})
+                                    })
+                                    .collect();
+                                let last_annot = bs.last().map(|(_, a)| *a).unwrap_or(0);
+                                let mut m = Map::new();
+                                m.insert("param".to_string(), param);
+                                m.insert(
+                                    "body_closure".to_string(),
+                                    serde_json::json!({
+                                        "var_name": bs[0].0,
+                                        "rest": rest,
+                                        "chain": "sigma",
+                                        // Compat: readers that only know
+                                        // `body_child_idx` see the last
+                                        // component's annotation.
+                                        "body_child_idx": last_annot,
+                                        "dep": true,
+                                    }),
+                                );
+                                return Ok(make_tag(ctx, "type.sigma", m));
+                            }
+                        }
                         // Tuple position `(A, B)` — the `type.array{elements}`
                         // convention `synth_function` mints for `(x, y) ~>`
                         // domains.
@@ -3032,6 +3093,60 @@ impl NbeTypecheckEngine {
                         .ok_or_else(|| {
                             LangError::engine("dep_synth_type: function missing body")
                         })?;
+                    // Typed-param arrow `(x : A, …) ~> B` in *type*
+                    // position is a dependent arrow — the same
+                    // `type.pi` `Pi(A, x ~> B)` mints: the domain reads
+                    // each binder's `type-annot`, the names bind the
+                    // lazy `body_closure` (`rest` chain for multiple
+                    // binders). Untyped params keep the `type.function`
+                    // reading below. Term position is unaffected —
+                    // `synth_node` handles lambdas there.
+                    let param_nodes: Vec<usize> = if let Some(p) = ast.get(params_idx) {
+                        if p.kind == "paren" {
+                            children_of(p)
+                                .map(|k| {
+                                    k.iter()
+                                        .filter_map(Value::as_u64)
+                                        .map(|v| v as usize)
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            vec![params_idx.index()]
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let binders: Option<Vec<(String, usize)>> = if param_nodes.is_empty() {
+                        None
+                    } else {
+                        param_nodes
+                            .iter()
+                            .map(|&i| Self::typed_binder(lang, ast, i))
+                            .collect()
+                    };
+                    if let Some(bs) = binders {
+                        if !bs.is_empty() {
+                            let param = self.dep_synth_type(lang, ast, bs[0].1, ctx)?;
+                            let rest: Vec<Value> = bs[1..]
+                                .iter()
+                                .map(|(n, a)| serde_json::json!({"name": n, "annot": a}))
+                                .collect();
+                            let mut m = Map::new();
+                            m.insert("param".to_string(), param);
+                            m.insert(
+                                "body_closure".to_string(),
+                                serde_json::json!({
+                                    "var_name": bs[0].0,
+                                    "rest": rest,
+                                    "chain": "pi",
+                                    "body_child_idx": body_idx.index(),
+                                    "dep": true,
+                                }),
+                            );
+                            return Ok(make_tag(ctx, "type.pi", m));
+                        }
+                    }
                     // The params child is a type expression — a `paren`-wrapped
                     // list takes its last child as the domain (the `A -> B`
                     // convention); any other node (`call` former
@@ -3720,9 +3835,46 @@ impl NbeTypecheckEngine {
                     // canonical `Former{type.io}` data. The sig index is
                     // an op-signature record — `{op: T, …}` entries
                     // synthesize their value types; `IO()` is `IO(⊤)`.
-                    let sig = match arg_indices.first() {
-                        Some(&i) => self.io_sig(lang, ast, i, ctx)?,
-                        None => Value::Null,
+                    // The brace-free `IO<puts, fs>` / `IO<puts: T, fs>`
+                    // spelling — the `dimension` node's argument list,
+                    // unambiguous there: each arg is an expression, a
+                    // bare `var` declares an op with an unstated
+                    // request and `name : T` its payload — is the same
+                    // sig-record sugar, single op included
+                    // (`IO<puts>` ≡ `IO<{ puts }>`,
+                    // `IO<puts: T>` ≡ `IO<{ puts: T }>`). Call-form
+                    // `IO(s)`/`IO(sig)` is untouched — a bare variable
+                    // there is a sig-typed *index*, not an op list —
+                    // and the sugar fires only when EVERY argument is a
+                    // bare name or typed binder; anything else keeps
+                    // the single-sig-argument reading.
+                    let sig = if node.kind == "dimension"
+                        && !arg_indices.is_empty()
+                        && arg_indices.iter().all(|&i| {
+                            ast.get(AstRef::new(i)).is_some_and(|n| {
+                                n.kind == "var" || Self::typed_binder(lang, ast, i).is_some()
+                            })
+                        }) {
+                        let mut m = Map::new();
+                        for &i in &arg_indices {
+                            if let Some((k, ty_idx)) = Self::typed_binder(lang, ast, i) {
+                                m.insert(k, self.dep_synth_type(lang, ast, ty_idx, ctx)?);
+                            } else if let Some(n) = ast.get(AstRef::new(i))
+                                && let Some(k) = node_name(n)
+                            {
+                                let mut u = Map::new();
+                                m.insert(
+                                    k,
+                                    make_tag(ctx, "type.unknown", std::mem::take(&mut u)),
+                                );
+                            }
+                        }
+                        Value::Object(m)
+                    } else {
+                        match arg_indices.first() {
+                            Some(&i) => self.io_sig(lang, ast, i, ctx)?,
+                            None => Value::Null,
+                        }
                     };
                     let vs = domain_lift(&sig, ctx);
                     Ok(domain_quote(
@@ -4159,6 +4311,114 @@ impl NbeTypecheckEngine {
             .or_else(|| node_name(pnode))
             .unwrap_or_else(|| "x".to_string());
         Some((name, body_idx.index()))
+    }
+
+    /// A *typed name binder* `x : T` — a `type-annot` node whose subject
+    /// is a bare `var`. Returns `(name, annot type-expr node idx)`; `None`
+    /// for anything else (untyped `var`, computed subject, non-annot).
+    /// Shared by the dependent-pair `paren` arm and the typed-param
+    /// `function` arm of [`Self::dep_synth_type`].
+    fn typed_binder(
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+    ) -> Option<(String, usize)> {
+        let n = ast.get(AstRef::new(idx))?;
+        if n.kind != "type-annot" && role_child_ref(lang, n, "annot").is_none() {
+            return None;
+        }
+        let kids = children_of(n)?;
+        let subj_i = lang
+            .child_role_index(&n.kind, "subject")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let annot_i = lang
+            .child_role_index(&n.kind, "annot")
+            .ok()
+            .flatten()
+            .unwrap_or(1);
+        let subj = ast.get(AstRef::new(kids.get(subj_i)?.as_u64()? as usize))?;
+        if subj.kind != "var" {
+            return None;
+        }
+        let name = node_name(subj)?;
+        let ty = kids.get(annot_i)?.as_u64()? as usize;
+        Some((name, ty))
+    }
+
+    /// Expand one step of a `body_closure` `rest` chain — the lazy
+    /// binder tail minted by `dep_synth_type` for dependent pairs
+    /// `(x : A, y : B(…), …)` (`"chain": "sigma"`) and typed-param
+    /// arrows `(x : A, …) ~> C` (`"chain": "pi"`). Each `rest` entry is
+    /// `{name, annot}` — the next binder's name and its type-expression
+    /// node, elaborated *now* so earlier binders are in scope.
+    ///
+    /// - `sigma`: yields `type.sigma{param, body_closure}` per remaining
+    ///   component; the last entry's annotation IS the final component
+    ///   type (returned directly).
+    /// - `pi`: yields `type.pi{param, body_closure}` per remaining
+    ///   binder; `body_child_idx` on the parent closure is the shared
+    ///   terminal body (`~>` right-hand side).
+    fn dep_closure_chain(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        bc: &Value,
+        rest: &[Value],
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let head = &rest[0];
+        let hname = head
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("x")
+            .to_string();
+        let hannot = head
+            .get("annot")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LangError::engine("dep_closure_chain: rest entry missing annot idx".to_string())
+            })? as usize;
+        let param = self.dep_synth_type(lang, ast, hannot, ctx)?;
+        let chain = bc.get("chain").and_then(Value::as_str).unwrap_or("sigma");
+        if chain == "pi" {
+            let body_idx = bc
+                .get("body_child_idx")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    LangError::engine("dep_closure_chain: pi chain missing body idx".to_string())
+                })?;
+            let mut m = Map::new();
+            m.insert("param".to_string(), param);
+            m.insert(
+                "body_closure".to_string(),
+                serde_json::json!({
+                    "var_name": hname,
+                    "rest": rest[1..],
+                    "chain": "pi",
+                    "body_child_idx": body_idx,
+                    "dep": true,
+                }),
+            );
+            return Ok(make_tag(ctx, "type.pi", m));
+        }
+        if rest.len() == 1 {
+            // Last sigma component: its annotation is the body type.
+            return Ok(param);
+        }
+        let mut m = Map::new();
+        m.insert("param".to_string(), param);
+        m.insert(
+            "body_closure".to_string(),
+            serde_json::json!({
+                "var_name": hname,
+                "rest": rest[1..],
+                "chain": "sigma",
+                "dep": true,
+            }),
+        );
+        Ok(make_tag(ctx, "type.sigma", m))
     }
 
     /// In `family_app` argument position a node is an *index term* when it
@@ -6318,6 +6578,15 @@ impl NbeTypecheckEngine {
                 .unwrap_or_else(|| var_term(var_name));
             return self.dep_closure_apply_term(lang, ast, fam, &term, ctx);
         }
+        // Dependent binder chains (`rest` — dependent pairs and
+        // typed-param arrows): expand one `type.sigma`/`type.pi` level
+        // per remaining binder. `var_name` is already bound by the
+        // caller (`dep_intro_arrow` sets `results[var_name]`).
+        if let Some(rest) = bc.get("rest").and_then(Value::as_array)
+            && !rest.is_empty()
+        {
+            return self.dep_closure_chain(lang, ast, bc, rest, ctx);
+        }
         let var_name = bc.get("var_name").and_then(Value::as_str).unwrap_or("x");
         let body_idx = bc
             .get("body_child_idx")
@@ -6392,18 +6661,17 @@ impl NbeTypecheckEngine {
             return Ok(cb.clone());
         }
         if let Some(fam) = bc.get("apply_type") {
-            return self.dep_closure_apply_term(lang, ast, fam, term, ctx);
+            return self.dep_closure_apply_term(lang, ast, fam, &term, ctx);
         }
         let var_name = bc
             .get("var_name")
             .and_then(Value::as_str)
             .unwrap_or("x")
             .to_string();
-        let body_idx = bc
-            .get("body_child_idx")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| LangError::engine("dep_closure_apply: no body idx".to_string()))?
-            as usize;
+        // `rest`-chain closures may carry no `body_child_idx` (sigma
+        // chains terminate on the last binder's annotation), so the
+        // index is only required on the non-chain path below.
+        let body_idx = bc.get("body_child_idx").and_then(Value::as_u64).map(|v| v as usize);
         let bound = eval_index(term, ctx);
         // Occurs guard: `var_name` occurring inside its own binding
         // term (`Sigma(Nat, m ~> Vec(m, a))` applied at `var{m}+1` —
@@ -6426,7 +6694,19 @@ impl NbeTypecheckEngine {
         };
         let old = ctx.results.get(&scoped_key).cloned();
         ctx.bind_result(scoped_key.clone(), bound);
-        let r = self.dep_synth_type(lang, ast, body_idx, ctx);
+        // Dependent binder chains (`rest` — dependent pairs and
+        // typed-param arrows): expand one `type.sigma`/`type.pi` level
+        // per remaining binder, inside this binding's scope.
+        let r = if let Some(rest) = bc.get("rest").and_then(Value::as_array)
+            && !rest.is_empty()
+        {
+            self.dep_closure_chain(lang, ast, bc, rest, ctx)
+        } else {
+            let body_idx = body_idx.ok_or_else(|| {
+                LangError::engine("dep_closure_apply: no body idx".to_string())
+            })?;
+            self.dep_synth_type(lang, ast, body_idx, ctx)
+        };
         match old {
             Some(v) => ctx.bind_result(scoped_key.clone(), v),
             None => {
