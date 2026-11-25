@@ -2184,6 +2184,12 @@ impl NbeTypecheckEngine {
                     })?;
                     self.synth_dim_arrow_judgment(lang, ast, node, ctx)
                 }
+                "synth_graded_arrow" => {
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_graded_arrow: node out of bounds".to_string())
+                    })?;
+                    self.synth_graded_arrow_judgment(lang, ast, node, ctx)
+                }
                 "synth_transport" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_transport: node out of bounds".to_string())

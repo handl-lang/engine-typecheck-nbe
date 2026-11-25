@@ -3413,6 +3413,49 @@ impl NbeTypecheckEngine {
                     let vb = domain_lift(&tgt, ctx);
                     Ok(hom_former(dim_v, va, vb, ctx))
                 }
+                "graded_arrow" => {
+                    // `A ~[G]~> B` in annotation position — a graded
+                    // arrow is a 1-cell with a grade annotation
+                    // (graded-arrows.md §4): `Hom(1, A, B)`. The grade
+                    // child elaborates for well-formedness but never
+                    // enters the `type.hom` index.
+                    let kids = children_of(node).ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow no children")
+                    })?;
+                    if kids.len() < 3 {
+                        return Err(LangError::engine(
+                            "dep_synth_type: graded_arrow missing operands",
+                        ));
+                    }
+                    let src_idx = kids[0]
+                        .as_u64()
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: graded_arrow src index")
+                        })?
+                        as usize;
+                    let grade_idx = kids[1]
+                        .as_u64()
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: graded_arrow grade index")
+                        })?
+                        as usize;
+                    let tgt_idx = kids[2]
+                        .as_u64()
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: graded_arrow tgt index")
+                        })?
+                        as usize;
+                    let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
+                    // Well-formedness: the grade expression must
+                    // elaborate; its type is discarded (grades are a
+                    // separate axis — no `type.hom` slot carries it).
+                    let _grade = self.dep_synth_type(lang, ast, grade_idx, ctx)?;
+                    let tgt = self.dep_synth_type(lang, ast, tgt_idx, ctx)?;
+                    let dim_v = Val::Const(TaggedValue::Int(1));
+                    let va = domain_lift(&src, ctx);
+                    let vb = domain_lift(&tgt, ctx);
+                    Ok(hom_former(dim_v, va, vb, ctx))
+                }
                 "absurd" | "if" | "match" | "object" | "index" => {
                     // Non-type positions in annotations — leave them open.
                     let mut m = Map::new();
@@ -9248,6 +9291,64 @@ impl NbeTypecheckEngine {
         Ok(hom_former(dim_v, va, vb, ctx))
     }
 
+    /// `A ~[G]~> B` — a graded arrow is a 1-cell with a grade annotation
+    /// (graded-arrows.md §4 P1): the emitted former is `Hom(1, src, tgt)`
+    /// — the grade never enters the `type.hom` index (ADR-0153 §6) — and
+    /// the grade child still synthesizes so names resolve and
+    /// diagnostics fire (well-formedness only; grade constraint
+    /// enforcement is deferred).
+    pub(crate) fn synth_graded_arrow_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = children_of(node)
+            .ok_or_else(|| LangError::engine("graded_arrow: no children".to_string()))?;
+        if kids.len() < 3 {
+            return Err(LangError::engine(
+                "graded_arrow: missing operands".to_string(),
+            ));
+        }
+        let src_idx = kids[0]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("graded_arrow: src index not a u64".to_string()))?
+            as usize;
+        let grade_idx = kids[1]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("graded_arrow: grade index not a u64".to_string()))?
+            as usize;
+        let tgt_idx = kids[2]
+            .as_u64()
+            .ok_or_else(|| LangError::engine("graded_arrow: tgt index not a u64".to_string()))?
+            as usize;
+        // Same law-pattern treatment as `synth_dim_arrow`: free `var`s of
+        // the endpoints are pattern variables, not wire references.
+        let law_mark = ctx.mark();
+        for idx in [src_idx, tgt_idx] {
+            if let Some(n) = ast.get(AstRef::new(idx)) {
+                self.bind_law_pattern_vars(lang, ast, n, ctx);
+            }
+        }
+        let judged = (|ctx: &mut TypecheckContext| -> Result<(Value, Value), LangError> {
+            let src = self.synth_node(lang, ast, AstRef::new(src_idx), ctx)?;
+            // The grade expression elaborates (node_types + diagnostics);
+            // the emitted former carries no grade field — `Hom` stays
+            // purely dimensional.
+            let _grade = self.synth_node(lang, ast, AstRef::new(grade_idx), ctx)?;
+            let tgt = self.synth_node(lang, ast, AstRef::new(tgt_idx), ctx)?;
+            Ok((src, tgt))
+        })(ctx);
+        ctx.restore(law_mark);
+        let (src, tgt) = judged?;
+        // A graded arrow is a 1-cell: `Hom(1, src, tgt)`.
+        let dim_v = Val::Const(TaggedValue::Int(1));
+        let va = domain_lift(&src, ctx);
+        let vb = domain_lift(&tgt, ctx);
+        Ok(hom_former(dim_v, va, vb, ctx))
+    }
+
     /// Bind the free `var`s of a `~[N]~>` law endpoint to fresh metas —
     /// the pattern-mode counterpart of the scope pass's rule-term
     /// check. A name already resolvable (Γ, results, injected or
@@ -10556,7 +10657,10 @@ impl NbeTypecheckEngine {
                     .ok_or_else(|| LangError::engine("synth_assign: annot idx".to_string()))?
                     as usize;
                 (iv.to_string(), AstRef::new(vidx), Some(AstRef::new(tidx)))
-            } else if matches!(lhs_node.kind.as_str(), "dim_arrow" | "axis_flow" | "flow") {
+            } else if matches!(
+                lhs_node.kind.as_str(),
+                "dim_arrow" | "graded_arrow" | "axis_flow" | "flow"
+            ) {
                 // `f : A ~[k]~> B` / `f : A >>>[k] B` — `:` binds
                 // tighter than the arrow infix, so the annotation
                 // parses as `arrow(type-annot(f, A), …)` with the

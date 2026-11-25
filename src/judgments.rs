@@ -382,6 +382,25 @@ fn eval_body_node(
                 args: vec![dv, sv, tv],
             })
         }
+        // `A ~[G]~> B` evaluates to the same canonical former data as
+        // `dim_arrow` at dimension 1 — a graded arrow is a 1-cell; the
+        // grade child still evaluates for well-formedness.
+        "graded_arrow" => {
+            let (Some(s), Some(g), Some(t)) = (
+                body_child(ast, node, lang, "src", 0),
+                body_child(ast, node, lang, "grade", 1),
+                body_child(ast, node, lang, "tgt", 2),
+            ) else {
+                return Ok(stuck_val("graded_arrow", vec![]));
+            };
+            let sv = ev(s, env, ast, lang, fuel)?;
+            let _gv = ev(g, env, ast, lang, fuel)?;
+            let tv = ev(t, env, ast, lang, fuel)?;
+            Ok(Val::Former {
+                head: type_sym("type.hom"),
+                args: vec![const_val(1), sv, tv],
+            })
+        }
         "axis_flow" => {
             let (Some(a), Some(k), Some(b)) = (
                 body_child(ast, node, lang, "left", 0),
