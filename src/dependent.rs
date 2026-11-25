@@ -2973,6 +2973,214 @@ fn inductive_spec_value(
     make_tag(ctx, "inductive.spec", fields)
 }
 
+/// Whether `v` is an owned node record produced by [`owned_node_value`]
+/// (`{kind, span, payload}`) rather than a scalar payload entry.
+/// `inductive.spec` children/body slots hold these records; every other
+/// payload value passes through untouched.
+fn is_owned_node_value(v: &Value) -> bool {
+    v.as_object()
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        .is_some()
+}
+
+/// Materialize one owned `inductive.spec` type-expr node into
+/// `ctx.spec_ast` (PL-0003 I2), returning its fresh arena index. The
+/// side arena is initialized lazily as a *clone of the source arena*
+/// so spec indices can never collide with source indices — they are
+/// always ≥ `ast.len()`, which is what lets `dep_synth_type`'s
+/// out-of-bounds fallback find them after elaboration. Children are
+/// materialized first (post-order); `payload["children"]` entries and
+/// `payload["body"]` that are owned node records become arena indices,
+/// everything else passes through verbatim — the same two keys
+/// [`owned_payload`] recursed into.
+fn spec_node_index(
+    ctx: &mut TypecheckContext,
+    ast: &Ast,
+    owned: &Value,
+) -> Result<usize, LangError> {
+    let Some(obj) = owned.as_object() else {
+        return Err(LangError::engine(
+            "inductive.spec: type-expr is not an owned node record".to_string(),
+        ));
+    };
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LangError::engine("inductive.spec: owned node missing kind".to_string())
+        })?
+        .to_string();
+    let span = obj.get("span").and_then(|sp| {
+        let start = sp.get("start").and_then(Value::as_u64)? as usize;
+        let end = sp.get("end").and_then(Value::as_u64)? as usize;
+        Some(handl_language::Span { start, end })
+    });
+    // Materialize `children`/`body` first — each recursion re-borrows
+    // `ctx`, so the arena borrow below never spans a recursive call.
+    let mut payload = match obj.get("payload") {
+        Some(Value::Object(p)) => p.clone(),
+        _ => Map::new(),
+    };
+    if let Some(Value::Array(items)) = payload.get("children").cloned() {
+        let mut idxs = Vec::with_capacity(items.len());
+        for c in &items {
+            if is_owned_node_value(c) {
+                idxs.push(Value::from(spec_node_index(ctx, ast, c)? as u64));
+            } else {
+                idxs.push(c.clone());
+            }
+        }
+        payload.insert("children".to_string(), Value::Array(idxs));
+    }
+    let mut body_idx = Value::Null;
+    let mut body_done = false;
+    if let Some(raw) = payload.get("body")
+        && is_owned_node_value(raw)
+    {
+        body_idx = Value::from(spec_node_index(ctx, ast, raw)? as u64);
+        body_done = true;
+    }
+    if ctx.spec_ast.is_none() {
+        ctx.spec_ast = Some(ast.clone());
+    }
+    if body_done {
+        payload.insert("body".to_string(), body_idx);
+    }
+    let node = AstNode {
+        kind,
+        span,
+        payload: Value::Object(payload),
+    };
+    let arena = ctx
+        .spec_ast
+        .as_mut()
+        .ok_or_else(|| LangError::engine("inductive.spec: spec arena missing".to_string()))?;
+    Ok(arena.push(node).index())
+}
+
+/// `true` when `results["<family>.spec"]` is an `inductive.spec`
+/// declaring `ctor` — the pure membership half of spec-driven ctor
+/// resolution (no arena materialization). Used for match-arm coverage
+/// classification where only membership matters.
+fn spec_declares_ctor(ctx: &TypecheckContext, family: &str, ctor: &str) -> bool {
+    if family.is_empty() {
+        return false;
+    }
+    ctx.results
+        .get(&format!("{family}.spec"))
+        .filter(|s| tag_of(s) == Some("inductive.spec"))
+        .and_then(|s| s.get("ctors").and_then(Value::as_array))
+        .is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some(ctor))
+        })
+}
+
+/// Rebuild the `type.ctor_sig` for `ctor` of `family` from the family's
+/// `inductive.spec` results value (PL-0003 I2). The spec's owned
+/// type-expr nodes are materialized into `ctx.spec_ast` and the
+/// returned sig's `node` fields index *that* arena — callers must
+/// instantiate it against `ctx.spec_ast`, not the source `ast` (see
+/// `synth_match_with_motive`). The record shape mirrors the gamma
+/// `type.ctor_sig` `synth_data` binds (`params`/`args` carry `node`
+/// arena indices, `result` an index or `null`, plus `bare`).
+/// `Ok(None)` when no usable spec or ctor is present — the caller then
+/// falls back to the gamma `type.ctor_sig` binding.
+fn spec_ctor_sig(
+    ctx: &mut TypecheckContext,
+    ast: &Ast,
+    family: &str,
+    ctor: &str,
+) -> Result<Option<Value>, LangError> {
+    if family.is_empty() {
+        return Ok(None);
+    }
+    let Some(spec) = ctx
+        .results
+        .get(&format!("{family}.spec"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if tag_of(&spec) != Some("inductive.spec") {
+        return Ok(None);
+    }
+    let Some(c) = spec
+        .get("ctors")
+        .and_then(Value::as_array)
+        .and_then(|cs| {
+            cs.iter()
+                .find(|c| c.get("name").and_then(Value::as_str) == Some(ctor))
+                .cloned()
+        })
+    else {
+        return Ok(None);
+    };
+    // Owned type-expr → spec-arena index; `null`/non-node stays `null`
+    // (the `type.unknown` domain convention `instantiate_ctor_full`
+    // already handles).
+    let mut params = Vec::new();
+    for p in spec
+        .get("params")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let node = match p.get("sort") {
+            Some(v) if is_owned_node_value(v) => {
+                Value::from(spec_node_index(ctx, ast, v)? as u64)
+            }
+            _ => Value::Null,
+        };
+        params.push(serde_json::json!({
+            "name": p.get("name").and_then(Value::as_str).unwrap_or(""),
+            "node": node,
+            "nat": p.get("nat").and_then(Value::as_bool).unwrap_or(false),
+        }));
+    }
+    let mut args = Vec::new();
+    for a in c
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let node = match a.get("type") {
+            Some(v) if is_owned_node_value(v) => {
+                Value::from(spec_node_index(ctx, ast, v)? as u64)
+            }
+            _ => Value::Null,
+        };
+        args.push(serde_json::json!({
+            "name": a.get("name").and_then(Value::as_str).unwrap_or(""),
+            "node": node,
+        }));
+    }
+    let result = match c.get("result") {
+        Some(v) if is_owned_node_value(v) => {
+            Value::from(spec_node_index(ctx, ast, v)? as u64)
+        }
+        _ => Value::Null,
+    };
+    let spec_name = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(family)
+        .to_string();
+    let sig = serde_json::json!({
+        "__tag__": "type.ctor_sig",
+        "__registry__": ctx.registry.registry_id(),
+        "ctor": true,
+        "family": spec_name,
+        "params": params,
+        "args": args,
+        "result": result,
+        "bare": c.get("bare").and_then(Value::as_bool).unwrap_or(false),
+    });
+    Ok(Some(sig))
+}
+
 /// Strict positivity over the ctor-arg AST (checker-owned, ADR-0152 §4):
 /// the defined former must not occur in a *domain* position. `occurs` is
 /// any occurrence; a `call(->, dom, cod)`/`function` node's domain child
@@ -3075,9 +3283,32 @@ impl NbeTypecheckEngine {
         crate::stats::dep_synth_type(idx);
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-            let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
-                LangError::engine(format!("dep_synth_type: node {} out of bounds", idx))
-            })?;
+            // PL-0003 I2: indices minted by `inductive.spec` materialization
+            // live in `ctx.spec_ast` — a clone of the source arena plus the
+            // appended owned type-expr nodes — so they always exceed the
+            // source length. A miss on `ast` is therefore the spec arena's
+            // hit, never a silent wrong-node read; anything still missing
+            // is the same out-of-bounds error as before.
+            let spec_node;
+            let node = match ast.get(AstRef::new(idx)) {
+                Some(n) => n,
+                None => {
+                    spec_node = ctx
+                        .spec_ast
+                        .as_ref()
+                        .and_then(|a| a.get(AstRef::new(idx)))
+                        .cloned();
+                    match spec_node.as_ref() {
+                        Some(n) => n,
+                        None => {
+                            return Err(LangError::engine(format!(
+                                "dep_synth_type: node {} out of bounds",
+                                idx
+                            )))
+                        }
+                    }
+                }
+            };
             match node.kind.as_str() {
                 "paren" => {
                     let kids = children_of(node)
@@ -5867,12 +6098,34 @@ impl NbeTypecheckEngine {
             .iter()
             .map(|a| freeze_metas(a, inst_no, &mut arg_pos))
             .collect();
+        self.register_instance(lang, ast, node, ctx, &head, args, &constraint, dict_idx)
+    }
+
+    /// Shared tail of `synth_instance` and `synth_new_decl`: the
+    /// coherence scan, dictionary well-formedness synth, and
+    /// `(head, args) ↦ dict-name` registration in the context's
+    /// instance table. `args` is the (already rigid/frozen) index
+    /// shape; `constraint` is the `type.family_app{head, args}` the
+    /// dict binds at in Γ — its `type` link IS the declared former
+    /// application.
+    #[allow(clippy::too_many_arguments)]
+    fn register_instance(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+        head: &str,
+        args: Vec<Value>,
+        constraint: &Value,
+        dict_idx: usize,
+    ) -> Result<Value, LangError> {
         // Coherence — no two instances may declare unifiable index
         // shapes for one head (decision: error at declaration time,
         // not ordered first-match at search). The candidate list is
         // cloned out — `unify_index`/`store_restore` borrow `ctx`
         // mutably inside the scan.
-        if let Some(existing) = ctx.instances.get(&head).cloned() {
+        if let Some(existing) = ctx.instances.get(head).cloned() {
             for cand in &existing {
                 if cand.args.len() != args.len() {
                     continue;
@@ -5891,7 +6144,7 @@ impl NbeTypecheckEngine {
                     return Err(LangError::engine_node(
                         format!(
                             "synth_instance: overlapping instance for `{}` — an instance with a unifiable index shape is already declared",
-                            display_type(&constraint, ctx)
+                            display_type(constraint, ctx)
                         ),
                         node,
                     ));
@@ -5903,16 +6156,143 @@ impl NbeTypecheckEngine {
         // constraint: the instance assertion is that this value's
         // `type` link is the former application.
         self.synth_node(lang, ast, AstRef::new(dict_idx), ctx)?;
-        let inst_name = format!("$instance:{head}:{inst_no}");
+        let inst_name = format!("$instance:{head}:{}", ctx.instance_count);
         ctx.instance_count += 1;
         ctx.extend(inst_name.clone(), constraint.clone());
         ctx.bind_result(inst_name.clone(), var_term(&inst_name));
-        ctx.instances.entry(head).or_default().push(InstanceEntry {
-            name: inst_name,
-            args,
-        });
+        ctx.instances
+            .entry(head.to_string())
+            .or_default()
+            .push(InstanceEntry {
+                name: inst_name,
+                args,
+            });
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
+    }
+
+    /// `X := new T(args) { members }` — the `new` declaration form
+    /// (graded-arrows.md §3 "Algebra declaration syntax", MTT
+    /// migration): one declaration, two jobs.
+    ///
+    /// 1. `X : type.family{name: X, base: [carrier]}` — `X(p)` in term
+    ///    position mints `type.family_app{X, [p]}` through the ordinary
+    ///    family-application reading (`Vec(2, Bool)` precedent): the
+    ///    self-describing call-head mode value `mode_compose` resolves
+    ///    an algebra for. `base` carries a single index whose sort is
+    ///    the carrier type — the first index argument of `T(args)`
+    ///    when it elaborates to a `type.family_app` (`Algebra(Nat)` →
+    ///    `Nat`), else a fresh meta (permissive fallback).
+    /// 2. `(X, [_]) ↦ dict` in the context's instance table — the same
+    ///    entry `instance X(_) := dict` registers (one rigid index
+    ///    var matching any `X`-headed mode payload), so dictionary
+    ///    search finds the algebra for `Cost`-headed modes. Coherence,
+    ///    dict well-formedness, and the Γ binding are
+    ///    [`Self::register_instance`]'s, shared with `synth_instance`.
+    ///
+    /// `T(args)` is elaborated as a type for well-formedness — it
+    /// names the algebra former. Checking the dict *against* `T(args)`
+    /// is deferred until M2's `Algebra` definition lands (documented
+    /// assumption); the dict currently gets the same
+    /// well-formedness-only treatment an `instance` dict does.
+    ///
+    /// `name` is the `assign` target — the family/instance head,
+    /// which a `new`-node-local judgment cannot see.
+    pub(crate) fn synth_new_decl_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        name: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let kids = children_of(node).ok_or_else(|| {
+            LangError::engine_node(
+                "synth_new: new needs [type, dict] children".to_string(),
+                node,
+            )
+        })?;
+        let type_idx = kids.first().and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine_node("synth_new: missing type child".to_string(), node)
+        })? as usize;
+        let dict_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine_node("synth_new: missing dict child".to_string(), node)
+        })? as usize;
+        // `T(args)` — the algebra former application — must elaborate
+        // as a type (well-formedness; names the algebra `Algebra` is
+        // M2's to define). Its first index argument is the carrier
+        // sort for the mode family's payload index.
+        let alg = self.dep_synth_type(lang, ast, type_idx, ctx)?;
+        let carrier = match tag_of(&alg) {
+            Some("type.family_app") => alg
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first().cloned())
+                .unwrap_or_else(|| meta_value(ctx.fresh_meta())),
+            _ => meta_value(ctx.fresh_meta()),
+        };
+        // `X : type.family{name: X, base: [carrier]}` — bind before the
+        // instance registration so the constraint head resolves as a
+        // declared former (the `synth_instance` head check's shape).
+        let mut elems = Map::new();
+        elems.insert("elements".to_string(), Value::Array(vec![carrier]));
+        let base = make_tag(ctx, "type.array", elems);
+        let mut fm = Map::new();
+        fm.insert("name".to_string(), Value::String(name.to_string()));
+        fm.insert("base".to_string(), base);
+        let family = make_tag(ctx, "type.family", fm);
+        ctx.extend(name.to_string(), family);
+        // `(X, [_]) ↦ dict` — the rigid index var is the registered
+        // shape's hole: any `X(p)` mode unifies with it at lookup.
+        let rigid = var_term(&format!("__{name}_payload"));
+        let mut cm = Map::new();
+        cm.insert("name".to_string(), Value::String(name.to_string()));
+        cm.insert("args".to_string(), Value::Array(vec![rigid.clone()]));
+        let constraint = make_tag(ctx, "type.family_app", cm);
+        self.register_instance(
+            lang,
+            ast,
+            node,
+            ctx,
+            name,
+            vec![rigid],
+            &constraint,
+            dict_idx,
+        )?;
+        Ok(())
+    }
+
+    /// `synth_new` — a `new` node reached *outside* an `assign` value
+    /// (there is no target name to bind the mode family under).
+    /// Synthesizes both children for well-formedness, warns, and
+    /// degrades to `type.unknown` — the honest-bound convention.
+    pub(crate) fn synth_new_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = children_of(node);
+        if let Some(kids) = kids
+            && kids.len() >= 2
+        {
+            if let Some(t) = kids[0].as_u64() {
+                let _ = self.dep_synth_type(lang, ast, t as usize, ctx)?;
+            }
+            if let Some(d) = kids[1].as_u64() {
+                self.synth_node(lang, ast, AstRef::new(d as usize), ctx)?;
+            }
+        }
+        ctx.diagnostics.push(TypecheckDiagnostic {
+            severity: "warning".to_string(),
+            message:
+                "`new` is only meaningful as the value of `X := new T(args) { … }` — no declaration target to bind"
+                    .to_string(),
+            span: node.span,
+        });
+        let mut m = Map::new();
+        Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
     }
 
     /// Dictionary search: the declared candidates for `head` tried in
@@ -7052,11 +7432,15 @@ impl NbeTypecheckEngine {
                 match &cons_name {
                     Some(n) => {
                         let family = scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("");
-                        let is_own_ctor = ctx
-                            .lookup(n)
-                            .filter(|v| tag_of(v) == Some("type.ctor_sig"))
-                            .and_then(|s| s.get("family").and_then(Value::as_str))
-                            .is_some_and(|f| f == family);
+                        // PL-0003 I2: a ctor the family's `inductive.spec`
+                        // declares counts as this family's own even when
+                        // the gamma `type.ctor_sig` binding is absent.
+                        let is_own_ctor = spec_declares_ctor(ctx, family, n)
+                            || ctx
+                                .lookup(n)
+                                .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+                                .and_then(|s| s.get("family").and_then(Value::as_str))
+                                .is_some_and(|f| f == family);
                         if is_own_ctor {
                             ArmCover::Ctor(n.clone())
                         } else if ctx.ctor_family.contains_key(n.as_str()) {
@@ -7076,14 +7460,57 @@ impl NbeTypecheckEngine {
             });
 
             // Instantiate the ctor sig (if the pattern is a constructor).
-            let ctor_inst: Option<Value> = cons_name
-                .as_deref()
-                .and_then(|n| ctx.lookup(n).cloned())
-                .filter(|v| tag_of(v) == Some("type.ctor_sig"));
+            // PL-0003 I2: prefer the scrutinee family's `inductive.spec`
+            // value — its owned type-exprs re-elaborate to the same ctor
+            // sig the gamma `type.ctor_sig` binding carries (the spec is
+            // minted from the same declaration data), so the spec-driven
+            // path is exercised by every spec-declaring family; the gamma
+            // binding remains the fallback for families without a spec
+            // (hand-built `data` payloads, imports, non-family scrutinees).
+            let mut ctor_spec_backed = false;
+            let ctor_inst: Option<Value> = match cons_name.as_deref() {
+                Some(n) => match scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("") {
+                    fam if !fam.is_empty() => match spec_ctor_sig(ctx, ast, fam, n)? {
+                        Some(sig) => {
+                            ctor_spec_backed = true;
+                            Some(sig)
+                        }
+                        None => ctx
+                            .lookup(n)
+                            .cloned()
+                            .filter(|v| tag_of(v) == Some("type.ctor_sig")),
+                    },
+                    _ => ctx
+                        .lookup(n)
+                        .cloned()
+                        .filter(|v| tag_of(v) == Some("type.ctor_sig")),
+                },
+                None => None,
+            };
             let mut ctor_result = Value::Null;
             let mut domains: Vec<(String, Value)> = Vec::new();
             if let Some(sig) = &ctor_inst {
-                let inst = self.instantiate_ctor_full(lang, ast, sig, ctx)?;
+                let inst = if ctor_spec_backed {
+                    // The sig's `node` fields index `ctx.spec_ast` — a
+                    // source-arena clone plus the materialized spec
+                    // nodes — so instantiate against that arena, then
+                    // restore it for later arms/lookups. A nested spec
+                    // materialization during instantiation would leave a
+                    // grown superset in `ctx.spec_ast`; keep it (indices
+                    // into the taken arena stay valid — same prefix).
+                    let arena = ctx.spec_ast.take().ok_or_else(|| {
+                        LangError::engine(
+                            "match: spec ctor sig without spec arena".to_string(),
+                        )
+                    })?;
+                    let r = self.instantiate_ctor_full(lang, &arena, sig, ctx);
+                    if ctx.spec_ast.is_none() {
+                        ctx.spec_ast = Some(arena);
+                    }
+                    r?
+                } else {
+                    self.instantiate_ctor_full(lang, ast, sig, ctx)?
+                };
                 let (doms, res) = self.peel_ctor(&inst);
                 for (i, (_pname, dom)) in doms.into_iter().enumerate() {
                     domains.push((arg_names.get(i).cloned().unwrap_or_default(), dom));
@@ -10903,6 +11330,27 @@ impl NbeTypecheckEngine {
                 (n, AstRef::new(vidx), None)
             }
         };
+        // `X := new T(args) { members }` — the `new` declaration form
+        // (graded-arrows.md §3): binds `X` as a mode-family former and
+        // registers the member dict as `X`'s instance. Handled whole
+        // here because the family/instance head is the assign target —
+        // a `new`-node-local judgment cannot see it.
+        if let Some(vn) = ast.get(value_ref)
+            && vn.kind == "new"
+        {
+            if ann_ref.is_some() {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message:
+                        "annotation ignored on `new` declaration — `X := new …` binds its own mode family"
+                            .to_string(),
+                    span: vn.span,
+                });
+            }
+            self.synth_new_decl_judgment(lang, ast, vn, &name, ctx)?;
+            let mut m = Map::new();
+            return Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)));
+        }
         let bound_type = if let Some(params) = alias_params {
             // The alias binds its expansion record, not a synthesized
             // type — `Name`/`Name(args)` in type position substitute

@@ -2130,6 +2130,17 @@ impl NbeTypecheckEngine {
                     })?;
                     self.synth_instance_judgment(lang, ast, node, ctx)
                 }
+                "synth_new" => {
+                    // `new T(args) { members }` outside an `assign` value
+                    // (graded-arrows.md §3): the `X := new …` form is
+                    // handled inside `synth_assign` (the family head is
+                    // the assign target); a bare `new` synths its
+                    // children, warns, and degrades to `type.unknown`.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_new: node out of bounds".to_string())
+                    })?;
+                    self.synth_new_judgment(lang, ast, node, ctx)
+                }
                 "synth_call" => {
                     // Curried application: ctor/function/pi chains, dependent
                     // application through `body_closure`s, family_app for
@@ -6375,6 +6386,15 @@ struct TypecheckContext {
     /// metavariable-typed binding stays maximally permissive rather than
     /// failing the escape-hatch code the check now reaches.
     loose: usize,
+    /// Spec-elaboration side arena (PL-0003 I2): lazily initialized as a
+    /// clone of the source `Ast` the first time an `inductive.spec`
+    /// owned type-expr is materialized, then grown with the materialized
+    /// nodes. Spec node indices are therefore always ≥ the source
+    /// length — a source-arena lookup misses and `dep_synth_type`
+    /// falls back here, so `body_child_idx`/`rest[].annot` indices that
+    /// escape into elaborated `type.pi`/`type.sigma` closures still
+    /// resolve against the appended nodes.
+    spec_ast: Option<Ast>,
 }
 
 /// A registered dictionary instance (phase-3 WS-A): the elaboration
@@ -6443,6 +6463,7 @@ impl TypecheckContext {
             instance_count: 0,
             scheme_td: HashMap::new(),
             loose: 0,
+            spec_ast: None,
         }
     }
 
