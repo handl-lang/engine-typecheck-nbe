@@ -2852,6 +2852,127 @@ fn collect_ctor_leaf(
     }
 }
 
+/// Owned type-expr node for `inductive.spec` values (PL-0003 I1): the
+/// serialized `{kind, span, payload}` [`AstNode`] shape with
+/// `payload["children"]` / `payload["body"]` arena references replaced
+/// by recursively owned node records — self-contained data that does
+/// not depend on the source arena. Mirror of the model's
+/// `owned_node_`/`owned_payload_`; field names must stay identical for
+/// parity.
+fn owned_node_at(ast: &Ast, idx: usize) -> Value {
+    match ast.get(AstRef::new(idx)) {
+        Some(node) => owned_node_value(ast, node),
+        None => Value::Null,
+    }
+}
+
+fn owned_node_value(ast: &Ast, node: &AstNode) -> Value {
+    let mut m = Map::new();
+    m.insert("kind".to_string(), Value::String(node.kind.clone()));
+    m.insert(
+        "span".to_string(),
+        node.span
+            .map(|sp| serde_json::json!({ "start": sp.start, "end": sp.end }))
+            .unwrap_or(Value::Null),
+    );
+    m.insert("payload".to_string(), owned_payload(ast, &node.payload));
+    Value::Object(m)
+}
+
+/// The arena index a `children` entry refers to — plain `u64`, or the
+/// head of a `[idx, …]` pair (the shape `ast_node` tolerates).
+fn child_index_of(v: &Value) -> Option<usize> {
+    v.as_u64()
+        .or_else(|| v.as_array()?.first()?.as_u64())
+        .map(|i| i as usize)
+}
+
+fn owned_payload(ast: &Ast, payload: &Value) -> Value {
+    let Value::Object(map) = payload else {
+        return payload.clone();
+    };
+    let mut out = map.clone();
+    if let Some(Value::Array(items)) = out.get("children").cloned() {
+        let owned: Vec<Value> = items
+            .iter()
+            .map(|c| match child_index_of(c) {
+                Some(i) => owned_node_at(ast, i),
+                None => c.clone(),
+            })
+            .collect();
+        out.insert("children".to_string(), Value::Array(owned));
+    }
+    if let Some(body) = out.get("body").and_then(Value::as_u64) {
+        out.insert("body".to_string(), owned_node_at(ast, body as usize));
+    }
+    Value::Object(out)
+}
+
+/// Build the `inductive.spec` record for a `data` declaration
+/// (PL-0003 I1): `{name, params, ctors}` with `params` a list of
+/// `{name, sort, nat}` (`sort` the owned annotation node or `null`) and
+/// `ctors` a list of `{name, args, result, bare}` — `args` entries are
+/// `{name, type}` (`type` the owned domain node or `null`), `result`
+/// the owned result-index node or `null`. Field names mirror the
+/// model's `inductive_spec_` exactly. The spec describes the
+/// *declaration*; `type.family`/`type.family_app`/`type.ctor_sig`
+/// application machinery is untouched.
+fn inductive_spec_value(
+    ctx: &TypecheckContext,
+    ast: &Ast,
+    name: &str,
+    params: &[DepParam],
+    ctors: &[DepCtor],
+) -> Value {
+    let p_specs: Vec<Value> = params
+        .iter()
+        .map(|p| {
+            let mut m = Map::new();
+            m.insert("name".to_string(), Value::String(p.name.clone()));
+            m.insert(
+                "sort".to_string(),
+                p.node.map(|i| owned_node_at(ast, i)).unwrap_or(Value::Null),
+            );
+            m.insert("nat".to_string(), Value::Bool(p.nat));
+            Value::Object(m)
+        })
+        .collect();
+    let c_specs: Vec<Value> = ctors
+        .iter()
+        .map(|c| {
+            let args: Vec<Value> = c
+                .args
+                .iter()
+                .map(|(n, t)| {
+                    let mut m = Map::new();
+                    m.insert("name".to_string(), Value::String(n.clone()));
+                    m.insert(
+                        "type".to_string(),
+                        t.map(|i| owned_node_at(ast, i)).unwrap_or(Value::Null),
+                    );
+                    Value::Object(m)
+                })
+                .collect();
+            let mut m = Map::new();
+            m.insert("name".to_string(), Value::String(c.name.clone()));
+            m.insert("args".to_string(), Value::Array(args));
+            m.insert(
+                "result".to_string(),
+                c.result
+                    .map(|i| owned_node_at(ast, i))
+                    .unwrap_or(Value::Null),
+            );
+            m.insert("bare".to_string(), Value::Bool(c.bare));
+            Value::Object(m)
+        })
+        .collect();
+    let mut fields = Map::new();
+    fields.insert("name".to_string(), Value::String(name.to_string()));
+    fields.insert("params".to_string(), Value::Array(p_specs));
+    fields.insert("ctors".to_string(), Value::Array(c_specs));
+    make_tag(ctx, "inductive.spec", fields)
+}
+
 /// Strict positivity over the ctor-arg AST (checker-owned, ADR-0152 §4):
 /// the defined former must not occur in a *domain* position. `occurs` is
 /// any occurrence; a `call(->, dom, cod)`/`function` node's domain child
@@ -4690,6 +4811,19 @@ impl NbeTypecheckEngine {
                     ctx.ctor_family.insert(c.clone(), name.clone());
                 }
                 ctx.family_ctors.insert(name.clone(), names);
+                // PL-0003 I1 — `inductive.spec` alongside the family
+                // bindings. Hand-built payloads carry no param/ctor AST
+                // detail, so the spec records the name with empty
+                // telescopes (what the model produces for a childless
+                // `data` node).
+                let mut fields = Map::new();
+                fields.insert("name".to_string(), Value::String(name.clone()));
+                fields.insert("params".to_string(), Value::Array(vec![]));
+                fields.insert("ctors".to_string(), Value::Array(vec![]));
+                ctx.bind_result(
+                    format!("{name}.spec"),
+                    make_tag(ctx, "inductive.spec", fields),
+                );
             }
             let mut m = Map::new();
             return Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)));
@@ -4753,6 +4887,16 @@ impl NbeTypecheckEngine {
                 "bare": c.bare,
             });
             ctx.extend(c.name.clone(), sig);
+        }
+        // PL-0003 I1 — `inductive.spec`: the declaration's spec as an
+        // owned data value (type-exprs are owned node records, not AST
+        // indices), bound in `results` under `"<name>.spec"` alongside
+        // the `type.family`/`type.ctor_sig` bindings. Inert for now;
+        // I2+ consumes it (positivity, spec-driven match). `results`
+        // (not Γ) is the value channel — the spec is data, not a type.
+        if !name.is_empty() {
+            let spec = inductive_spec_value(ctx, ast, &name, &params, &ctors);
+            ctx.bind_result(format!("{name}.spec"), spec);
         }
         // WS-C coverage census: the family's ctor list + the reverse
         // ctor → family table (index-level ctor disjointness reads it),

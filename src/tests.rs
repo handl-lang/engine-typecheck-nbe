@@ -11430,3 +11430,131 @@ fn dep_unify_family_app_still_decided_mismatch() {
     let b = json!({"__tag__":"type.family_app","name":"Vec","args":[json!(3)]});
     assert!(e.dep_unify(&a, &b, &mut ctx).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// PL-0003 I1 — `inductive.spec` materialization
+// ---------------------------------------------------------------------------
+
+/// PL-0003 I1: `synth_data` materializes an `inductive.spec` value — the
+/// declaration's spec as ordinary data (type-exprs are *owned* node
+/// records `{kind, span, payload}`, not AST arena indices) — into
+/// `results` under `"<name>.spec"`, alongside the existing
+/// `type.family`/`type.ctor_sig` bindings. Covers a simple family
+/// (`Nat`) and an indexed one (`Vec`).
+#[test]
+fn synth_data_binds_inductive_spec() {
+    let lang = handl_kit_data_prelude::language_from_yaml().expect("canonical language");
+    let _ = handl_plugin_lib_handl::install_default_language(lang.clone());
+    let eng = engine();
+    let mut ctx = TypecheckContext::new("handl.canonical", HashMap::new());
+
+    let parse_decl = |src: &str| -> Ast {
+        let tokens = hnl_tool_lex_pattern::lex(&lang, src).expect("lex");
+        let parser = hnl_tool_parse_pratt::PrattEngine::new();
+        let req = hnl_tool_parse::ParserRequest::new(tokens);
+        hnl_tool_parse::ParserEngine::parse(&parser, &lang, &req).expect("parse")
+    };
+    let data_idx = |ast: &Ast| {
+        ast.nodes()
+            .iter()
+            .position(|n| n.kind == "data")
+            .expect("data node")
+    };
+
+    // `Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }` — no params.
+    let ast = parse_decl("Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }");
+    eng.synth_data_judgment(
+        &lang,
+        &ast,
+        handl_language::AstRef::new(data_idx(&ast)),
+        &mut ctx,
+    )
+    .expect("synth_data Nat");
+    let spec = ctx
+        .results
+        .get("Nat.spec")
+        .expect("Nat.spec bound in results")
+        .clone();
+    assert_eq!(
+        spec.get("__tag__").and_then(Value::as_str),
+        Some("inductive.spec")
+    );
+    assert_eq!(spec.get("name").and_then(Value::as_str), Some("Nat"));
+    assert_eq!(
+        spec.get("params").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    let ctors = spec.get("ctors").and_then(Value::as_array).expect("ctors");
+    assert_eq!(ctors.len(), 2);
+    assert_eq!(ctors[0].get("name").and_then(Value::as_str), Some("Zero"));
+    assert_eq!(ctors[1].get("name").and_then(Value::as_str), Some("Succ"));
+    // `Zero : Nat` / `… ~> Nat` — a codomain spelled as the bare family
+    // name normalizes to `result: null` (the same convention
+    // `type.ctor_sig` uses); `Zero` is the bare-var bootstrap ctor.
+    assert!(ctors[0].get("result").is_some_and(Value::is_null));
+    assert_eq!(ctors[0].get("bare").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        ctors[0].get("args").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    // `Succ(pred : Nat) ~> Nat` — one arg named `pred` whose `type` is
+    // an owned `{kind, span, payload}` node record, not an arena index.
+    let succ = &ctors[1];
+    let args = succ
+        .get("args")
+        .and_then(Value::as_array)
+        .expect("Succ args");
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0].get("name").and_then(Value::as_str), Some("pred"));
+    let pred_ty = args[0].get("type").expect("pred type");
+    assert_eq!(pred_ty.get("kind").and_then(Value::as_str), Some("var"));
+    assert_eq!(pred_ty.get("payload").and_then(Value::as_str), Some("Nat"));
+    assert!(pred_ty.get("span").is_some());
+    assert!(succ.get("result").is_some_and(Value::is_null));
+    assert_eq!(succ.get("bare").and_then(Value::as_bool), Some(false));
+
+    // `Vec<n : Nat, a : Type>` — indexed family: params carry owned
+    // sort nodes + `nat` flags; ctor results are owned index exprs.
+    let ast = parse_decl(
+        "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
+    );
+    eng.synth_data_judgment(
+        &lang,
+        &ast,
+        handl_language::AstRef::new(data_idx(&ast)),
+        &mut ctx,
+    )
+    .expect("synth_data Vec");
+    let spec = ctx
+        .results
+        .get("Vec.spec")
+        .expect("Vec.spec bound in results")
+        .clone();
+    assert_eq!(
+        spec.get("__tag__").and_then(Value::as_str),
+        Some("inductive.spec")
+    );
+    assert_eq!(spec.get("name").and_then(Value::as_str), Some("Vec"));
+    let params = spec
+        .get("params")
+        .and_then(Value::as_array)
+        .expect("params");
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].get("name").and_then(Value::as_str), Some("n"));
+    assert_eq!(params[0].get("nat").and_then(Value::as_bool), Some(true));
+    let n_sort = params[0].get("sort").expect("n sort");
+    assert_eq!(n_sort.get("kind").and_then(Value::as_str), Some("var"));
+    assert_eq!(n_sort.get("payload").and_then(Value::as_str), Some("Nat"));
+    assert_eq!(params[1].get("name").and_then(Value::as_str), Some("a"));
+    assert_eq!(params[1].get("nat").and_then(Value::as_bool), Some(false));
+    let ctors = spec.get("ctors").and_then(Value::as_array).expect("ctors");
+    assert_eq!(ctors.len(), 2);
+    assert_eq!(ctors[0].get("name").and_then(Value::as_str), Some("VNil"));
+    assert_eq!(ctors[1].get("name").and_then(Value::as_str), Some("VCons"));
+    // `VCons`'s result `Vec(n + 1, a)` is an owned `call` node whose
+    // `children` are nested owned nodes — the index expr `n + 1` is
+    // preserved as data for later re-elaboration.
+    let vcons_result = ctors[1].get("result").expect("VCons result");
+    assert!(vcons_result.get("kind").is_some());
+    assert!(vcons_result.get("payload").is_some());
+}
