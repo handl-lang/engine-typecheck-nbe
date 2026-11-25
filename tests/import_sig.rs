@@ -39,11 +39,16 @@ impl handl_platform::Module for TestModule {
         match name {
             "double" => Some(&DOUBLE),
             "unit_op" => Some(&UNIT_OP),
+            "rust.resolve" => Some(&RESOLVE),
             _ => None,
         }
     }
     fn functions(&self) -> Vec<(&str, &dyn handl_platform::Function)> {
-        vec![("double", &DOUBLE), ("unit_op", &UNIT_OP)]
+        vec![
+            ("double", &DOUBLE),
+            ("unit_op", &UNIT_OP),
+            ("rust.resolve", &RESOLVE),
+        ]
     }
     fn value_names(&self) -> Vec<String> {
         vec!["flag".to_string()]
@@ -94,6 +99,28 @@ impl handl_platform::TypeSignature for UnitOp {
     }
 }
 static UNIT_OP: UnitOp = UnitOp;
+
+/// A namespaced op local name — `"rust.resolve"` inside module `mymod`,
+/// the `ffi.rust.resolve` shape (P-013 T-152): `String ~> Number`.
+struct Resolve;
+impl handl_platform::Function for Resolve {
+    fn call(
+        &self,
+        _args: &[Value],
+        _ctx: &mut handl_platform::EvalContext,
+    ) -> Result<Value, handl_platform::EvalError> {
+        Ok(Value::Null)
+    }
+    fn as_type_signature(&self) -> Option<&dyn handl_platform::TypeSignature> {
+        Some(self)
+    }
+}
+impl handl_platform::TypeSignature for Resolve {
+    fn type_signature(&self) -> Value {
+        serde_json::json!({"__tag__":"type.function","__registry__":"handl.canonical","param":{"__tag__":"type.string","__registry__":"handl.canonical"},"body":{"__tag__":"type.number","__registry__":"handl.canonical"}})
+    }
+}
+static RESOLVE: Resolve = Resolve;
 
 fn engine() -> Box<dyn TypecheckEngine> {
     let registry = handl_plugin_module::ModuleRegistry::new().with(TestModule);
@@ -344,4 +371,40 @@ fn empty_module_has_empty_signature() {
         .expect("signature should be a fields record");
     assert!(fields.is_empty(), "no exports → empty Sig_m: {fields:?}");
     let _: HashMap<String, Value> = HashMap::new();
+}
+
+/// A dotted export name (`"rust.resolve"` — the `ffi.rust.resolve`
+/// local-name shape, P-013 T-152) nests as `type.record` prefixes in
+/// `Sig_m`: `mymod.rust` projects the record, `.resolve` its field, and
+/// the call synthesizes the declared signature's body.
+#[test]
+fn dotted_export_name_nests_module_sig() {
+    let lang = canonical_lang();
+    let ast = parse(
+        &lang,
+        "do {\nimport mymod\nx := mymod.rust.resolve(\"a\")\n}",
+    );
+    let result = engine()
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect("typecheck should succeed");
+    assert!(
+        result
+            .node_types
+            .values()
+            .any(|v| tag(v) == Some("type.number")),
+        "mymod.rust.resolve(\"a\") should synth type.number: {result:?}"
+    );
+}
+
+/// The nested record is exact: a sibling under the same prefix that was
+/// never exported is still a `record_field_type` miss.
+#[test]
+fn dotted_export_missing_sibling_fails() {
+    let lang = canonical_lang();
+    let bad = parse(&lang, "do {\nimport mymod\nx := mymod.rust.missing\n}");
+    let res = engine().typecheck(&lang, &TypecheckRequest::new(bad));
+    assert!(
+        res.is_err(),
+        "mymod.rust.missing should fail field resolution: {res:?}"
+    );
 }

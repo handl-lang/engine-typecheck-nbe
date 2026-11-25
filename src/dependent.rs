@@ -49,6 +49,45 @@ fn make_tag(ctx: &TypecheckContext, tag: &str, fields: Map<String, Value>) -> Va
     Value::Object(m)
 }
 
+/// Insert one module export into a `type.module_sig` `fields` map.
+///
+/// Export names can be dotted — a namespaced op's *local* name keeps its
+/// inner segments (`"ffi.rust.resolve"` in module `"ffi"` is exposed as
+/// `"rust.resolve"`, P-013 T-152). Nest each `.`-separated prefix as a
+/// `type.record` so `mod.rust.resolve` projects through the ordinary
+/// `record_field_type` path: `mod.rust` yields the record, `.resolve`
+/// its field. A prefix colliding with a non-record field is overwritten
+/// by the nested record (the namespace wins — a flat `rust` export and a
+/// `rust.*` op family cannot both be projected unambiguously anyway).
+fn insert_module_sig_field(
+    fields: &mut Map<String, Value>,
+    name: &str,
+    ty: Value,
+    ctx: &TypecheckContext,
+) {
+    let Some((head, rest)) = name.split_once('.') else {
+        fields.insert(name.to_string(), ty);
+        return;
+    };
+    let entry = fields.entry(head.to_string()).or_insert_with(|| {
+        let mut inner = Map::new();
+        inner.insert("fields".to_string(), Value::Object(Map::new()));
+        make_tag(ctx, "type.record", inner)
+    });
+    let is_record = entry.get("__tag__").and_then(Value::as_str) == Some("type.record");
+    if !is_record {
+        let mut inner = Map::new();
+        inner.insert("fields".to_string(), Value::Object(Map::new()));
+        *entry = make_tag(ctx, "type.record", inner);
+    }
+    if let Some(inner_fields) = entry
+        .get_mut("fields")
+        .and_then(Value::as_object_mut)
+    {
+        insert_module_sig_field(inner_fields, rest, ty, ctx);
+    }
+}
+
 fn tag_of(v: &Value) -> Option<&str> {
     v.get("__tag__").and_then(Value::as_str)
 }
@@ -11015,7 +11054,8 @@ impl NbeTypecheckEngine {
             Some(list) => {
                 let mut fields = Map::new();
                 for (name, sig) in list {
-                    fields.insert(name, sig.unwrap_or_else(|| self.type_unknown(ctx)));
+                    let ty = sig.unwrap_or_else(|| self.type_unknown(ctx));
+                    insert_module_sig_field(&mut fields, &name, ty, ctx);
                 }
                 let mut payload = Map::new();
                 payload.insert("module".to_string(), Value::String(spec.to_string()));
