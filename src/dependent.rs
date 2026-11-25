@@ -145,6 +145,21 @@ fn path_val(frm: Value, to: Value) -> Value {
     Value::Object(m)
 }
 
+/// Record the consumed path witness under `via` — the model's
+/// `set(ty, "via", rp.witness)` on object results (`synth_j_`'s path
+/// and refl arms, `synth_transport_`). An open result over an unsolved
+/// metavariable stays atomic — a `via` field would corrupt the
+/// `{"__meta__"}` encoding.
+fn with_path_via(ty: Value, witness: &Value) -> Value {
+    if let Value::Object(mut m) = ty {
+        if extract_meta_id(&Value::Object(m.clone())).is_none() {
+            m.insert("via".to_string(), witness.clone());
+        }
+        return Value::Object(m);
+    }
+    ty
+}
+
 /// Endpoint pair `(frm, to)` of a path witness value: a legacy
 /// `Path{frm,to}` record, a `type.eq{left,right}`, or a cubical
 /// path-carrying `type.pi` (`path{x,y}` payload, ADR-0208 P1).
@@ -7181,8 +7196,12 @@ impl NbeTypecheckEngine {
         Ok(transported)
     }
 
-    /// `j p, motive, base` — the J eliminator: check `base` against the
-    /// motive applied at `frm`, synthesize the motive applied at `to`.
+    /// `j p, motive, base` — the J eliminator: at `refl` the motive is
+    /// applied at the base's own family indices plus the base term and
+    /// the base is checked against it; on a decided path `base` is
+    /// checked against the motive applied at `frm` (with the path
+    /// witness bound to the motive's `w`) and the motive applied at
+    /// `to` is synthesized — the model's `synth_j_` (ADR-0208 P5).
     pub(crate) fn synth_j_judgment(
         &self,
         lang: &Language,
@@ -7212,11 +7231,54 @@ impl NbeTypecheckEngine {
         let path = self
             .resolve_path_full(lang, ast, AstRef::new(path_idx), ctx)
             .ok_or_else(|| LangError::engine("j: operand is not a Path".to_string()))?;
+        // `refl` iota (the model's `synth_j_` refl arm, ADR-0208 P5): at
+        // the identity path the endpoints are unidentified, so J
+        // computes on the base's own fibre — the motive is applied at
+        // the base's family indices plus the base *term* (the same
+        // convention `synth_match_arms` uses for the scrutinee) and the
+        // base is checked against it.
+        if path.verdict == CubPathVerdict::Refl {
+            let base_ref = AstRef::new(base_idx);
+            let base_ty = self.synth_node(lang, ast, base_ref, ctx)?;
+            let idx_args: Vec<Value> = match tag_of(&base_ty) {
+                Some("type.family_app") => base_ty
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|a| eval_index(a, ctx))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let base_node = ast
+                .get(base_ref)
+                .ok_or_else(|| LangError::engine("j: base node out of bounds".to_string()))?;
+            let bterm = self.node_to_index_term(lang, ast, base_node, ctx);
+            let mut arg_vals = idx_args;
+            arg_vals.push(bterm);
+            let motive_ty = self.apply_motive(lang, ast, motive_idx, &arg_vals, base_idx, ctx)?;
+            self.check_node(lang, ast, base_ref, &motive_ty, ctx)?;
+            return Ok(with_path_via(motive_ty, &path.witness));
+        }
         let frm = eval_index(&path.frm, ctx);
         let to = eval_index(&path.to, ctx);
-        let expected_base = self.apply_motive(lang, ast, motive_idx, &[frm], path_idx, ctx)?;
+        // The motive's path binder `w` receives the resolved witness
+        // (the model's `apply_motive_ … [endpoint, witness]` — the
+        // `j_motive` closure's `witness` field), not a `var` of the
+        // operand's name.
+        let witness = path.witness.clone();
+        let expected_base = self.apply_motive(
+            lang,
+            ast,
+            motive_idx,
+            &[frm, witness.clone()],
+            path_idx,
+            ctx,
+        )?;
         self.check_node(lang, ast, AstRef::new(base_idx), &expected_base, ctx)?;
-        self.apply_motive(lang, ast, motive_idx, &[to], path_idx, ctx)
+        let result = self.apply_motive(lang, ast, motive_idx, &[to, witness], path_idx, ctx)?;
+        Ok(with_path_via(result, &path.witness))
     }
 
     // -----------------------------------------------------------------------

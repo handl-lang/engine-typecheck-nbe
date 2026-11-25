@@ -719,6 +719,64 @@ fn j_surface_literal_motive() {
     );
 }
 
+/// `J refl, motive, base` — the refl iota (the model's `synth_j_`
+/// refl arm, ADR-0208 P5): at the identity path the endpoints are
+/// unidentified, so J computes on the base's *own* fibre — the motive
+/// is applied at the base type's family indices plus the base term
+/// (the `synth_match_arms` scrutinee convention) and the base is
+/// checked against it. `VNil : Vec(0, Bool)` therefore eliminates to
+/// `Vec(0, Bool)`, not to any path endpoint; a `Vec(1, Bool)`
+/// expectation must fail.
+#[test]
+fn j_refl_computes_on_base_fibre() {
+    let lang = canonical_lang();
+    let decl = "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }";
+
+    let ok = parse_block(
+        &lang,
+        &[
+            decl,
+            "r : Vec(0, Bool) := J refl, (i, w) ~> Vec(i, Bool), VNil",
+        ],
+    );
+    let result = typecheck(&lang, ok);
+    assert!(
+        !has_error(&result),
+        "J refl should compute on VNil's own fibre Vec(0, Bool), got {:?}",
+        diags_of(&result)
+    );
+
+    let bad = parse_block(
+        &lang,
+        &[
+            decl,
+            "r : Vec(1, Bool) := J refl, (i, w) ~> Vec(i, Bool), VNil",
+        ],
+    );
+    let result = typecheck(&lang, bad);
+    assert!(
+        has_error(&result),
+        "J refl on VNil must not produce Vec(1, Bool) — the base's index is 0"
+    );
+
+    // A `var` base keeps its own indices too: `v : Vec(2, Bool)`
+    // eliminates to `Vec(2, Bool)`.
+    let ok_var = parse_block(
+        &lang,
+        &[
+            decl,
+            "v : Vec(2, Bool) := VCons(true, VCons(false, VNil))",
+            "r : Vec(2, Bool) := J refl, (i, w) ~> Vec(i, Bool), v",
+        ],
+    );
+    let result = typecheck(&lang, ok_var);
+    assert!(
+        !has_error(&result),
+        "J refl on v : Vec(2, Bool) should give Vec(2, Bool), got {:?}",
+        diags_of(&result)
+    );
+}
+
 /// Bounded nonlinear index solving: `c * X ≡ t` solves `X` by exact
 /// division. The `Dbl` family's constructor lands at `Dbl(2 * n)` —
 /// commutative canonicalization already normalizes it to

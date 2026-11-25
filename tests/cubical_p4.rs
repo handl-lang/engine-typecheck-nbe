@@ -396,6 +396,28 @@ fn univalence_rejects_non_equivalence() {
     );
 }
 
+/// `J`'s motive path binder `w` receives the *resolved witness* — the
+/// model's `apply_motive_ … [endpoint, witness]` (`j_motive`'s
+/// `witness` field), not a `var` of the operand's name. With an
+/// inline `ua(e)` operand there is no operand `var` to borrow, so a
+/// motive that mentions `w` (`(i, w) ~> w`) yields the path type
+/// itself: `ua(e)` — synthesizing the same path-carrying `type.pi` —
+/// checks against it as the base.
+#[test]
+fn j_motive_binds_path_witness() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[NAT_VEC, BOOL_NAT_EQUIV, "r := J ua(e), (i, w) ~> w, ua(e)"],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "J ua(e), (i, w) ~> w, ua(e) should bind w to the ua path witness, got {:?}",
+        diags_of(&result)
+    );
+}
+
 /// `Equiv(A, B)` inhabitants need both directions: a record missing
 /// `fro` does not check against `type.equiv`.
 #[test]
