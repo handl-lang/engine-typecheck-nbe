@@ -181,6 +181,32 @@ fn dim_arrow_bare_spelling() {
     );
 }
 
+/// `A ~[G]~> B` payload-kind flip (graded-arrows.md §9): a non-numeric
+/// payload mints `graded_arrow`, which `synth_graded_arrow` elaborates
+/// to `Arrow{…, dim: 1}` — the grade stays off the dimension channel.
+/// The bare `~>[n]` spelling keeps `dim_arrow` for every payload.
+#[test]
+fn graded_arrow_payload_flip() {
+    let lang = canonical_lang();
+    // Parse-level: `~[N]~>` with a named payload mints `graded_arrow`.
+    let ast = parse_one(&lang, "dedupe<N> := (g >>> g) ~[N]~> g");
+    assert!(
+        ast.nodes().iter().any(|n| n.kind == "graded_arrow"),
+        "named ~[N]~> payload must mint graded_arrow"
+    );
+    assert!(
+        !ast.nodes().iter().any(|n| n.kind == "dim_arrow"),
+        "named ~[N]~> payload must not mint dim_arrow"
+    );
+    // Type-level: the same source typechecks through `synth_graded_arrow`.
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "graded arrow should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
 /// `IO<puts, fs>` — the brace-free sig record: bare names declare ops
 /// (`type.unknown` payload), `name : T` declares the payload type.
 /// Widening/coverage rules are identical to `IO<{ … }>`.
