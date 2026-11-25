@@ -2414,6 +2414,63 @@ fn index_sort_nonneg(sort: &IndexSort, ctx: &TypecheckContext) -> bool {
     }
 }
 
+/// The numeric payload of a `value`/`lit` node — unwraps the
+/// `{"value": x}` literal-payload envelope literal nodes can carry.
+fn literal_payload_num(node: &AstNode) -> Option<f64> {
+    let raw = match &node.payload {
+        Value::Object(m) if m.get("__tag__").is_none() => m.get("value")?,
+        p => p,
+    };
+    raw.as_f64()
+}
+
+/// `true` when `node` is a non-negative *integer* literal — a `value`/`lit`
+/// node with an integral numeric payload (`paren`-transparent). This is
+/// the surface spelling of a `Succ^k(Zero)` index term: `idn(2)`
+/// elaborates exactly like `idn(Succ(Succ(Zero)))`. Fractionals and
+/// negatives keep the ordinary `Number` typing.
+pub(crate) fn nat_literal_node(node: &AstNode, ast: &Ast) -> bool {
+    match node.kind.as_str() {
+        "value" | "lit" => literal_payload_num(node).is_some_and(|n| n >= 0.0 && n.fract() == 0.0),
+        "paren" => child_at(ast, node, 0)
+            .and_then(|i| ast.get(i))
+            .is_some_and(|inner| nat_literal_node(inner, ast)),
+        _ => false,
+    }
+}
+
+/// `expected` (already zonked) is a *parameterless* Nat-shaped family —
+/// `type.family_app`/`type.family` naming a family whose ctors all carry
+/// numeric index projections (`nat_shaped_family`) and which takes no
+/// index arguments. Only there is the literal's elaborated type
+/// index-independent (`Zero` and every `Succ^k(Zero)` share the same
+/// `F`), so `2` reads as `Succ²(Zero)` with no index-unification
+/// obligation. An indexed Nat-shaped family would need the literal's
+/// own index computed — out of scope, stays `Number`.
+pub(crate) fn nat_family_expected(expected: &Value, ctx: &TypecheckContext) -> bool {
+    let (name, n_args) = match tag_of(expected) {
+        Some("type.family_app") => (
+            expected.get("name").and_then(Value::as_str),
+            expected
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0),
+        ),
+        Some("type.family") => (
+            expected.get("name").and_then(Value::as_str),
+            expected
+                .get("base")
+                .and_then(|b| b.get("elements"))
+                .and_then(Value::as_array)
+                .map(|e| e.len())
+                .unwrap_or(0),
+        ),
+        _ => (None, usize::MAX),
+    };
+    n_args == 0 && name.is_some_and(|n| nat_shaped_family(n, ctx))
+}
+
 /// The declared-index-sort descriptor for one `type.family` position:
 /// the position's evaluated sort value + the family's `nat` flag (the
 /// `n : Nat` annotation convention — needed because `Nat` evaluates to

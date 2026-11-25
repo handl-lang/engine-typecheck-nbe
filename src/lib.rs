@@ -383,6 +383,25 @@ impl NbeTypecheckEngine {
                 self.synth_node(lang, ast, node_ref, ctx)?;
                 return Ok(());
             };
+            // Number-literal → `Nat` elaboration: a non-negative integer
+            // literal checked against a parameterless Nat-shaped family
+            // (`data Nat :: Zero | Succ(pred : Nat)` and kin —
+            // `nat_shaped_family`) reads as the `Succ^k(Zero)` index
+            // term. Index land already normalizes ctor towers to
+            // numerals through `ctor_proj`, so the literal and the
+            // tower are definitionally equal — `idn(2)` is
+            // `idn(Succ(Succ(Zero)))`. This is what lets `forall
+            // n : Nat, …` binders (and `pred : Nat` ctor domains, `Nat
+            // ~> …` arrows, `x : Nat := …` annotations) accept the
+            // numeric spelling uniformly. Runs before `dep_check_intro`:
+            // its `type.family_app` arm synth+unifies, which is exactly
+            // the `Number` vs `Nat` mismatch this rule absorbs.
+            if dependent::nat_literal_node(node, ast)
+                && dependent::nat_family_expected(&self.zonk(expected, ctx), ctx)
+            {
+                ctx.node_types.insert(node_ref.index(), expected.clone());
+                return Ok(());
+            }
             // Dependent introduction (ADR-0152/0120): checking an arrow
             // against `type.pi`/`type.family`, a pair against `type.sigma`,
             // or `refl`/a witness against `Path` goes through the dependent

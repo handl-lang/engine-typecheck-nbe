@@ -224,7 +224,10 @@ fn dependent_indices_compute_definitionally() {
 
 /// A `data`-declared family shadows the builtin spelling, so
 /// `Succ(pred : Nat)` takes the declared `Nat` family — `Succ(Zero)`
-/// checks and `Succ(3)` does not.
+/// checks, and `Succ(3)` checks too: a non-negative integer literal in
+/// `Nat`-expected position elaborates to the `Succ^k(Zero)` index term
+/// (number-literal → `Nat` elaboration), while a fractional literal
+/// stays `Number` and is rejected.
 #[test]
 fn dependent_constructors_check_arguments() {
     let lang = canonical_lang();
@@ -234,6 +237,7 @@ fn dependent_constructors_check_arguments() {
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
             "x : Nat := Succ(Zero)",
             "y : Nat := Succ(Succ(Zero))",
+            "z : Nat := Succ(3)",
         ],
     );
     let result = typecheck(&lang, good);
@@ -247,13 +251,61 @@ fn dependent_constructors_check_arguments() {
         &lang,
         &[
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
-            "x : Nat := Succ(3)",
+            "x : Nat := Succ(2.5)",
         ],
     );
     let result = typecheck(&lang, bad);
     assert!(
         has_error(&result),
-        "Succ(3) should be rejected — pred : Nat, not Nat-number"
+        "Succ(2.5) should be rejected — pred : Nat, not a Nat literal"
+    );
+}
+
+/// Number-literal → `Nat` elaboration in argument position: `forall
+/// n : Nat` binders accept the numeric spelling — `idn(2)` is
+/// `idn(Succ(Succ(Zero)))` and `polyv(1)(v)` instantiates `Vec(1,
+/// Bool)`. The literal binds the dependent index to the numeral (the
+/// same normal form `Succ^k(Zero)` evaluates to through `ctor_proj`),
+/// so dependent codomains compute identically.
+#[test]
+fn nat_literals_elaborate_in_application_args() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
+            "idn : forall n : Nat, Nat := n ~> n",
+            "polyv : forall n : Nat, Vec(n, Bool) ~> Vec(n, Bool) := n ~> v ~> v",
+            "two : Nat := idn(2)",
+            "two_b : Nat := idn(Succ(Succ(Zero)))",
+            "v1 : Vec<1, Bool> := polyv(1)(VCons(true, VNil))",
+            "v1_b : Vec<1, Bool> := polyv(Succ(Zero))(VCons(true, VNil))",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "numeric literals should elaborate to Nat index terms, got {:?}",
+        diags_of(&result)
+    );
+
+    // A literal bound through `forall` still feeds the dependent index:
+    // `polyv(1)` must produce `Vec(1, Bool) ~> Vec(1, Bool)`, so a
+    // `Vec<2, Bool>` result is a decided mismatch, not a fresh meta.
+    let wrong = parse_block(
+        &lang,
+        &[
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }",
+            "Vec<n : Nat, a : Type> := { VNil : Vec(0, a), VCons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a) }",
+            "polyv : forall n : Nat, Vec(n, Bool) ~> Vec(n, Bool) := n ~> v ~> v",
+            "v2 : Vec<2, Bool> := polyv(1)(VCons(true, VCons(false, VNil)))",
+        ],
+    );
+    let result = typecheck(&lang, wrong);
+    assert!(
+        has_error(&result),
+        "polyv(1) must pin the index to 1 — Vec<2, Bool> should not check"
     );
 }
 
