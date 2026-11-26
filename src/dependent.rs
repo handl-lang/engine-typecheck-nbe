@@ -6411,12 +6411,7 @@ impl NbeTypecheckEngine {
         // index args when projecting `ev.<field>` off the shape.
         ctx.bind_result(
             format!("{name}.shape.vars"),
-            Value::Array(
-                gen_vars
-                    .iter()
-                    .map(|n| Value::String(n.clone()))
-                    .collect(),
-            ),
+            Value::Array(gen_vars.iter().map(|n| Value::String(n.clone())).collect()),
         );
         let old_results = ctx.results.clone();
         for n in &gen_vars {
@@ -6911,6 +6906,38 @@ impl NbeTypecheckEngine {
                     self.unify_equiv_record(equiv_t, record_t, ctx)
                 }
                 _ => {
+                    // Mode-carrying `Hom(d, s, t, m)` types (pl-0002
+                    // M3): graded-arrow cell types check by *directed*
+                    // subsumption — the actual's mode must be `≤` the
+                    // expected's under the governing `mode.algebra.*`
+                    // `order` field (`vsubtype` semantics, mirroring
+                    // the `io_headed` arm below). `unify`'s
+                    // domain-encoded path only reaches `conv`, which
+                    // accepts either direction; routing through
+                    // `subtype` is what makes "argument mode vs
+                    // parameter mode" and "composition result vs
+                    // annotation" enforce.
+                    if json_mode_hom(a) || json_mode_hom(b) {
+                        let mark = ctx.vcheck.store_mark();
+                        let va = domain_lift(a, ctx);
+                        let vb = domain_lift(b, ctx);
+                        if ctx.vcheck.subtype(&va, &vb) {
+                            return Ok(());
+                        }
+                        // Same stuck escape `unify` keeps: a `Hom`
+                        // above the checked dimension is under-decided
+                        // by convention.
+                        if beyond_checked_dim(&va) || beyond_checked_dim(&vb) {
+                            ctx.vcheck.store_restore(mark);
+                            return Ok(());
+                        }
+                        ctx.vcheck.store_restore(mark);
+                        return Err(LangError::engine(format!(
+                            "typecheck: cannot unify — expected {}, got {}",
+                            display_type(b, ctx),
+                            display_type(a, ctx)
+                        )));
+                    }
                     // `Former{type.io}` — signature subtyping (record-width
                     // on the sig index): `IO(s) <: IO(s')` iff `s'` names
                     // at least the ops of `s` — directed, unlike index conv.
