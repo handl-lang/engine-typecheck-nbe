@@ -6331,7 +6331,17 @@ impl NbeTypecheckEngine {
             .iter()
             .map(|a| freeze_metas(a, inst_no, &mut arg_pos))
             .collect();
-        self.register_instance(lang, ast, node, ctx, &head, args, &constraint, dict_idx)
+        self.register_instance(
+            lang,
+            ast,
+            node,
+            ctx,
+            &head,
+            args,
+            &constraint,
+            dict_idx,
+            &[],
+        )
     }
 
     /// Shared tail of `synth_instance` and `synth_new_decl`: the
@@ -6340,7 +6350,11 @@ impl NbeTypecheckEngine {
     /// instance table. `args` is the (already rigid/frozen) index
     /// shape; `constraint` is the `type.family_app{head, args}` the
     /// dict binds at in Γ — its `type` link IS the declared former
-    /// application.
+    /// application. `dict_skip` names `object`-dict entry keys whose
+    /// values are declaration metadata, not terms (PL-0004 G0:
+    /// `new Algebra`'s `op`/`requires` — `op` is a *type* signature
+    /// and `requires` a head-name list; term-synthesizing them
+    /// rejects type-level spellings like `Str ~> Unit`).
     #[allow(clippy::too_many_arguments)]
     fn register_instance(
         &self,
@@ -6352,6 +6366,7 @@ impl NbeTypecheckEngine {
         args: Vec<Value>,
         constraint: &Value,
         dict_idx: usize,
+        dict_skip: &[&str],
     ) -> Result<Value, LangError> {
         // Coherence — no two instances may declare unifiable index
         // shapes for one head (decision: error at declaration time,
@@ -6387,8 +6402,10 @@ impl NbeTypecheckEngine {
         // The dictionary is ordinary data — it must synth (a record,
         // a ctor application, an arrow). Its *declared* type is the
         // constraint: the instance assertion is that this value's
-        // `type` link is the former application.
-        self.synth_node(lang, ast, AstRef::new(dict_idx), ctx)?;
+        // `type` link is the former application. `object` dicts synth
+        // entry-wise so declaration-metadata keys (`dict_skip`) stay
+        // out of term position; anything else synths whole.
+        self.synth_instance_dict(lang, ast, dict_idx, dict_skip, ctx)?;
         let inst_name = format!("$instance:{head}:{}", ctx.instance_count);
         ctx.instance_count += 1;
         ctx.extend(inst_name.clone(), constraint.clone());
@@ -6402,6 +6419,63 @@ impl NbeTypecheckEngine {
             });
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
+    }
+
+    /// Dictionary well-formedness synth for [`Self::register_instance`]:
+    /// `object` dicts iterate their `entry` children and synth each
+    /// value — skipping keys in `dict_skip` (declaration metadata that
+    /// is not term data; PL-0004 G0's `op`/`requires` on `new
+    /// Algebra`). Non-`object` dicts (ctor applications, arrows)
+    /// synth whole, unchanged.
+    fn synth_instance_dict(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        dict_idx: usize,
+        dict_skip: &[&str],
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let Some(node) = ast.get(AstRef::new(dict_idx)) else {
+            return Ok(());
+        };
+        if node.kind != "object" || dict_skip.is_empty() {
+            self.synth_node(lang, ast, AstRef::new(dict_idx), ctx)?;
+            return Ok(());
+        }
+        for k in children_of(node).cloned().unwrap_or_default() {
+            let Some(ci) = k.as_u64() else { continue };
+            let Some(en) = ast.get(AstRef::new(ci as usize)) else {
+                continue;
+            };
+            if en.kind != "entry" {
+                // Non-entry children (spread/rest) synth whole.
+                self.synth_node(lang, ast, AstRef::new(ci as usize), ctx)?;
+                continue;
+            }
+            let ek = children_of(en)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)));
+            let key = ek.and_then(|n| {
+                node_name(n).or_else(|| {
+                    n.payload
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            });
+            let v_idx = children_of(en)
+                .and_then(|c| c.get(1))
+                .and_then(Value::as_u64)
+                .map(|i| i as usize);
+            if let (Some(key), Some(vi)) = (key, v_idx) {
+                if dict_skip.contains(&key.as_str()) {
+                    continue;
+                }
+                self.synth_node(lang, ast, AstRef::new(vi), ctx)?;
+            }
+        }
+        Ok(())
     }
 
     /// `X := new T(args) { members }` — the `new` declaration form
@@ -6485,10 +6559,26 @@ impl NbeTypecheckEngine {
         // `compose`/`unit`/`order` live in the instance table the `Val`
         // domain cannot evaluate, so composing through the head still
         // takes the honest bound until the bridge lands (E2+).
-        if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
-            && schema == "Algebra"
-        {
+        // G0 (effects-ambient-modes.md §2/§4): the dict's `op`/`requires`
+        // fields are effect-declaration data — `op` elaborates as the
+        // canonical `A ~> B` signature `perform` reads, `requires`
+        // declares algebra implication the mode-set elaboration closes
+        // under. Effect algebras declare no `compose`/`order`: their
+        // composition is set union, their subsumption set inclusion.
+        let is_algebra =
+            new_decl_schema(lang, ast, type_idx).is_some_and(|(schema, _)| schema == "Algebra");
+        if is_algebra {
             ctx.vcheck.algebra_heads.insert(name.to_string());
+            let (op, requires, compositional) =
+                self.algebra_effect_fields(lang, ast, dict_idx, ctx)?;
+            ctx.vcheck.algebra_effects.insert(
+                name.to_string(),
+                checker::AlgebraEffectDecl {
+                    op,
+                    requires,
+                    compositional,
+                },
+            );
         }
         // `T(args)` — the algebra former application — must elaborate
         // as a type (well-formedness; names the algebra `Algebra` is
@@ -6530,8 +6620,184 @@ impl NbeTypecheckEngine {
             vec![rigid],
             &constraint,
             dict_idx,
+            // `op`/`requires` are declaration metadata on `new
+            // Algebra` dicts — type signatures and head-name lists,
+            // not terms (PL-0004 G0); `algebra_effect_fields` already
+            // elaborated them.
+            if is_algebra {
+                &["op", "requires"][..]
+            } else {
+                &[][..]
+            },
         )?;
         Ok(())
+    }
+
+    /// The `op`/`requires` fields of a `new Algebra` dict child
+    /// (PL-0004 G0; design/effects-ambient-modes.md §2/§4). The dict
+    /// record's other fields (`compose`/`unit`/`order`) are
+    /// instance-table data the `Val` domain cannot evaluate — only
+    /// the two effect fields elaborate here:
+    ///
+    /// - `op : A ~> B` synthesizes as a *type* (`dep_synth_type`) —
+    ///   the same reading `IO<{op: A ~> B}>` sig entries get, so
+    ///   `perform` finds the `type.function{param, body}` shape it
+    ///   already consumes. An `op` that does not elaborate warns and
+    ///   leaves `None` (the head keeps the transition behavior).
+    /// - `requires : [Head, …]` reads algebra head *names* off the
+    ///   array literal — heads are declared names, not values, so no
+    ///   type synthesis runs on them. Non-`var` elements warn and
+    ///   drop (honest bound).
+    ///
+    /// The third return component reports whether the dict declared
+    /// `compose`/`order` — a compositional (graded-style) algebra
+    /// whose mode elements compose payloads rather than set-union.
+    ///
+    /// Dict shapes mirror `io_sig`: `object` nodes carry `entry`
+    /// children (`key`/`value` roles); `block`-position literals
+    /// parse as `type-annot` children (subject → field name, annot →
+    /// value). Any other dict shape yields no fields.
+    fn algebra_effect_fields(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        dict_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(Option<Value>, Vec<String>, bool), LangError> {
+        let Some(node) = ast.get(AstRef::new(dict_idx)) else {
+            return Ok((None, Vec::new(), false));
+        };
+        // `(field name, value node index)` pairs.
+        let mut fields: Vec<(String, usize)> = Vec::new();
+        if node.kind == "object" {
+            for k in children_of(node).cloned().unwrap_or_default() {
+                let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
+                    continue;
+                };
+                if en.kind != "entry" {
+                    continue;
+                }
+                let ek = children_of(en)
+                    .and_then(|c| c.first())
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)));
+                let key = ek.and_then(|n| {
+                    node_name(n).or_else(|| {
+                        n.payload
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                });
+                let v_idx = children_of(en)
+                    .and_then(|c| c.get(1))
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize);
+                if let (Some(key), Some(vi)) = (key, v_idx) {
+                    fields.push((key, vi));
+                }
+            }
+        } else if node.kind == "block" {
+            for k in children_of(node).cloned().unwrap_or_default() {
+                let Some(tn) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
+                    continue;
+                };
+                if tn.kind != "type-annot" {
+                    continue;
+                }
+                let tk = children_of(tn)
+                    .and_then(|c| c.first())
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(|n| {
+                        node_name(n).or_else(|| {
+                            n.payload
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                    });
+                let v_idx = children_of(tn)
+                    .and_then(|c| c.get(1))
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize);
+                if let (Some(key), Some(vi)) = (tk, v_idx) {
+                    fields.push((key, vi));
+                }
+            }
+        }
+        // A declared `compose`/`order` makes the algebra compositional
+        // (graded-style payload composition); without them it is an
+        // effect algebra — set union / set inclusion (design §2).
+        let compositional = fields.iter().any(|(k, _)| k == "compose" || k == "order");
+        let mut op = None;
+        let mut requires = Vec::new();
+        for (key, vi) in fields {
+            match key.as_str() {
+                "op" => match self.dep_synth_type(lang, ast, vi, ctx) {
+                    Ok(t) => op = Some(t),
+                    Err(e) => ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "new Algebra: `op` signature does not elaborate ({e}) — the head keeps transition behavior (honest bound)"
+                        ),
+                        span: ast.get(AstRef::new(vi)).and_then(|n| n.span),
+                    }),
+                },
+                "requires" => {
+                    let mut vn = ast.get(AstRef::new(vi));
+                    while let Some(n) = vn {
+                        if n.kind != "paren" {
+                            break;
+                        }
+                        vn = children_of(n)
+                            .and_then(|c| c.first())
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)));
+                    }
+                    match vn {
+                        Some(n) if n.kind == "array" => {
+                            for k in children_of(n).cloned().unwrap_or_default() {
+                                let Some(mut el) =
+                                    k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize)))
+                                else {
+                                    continue;
+                                };
+                                while el.kind == "paren" {
+                                    match children_of(el)
+                                        .and_then(|c| c.first())
+                                        .and_then(Value::as_u64)
+                                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                                    {
+                                        Some(inner) => el = inner,
+                                        None => break,
+                                    }
+                                }
+                                match node_name(el) {
+                                    Some(h) if el.kind == "var" => requires.push(h),
+                                    _ => ctx.diagnostics.push(TypecheckDiagnostic {
+                                        severity: "warning".to_string(),
+                                        message:
+                                            "new Algebra: `requires` entries must name algebra heads — entry dropped (honest bound)"
+                                                .to_string(),
+                                        span: el.span,
+                                    }),
+                                }
+                            }
+                        }
+                        _ => ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message:
+                                "new Algebra: `requires` must be an array of algebra heads — field ignored (honest bound)"
+                                    .to_string(),
+                            span: vn.and_then(|n| n.span),
+                        }),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((op, requires, compositional))
     }
 
     /// `X := new Constraint(S…) { shape }` — the `Constraint` schema of
@@ -10568,6 +10834,44 @@ impl NbeTypecheckEngine {
             }
             modes.push(element);
         }
+        // PL-0004 G0 `requires` closure (design/effects-ambient-modes.md
+        // §4.1): each element head's declared `requires` list unions
+        // into the set, transitively — `@ [ReadFile]` with
+        // `requires: [FsRead]` elaborates to `{ReadFile, FsRead}`.
+        // Required heads arrive as bare-head elements (no payload);
+        // unresolvable heads warn + pass (the honest bound — the
+        // capability is simply absent).
+        let mut queue: Vec<String> = heads.iter().cloned().collect();
+        while let Some(h) = queue.pop() {
+            let reqs = ctx
+                .vcheck
+                .algebra_effects
+                .get(&h)
+                .map(|d| d.requires.clone())
+                .unwrap_or_default();
+            for r in reqs {
+                if heads.contains(&r) {
+                    continue;
+                }
+                if !Self::mode_head_declared(ctx, &r) {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "mode ascription: `{h}` requires unknown algebra head `{r}` — passing (honest bound)"
+                        ),
+                        span: None,
+                    });
+                    continue;
+                }
+                heads.insert(r.clone());
+                let mut em = Map::new();
+                em.insert("head".to_string(), Value::String(r.clone()));
+                em.insert("arg".to_string(), Value::Null);
+                em.insert("raw".to_string(), var_term(&r));
+                modes.push(Value::Object(em));
+                queue.push(r);
+            }
+        }
         let mut m = Map::new();
         m.insert(
             "__tag__".to_string(),
@@ -10663,6 +10967,34 @@ impl NbeTypecheckEngine {
                 return Ok((Some(h), Value::Object(em)));
             }
         }
+        // PL-0004 G0: a bare `var` naming a declared algebra head is a
+        // *bare-head mode element* — `@ [ReadFile]` carries the head
+        // with no payload (design/effects-ambient-modes.md §2: effect
+        // heads are unit; the payload slot is for parameters like
+        // `Raise(Nat)`, which stay on the `call` path above). Head
+        // resolution is name-level, same as the registered check in
+        // `elaborate_mode_set_inner`.
+        let mut bv = e;
+        while bv.kind == "paren" {
+            match children_of(bv)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+            {
+                Some(inner) => bv = inner,
+                None => break,
+            }
+        }
+        if bv.kind == "var"
+            && let Some(h) = node_name(bv)
+            && Self::mode_head_declared(ctx, &h)
+        {
+            let mut em = Map::new();
+            em.insert("head".to_string(), Value::String(h.clone()));
+            em.insert("arg".to_string(), Value::Null);
+            em.insert("raw".to_string(), var_term(&h));
+            return Ok((Some(h), Value::Object(em)));
+        }
         // Bare mode element — the whole child is the payload. An
         // unevaluable mode is the honest bound (fresh meta + warning).
         // PL-0004 E3: an unbound `var` payload already arrived as the
@@ -10690,6 +11022,21 @@ impl NbeTypecheckEngine {
         em.insert("arg".to_string(), Value::Null);
         em.insert("raw".to_string(), raw);
         Ok((None, Value::Object(em)))
+    }
+
+    /// Whether `h` resolves as a mode-algebra head (PL-0004 G0) — a
+    /// `new Algebra` declaration ([`Checker::algebra_heads`], also
+    /// populated for effect decls in `algebra_effects`) or a
+    /// registered `mode.algebra.<h>` language global. Name-level,
+    /// mirroring the registered check in `elaborate_mode_set_inner`;
+    /// shared by bare-head elements and the `requires` closure.
+    fn mode_head_declared(ctx: &TypecheckContext, h: &str) -> bool {
+        ctx.vcheck.algebra_heads.contains(h)
+            || ctx.vcheck.algebra_effects.contains_key(h)
+            || ctx
+                .vcheck
+                .mode_algebras
+                .contains_key(&format!("mode.algebra.{h}"))
     }
 
     /// Whether a mode-expression `var` name resolves to something
@@ -10896,6 +11243,18 @@ impl NbeTypecheckEngine {
         v.as_object().cloned()
     }
 
+    /// Whether a `type.mode_set` value holds an element headed by
+    /// `head` (PL-0004 G0 granular lookup — `perform`'s `op`-field
+    /// membership check).
+    fn mode_set_has_head(mu: &Value, head: &str) -> bool {
+        mu.get("modes")
+            .and_then(Value::as_array)
+            .is_some_and(|els| {
+                els.iter()
+                    .any(|el| el.get("head").and_then(Value::as_str) == Some(head))
+            })
+    }
+
     /// The `Effects` row of an ambient `type.mode_set` value — the
     /// `arg` record of the `Effects` element (`{op: A ~> B}` entries).
     /// `None` when the set has no `Effects` element *or* its payload is
@@ -11087,6 +11446,23 @@ impl NbeTypecheckEngine {
                 }
             };
         }
+        // PL-0004 G0: identical elements of a *non-compositional*
+        // declared algebra compose to themselves — set-union
+        // idempotence (`{H} ⋄ {H} = {H}`) — keeping bare-head effect
+        // elements (unit payload) off the `Val`-descriptor bridge.
+        // Compositional algebras (`compose`/`order` declared, e.g.
+        // `Cost`) still compose payloads: `Cost(3) ⋄ Cost(3) = 6`.
+        if let Some(h) = head
+            && a_arg == b_arg
+            && a_raw == b_raw
+            && ctx
+                .vcheck
+                .algebra_effects
+                .get(h)
+                .is_some_and(|d| !d.compositional)
+        {
+            return (a_arg.clone(), a_raw.clone());
+        }
         // Lift both sides into the `Val` domain (tagged `__meta__`
         // leaves remap to fresh domain metas), compose the
         // descriptors, quote the composite back.
@@ -11175,6 +11551,10 @@ impl NbeTypecheckEngine {
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        // PL-0004 G0: granular heads subsume by set inclusion — runs
+        // before the `Effects` row machinery (kept for the transition;
+        // G1/G2 retire it).
+        self.check_mode_heads_subsumption(actual, expected, ctx)?;
         let a_pay = Self::mode_set_effects_payload(actual).map(|p| self.zonk(&p, ctx));
         let e_pay = Self::mode_set_effects_payload(expected).map(|p| self.zonk(&p, ctx));
         let a_row = a_pay.as_ref().and_then(Self::plain_effects_row);
@@ -11246,6 +11626,74 @@ impl NbeTypecheckEngine {
                             severity: "warning".to_string(),
                             message: format!(
                                 "mode subsumption: effect `{k}`'s row entries do not unify — passing (honest bound)"
+                            ),
+                            span: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// PL-0004 G0 granular-head subsumption (design/effects-ambient-modes.md
+    /// §2 — effect algebras without `compose`/`order` subsume by *set
+    /// inclusion*): every named non-`Effects` head in `actual` must
+    /// appear in `expected`; same-head payloads (`Raise(Nat)`-style
+    /// parameters) unify — a decided mismatch warns + passes (the
+    /// honest bound, the same posture row entries get). Bare-mode
+    /// (`head: null`) elements and a symbolic `Effects` payload make
+    /// the head set unenumerable — the check passes undecided.
+    /// `Effects` elements keep their row machinery until G1/G2.
+    fn check_mode_heads_subsumption(
+        &self,
+        actual: &Value,
+        expected: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        /// The `(head, payload)` pairs of a mode set's named elements,
+        /// `Effects` excluded (its row machinery decides separately).
+        /// `None` when any element is head-less — a bare mode or mode
+        /// metavariable the set cannot enumerate.
+        fn heads_of(mu: &Value) -> Option<Vec<(String, Value)>> {
+            let els = mu.get("modes")?.as_array()?;
+            let mut out = Vec::new();
+            for el in els {
+                match el.get("head").and_then(Value::as_str) {
+                    None => return None,
+                    Some("Effects") => {}
+                    Some(h) => {
+                        out.push((h.to_string(), el.get("arg").cloned().unwrap_or(Value::Null)))
+                    }
+                }
+            }
+            Some(out)
+        }
+        let (Some(a_heads), Some(e_heads)) = (heads_of(actual), heads_of(expected)) else {
+            return Ok(());
+        };
+        // A symbolic `Effects` payload on the expected side could still
+        // denote coverage for the granular heads — undecidable, pass.
+        if Self::mode_set_effects_payload(expected).is_some()
+            && Self::mode_set_effects_row(expected).is_none()
+        {
+            return Ok(());
+        }
+        for (h, a_arg) in &a_heads {
+            match e_heads.iter().find(|(eh, _)| eh == h) {
+                None => {
+                    return Err(LangError::engine(format!(
+                        "typecheck: ambient mode subsumption: effect head `{h}` is not permitted by the ascription's mode set"
+                    )));
+                }
+                Some((_, e_arg)) => {
+                    let mark = ctx.store_mark();
+                    if self.dep_unify(a_arg, e_arg, ctx).is_err() {
+                        ctx.store_restore(mark);
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message: format!(
+                                "mode subsumption: head `{h}`'s payloads do not unify — passing (honest bound)"
                             ),
                             span: None,
                         });
@@ -11783,6 +12231,64 @@ impl NbeTypecheckEngine {
         // warning: the dual-path transition (the smoke corpus still
         // spells effects `IO<…>`; E1 already deprecates the former).
         if let Some(mu) = ctx.ambient_mode.clone() {
+            // PL-0004 G0 granular path (design/effects-ambient-modes.md
+            // §2/§3): `perform(Head, arg)` where `Head` is a declared
+            // effect algebra whose `op : A ~> B` signature is on
+            // record — domain/codomain resolve from `op`, not an
+            // `Effects` row entry. Preferred whenever the head has an
+            // `op` *and* sits in the ambient set; a declared `op`
+            // head absent from `μ` warns and falls through to the
+            // `IO` mint (the same transition the missing-row-op case
+            // takes — G1 re-keys membership/extension). The `Effects`
+            // row path below stays for the transition; G1/G2 retire it.
+            if let Some(op_sig) = ctx
+                .vcheck
+                .algebra_effects
+                .get(&op_name)
+                .and_then(|d| d.op.clone())
+            {
+                if Self::mode_set_has_head(&mu, &op_name) {
+                    let entry = self.zonk(&op_sig, ctx);
+                    if tag_of(&entry) == Some("type.function") {
+                        // `op : A ~> B` — check the argument against the
+                        // declared domain, yield the codomain (the same
+                        // reading the `Effects` row path gives).
+                        let dom = entry.get("param").cloned().unwrap_or(Value::Null);
+                        let cod = entry.get("body").cloned().unwrap_or(Value::Null);
+                        self.dep_unify(&arg_ty, &dom, ctx).map_err(|e| {
+                            LangError::engine(format!(
+                                "typecheck: perform: argument does not match op `{op_name}`'s domain: {e}"
+                            ))
+                        })?;
+                        ctx.performed_effects.push((op_name.clone(), entry.clone()));
+                        return Ok(self.zonk(&cod, ctx));
+                    }
+                    // Non-arrow `op` — the honest bound, mirroring the
+                    // row path's payload-style entry: the signature
+                    // reads as both domain and codomain.
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "perform: op `{op_name}`'s `op` field is not an arrow type `A ~> B` — treating it as domain and codomain (honest bound)"
+                        ),
+                        span: op_node.span,
+                    });
+                    self.dep_unify(&arg_ty, &entry, ctx).map_err(|e| {
+                        LangError::engine(format!(
+                            "typecheck: perform: argument does not match op `{op_name}`'s signature: {e}"
+                        ))
+                    })?;
+                    ctx.performed_effects.push((op_name.clone(), entry.clone()));
+                    return Ok(entry);
+                }
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "perform: op `{op_name}` is not in the ambient mode set — minting `IO{{…}}` (transition path)"
+                    ),
+                    span: op_node.span,
+                });
+            }
             if let Some(row) = Self::mode_set_effects_row(&mu) {
                 match row.get(&op_name).cloned() {
                     Some(entry) => {

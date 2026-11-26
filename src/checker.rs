@@ -244,6 +244,35 @@ pub struct Checker {
     /// composing through such a head still takes the honest bound
     /// until the algebra bridge lands (E2+).
     pub algebra_heads: HashSet<String>,
+    /// Effect-declaration fields of `new Algebra` heads (PL-0004
+    /// G0): `op` signatures and `requires` implications, populated
+    /// by `synth_new_decl`'s `Algebra` arm. Heads absent here (or
+    /// with `op: None`) keep the transition behavior — `perform`
+    /// falls back to the `Effects` row / `IO` mint.
+    pub algebra_effects: HashMap<String, AlgebraEffectDecl>,
+}
+
+/// The effect-relevant fields of a `new Algebra { … }` declaration
+/// record (PL-0004 G0; design/effects-ambient-modes.md §2/§4): `op`
+/// is the canonical operation signature (`op : A ~> B`, elaborated
+/// as a type — `perform` reads domain/codomain from it) and
+/// `requires` lists the algebra heads the operation implies
+/// (effect implication — `elaborate_mode_set` closes mode sets under
+/// it, transitively). `compose`/`unit`/`order` stay instance-table
+/// data: effect algebras compose by set union and subsume by set
+/// inclusion, so they declare neither.
+#[derive(Debug, Default, Clone)]
+pub struct AlgebraEffectDecl {
+    /// `op : A ~> B` — the operation's domain/codomain signature.
+    pub op: Option<serde_json::Value>,
+    /// `requires : [Head, …]` — algebra heads implied by this one.
+    pub requires: Vec<String>,
+    /// The dict declared `compose`/`order` — a *compositional*
+    /// (graded-style) algebra whose same-head mode elements compose
+    /// payloads (`Cost(3) ⋄ Cost(3) = Cost(6)`). `false` marks an
+    /// effect algebra: same-head elements set-union
+    /// (`{H} ⋄ {H} = {H}`), subsumption is set inclusion.
+    pub compositional: bool,
 }
 
 /// The verdict of a mode subsumption check `actual ≤ expected`
@@ -1266,10 +1295,15 @@ impl Checker {
             // M3 enforcement: an unregistered head still composes
             // under `default` (the M2 fallback — `new`-declared
             // algebras live in the instance table, not this registry),
-            // but the fallback is no longer silent.
+            // but the fallback is no longer silent. Heads declared
+            // via `new Algebra` are *known* — effect algebras
+            // deliberately declare no `compose`/`order` (set union /
+            // set inclusion, PL-0004 G0), so composing them under
+            // `default` is by design, not a gap.
             if !self
                 .mode_algebras
                 .contains_key(&format!("mode.algebra.{h}"))
+                && !self.algebra_heads.contains(h)
             {
                 self.mode_warnings.push(format!(
                     "mode compose: unknown algebra head `{h}` (composing under `default`)"
