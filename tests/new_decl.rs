@@ -118,3 +118,44 @@ fn new_decl_duplicate_name_is_coherence_error() {
         "expected coherence error, got: {msg}"
     );
 }
+
+// --- `new Constraint(S…)` — the constraint schema
+// (design/instance-unified-registry.md §2): the schema head chooses
+// what registers; `Constraint` binds `X` as a `type.family` whose
+// `base` elements are the index sorts, so `instance X(T) := dict` and
+// implicit `<ev : X(a)>` evidence binders flow through the unchanged
+// `synth_instance`/`resolve_instance` machinery.
+
+/// `Nat`/`Bool` datatypes + the `Eq` constraint + its `Nat` instance +
+/// a function demanding implicit `Eq` evidence.
+const CONSTRAINT_SRC: &str = "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }\n\
+     Bool := { True : Bool, False : Bool }\n\
+     Eq := new Constraint(Type) { evidence : a ~> a ~> Bool }\n\
+     instance Eq(Nat) := { eq: (x, y) ~> x == y }\n\
+     f<a, ev : Eq(a)> : a ~> a := v ~> v\n";
+
+#[test]
+fn new_constraint_discharges_implicit_instance() {
+    // `f(Zero)` — `ev : Eq(Nat)` resolves by dictionary search against
+    // the declared `instance Eq(Nat)`.
+    let src = format!("{CONSTRAINT_SRC}r := f(Zero)\n");
+    tc_full(&src);
+}
+
+#[test]
+fn new_constraint_missing_instance_is_honest_error() {
+    // `f(True)` needs `Eq(Bool)` — only `Eq(Nat)` is declared, so
+    // instance search fails honestly (no silent unsolved meta).
+    let src = format!("{CONSTRAINT_SRC}r := f(True)\n");
+    let lang = lang();
+    let ast = parse(&lang, &src);
+    let nbe = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
+    let err = nbe
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect_err("missing Eq(Bool) instance must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Eq") && (msg.contains("instance") || msg.contains("Bool")),
+        "expected missing-instance error naming Eq/Bool, got: {msg}"
+    );
+}

@@ -207,6 +207,37 @@ fn graded_arrow_payload_flip() {
     );
 }
 
+/// pl-0002 M2: a call-head grade payload (`~[Cost(3)]~>`) mints a
+/// `type.mode` descriptor `{head, arg, raw}` riding the optional 4th
+/// `type.hom` index — `Cost(3)` selects `mode.algebra.Cost`, `3` is
+/// the payload, and `raw` is the self-describing `Cost(3)` app.
+#[test]
+fn graded_arrow_mode_descriptor() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "Algebra<c : Type> := { mkAlgebra : (compose : c ~> c ~> c, unit : c, order : c ~> c ~> Bool) ~> Algebra }",
+            "Cost := new Algebra(Nat) { compose: (a, b) ~> a + b, unit: 0 }",
+            "dedupe := (g >>> g) ~[Cost(3)]~> g",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "graded arrow with a call-head mode should check, got {:?}",
+        diags_of(&result)
+    );
+    let found = result.node_types.values().any(|t| {
+        let s = serde_json::to_string(t).unwrap_or_default();
+        s.contains("\"name\":\"mode\"") && s.contains("Cost")
+    });
+    assert!(
+        found,
+        "expected a type.mode descriptor carrying head `Cost` in node_types"
+    );
+}
+
 /// `IO<puts, fs>` — the brace-free sig record: bare names declare ops
 /// (`type.unknown` payload), `name : T` declares the payload type.
 /// Widening/coverage rules are identical to `IO<{ … }>`.

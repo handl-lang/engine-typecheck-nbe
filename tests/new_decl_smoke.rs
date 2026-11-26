@@ -18,3 +18,16 @@ fn smoke_new_decl_typechecks() {
     nbe.typecheck(lang, &TypecheckRequest::new(ast))
         .expect("typecheck");
 }
+
+#[test]
+fn smoke_new_constraint_typechecks() {
+    let src = include_str!("../../host/tests/smoke/new_constraint.hnl");
+    let kit = handl_kit_data_prelude::assemble().expect("canonical assembly");
+    let lang: &Language = kit.lang();
+    let ast: Ast = PrattEngine::new()
+        .parse(lang, &ParserRequest::new(lex_src(lang, src).expect("lex")))
+        .expect("parse");
+    let nbe = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
+    nbe.typecheck(lang, &TypecheckRequest::new(ast))
+        .expect("typecheck");
+}
