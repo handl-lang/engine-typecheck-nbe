@@ -1420,7 +1420,7 @@ impl Checker {
 
     /// Directed mode subsumption `a ≤ b` between two types (pl-0002
     /// M3): a paired structural walk in which only `type.hom` mode
-    /// indices decide — [`Checker::mode_leq`] on `args[3]` — while
+    /// indices decide — `mode_leq` on `args[3]` — while
     /// dims, endpoints, former args, and spines recurse for nested
     /// modes. Returns `false` *only* on a decided `order` failure;
     /// unresolvable modes pass (the honest bound). No-op when no
