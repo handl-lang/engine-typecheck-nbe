@@ -2953,6 +2953,60 @@ impl NbeTypecheckEngine {
                             "record_field_type: family '{fname}' has no scope binding '{field_name}'"
                         )));
                     }
+                    // `type.family_app` — a `new Constraint` head applied
+                    // to its index args (`ev : Eq(a)`). The constraint's
+                    // dictionary *shape* (`"<head>.shape"`, recorded by
+                    // `synth_new_constraint_decl`) is a `type.record`
+                    // signature; projecting `ev.<field>` yields the
+                    // shape's field type with the declaration's
+                    // schematic vars substituted by the goal's index
+                    // args (`"<head>.shape.vars"` is the positional
+                    // key). A family_app with no recorded shape has no
+                    // dictionary surface — honest error.
+                    if container_type.get("__tag__").and_then(|t| t.as_str())
+                        == Some("type.family_app")
+                    {
+                        let head = container_type
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let goal_args = container_type
+                            .get("args")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let shape = ctx.lookup_result(&format!("{head}.shape")).cloned();
+                        let Some(shape) = shape else {
+                            return Err(LangError::engine(format!(
+                                "record_field_type: '{head}' has no constraint shape — `ev.{field_name}` needs a `new Constraint` declaration"
+                            )));
+                        };
+                        let shape_fields = shape
+                            .get("fields")
+                            .and_then(|f| f.as_object())
+                            .ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "record_field_type: constraint shape for '{head}' is not a record: {shape:?}"
+                                ))
+                            })?;
+                        let field_type = shape_fields.get(&field_name).ok_or_else(|| {
+                            LangError::engine(format!(
+                                "record_field_type: constraint '{head}' shape has no field '{field_name}'"
+                            ))
+                        })?;
+                        let vars: Vec<String> = ctx
+                            .lookup_result(&format!("{head}.shape.vars"))
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        return Ok(dependent::subst_shape_vars(
+                            field_type, &vars, &goal_args,
+                        ));
+                    }
                     let fields = container_type
                         .get("fields")
                         .and_then(|f| f.as_object())

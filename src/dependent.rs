@@ -6406,11 +6406,23 @@ impl NbeTypecheckEngine {
         // `"<name>.shape"` for the deferred instance-site check.
         let mut gen_vars = Vec::new();
         collect_unbound_index_vars(ast, AstRef::new(dict_idx), ctx, &mut gen_vars);
+        // The schematic vars in first-appearance order — the positional
+        // key `record_field_type` substitutes against a `family_app`'s
+        // index args when projecting `ev.<field>` off the shape.
+        ctx.bind_result(
+            format!("{name}.shape.vars"),
+            Value::Array(
+                gen_vars
+                    .iter()
+                    .map(|n| Value::String(n.clone()))
+                    .collect(),
+            ),
+        );
         let old_results = ctx.results.clone();
         for n in &gen_vars {
             ctx.bind_result(n.clone(), var_term(n));
         }
-        let shape = self.synth_node(lang, ast, AstRef::new(dict_idx), ctx);
+        let shape = self.synth_constraint_shape(lang, ast, dict_idx, ctx);
         ctx.results = old_results;
         match shape {
             Ok(s) => {
@@ -6427,6 +6439,57 @@ impl NbeTypecheckEngine {
             }
         }
         Ok(())
+    }
+
+    /// Elaborate a `new Constraint` dict child `{ field : T, … }` into
+    /// the `type.record` dictionary *shape*. Each field's type
+    /// expression goes through [`Self::dep_synth_type`] — the same
+    /// elaborator annotations use — so schematic vars (`a` in
+    /// `a ~> a ~> Bool`) resolve to the rigid `var{a}` leaves the
+    /// `"<name>.shape.vars"` positional substitution expects, and
+    /// builtin/family names resolve exactly as they do at `instance`
+    /// and binder sites. A non-`object` dict child falls back to
+    /// `synth_node` (well-formedness only — the shape then has no
+    /// `fields` to project).
+    fn synth_constraint_shape(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        dict_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let Some(node) = ast.get(AstRef::new(dict_idx)) else {
+            return Err(LangError::engine(format!(
+                "synth_new: constraint dict node {dict_idx} out of bounds"
+            )));
+        };
+        if node.kind != "object" {
+            return self.synth_node(lang, ast, AstRef::new(dict_idx), ctx);
+        }
+        let mut fields = Map::new();
+        for k in children_of(node).cloned().unwrap_or_default() {
+            let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
+                continue;
+            };
+            if en.kind != "entry" {
+                continue;
+            }
+            let ek = children_of(en)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)));
+            let key = ek.and_then(node_name);
+            let v_idx = children_of(en)
+                .and_then(|c| c.get(1))
+                .and_then(Value::as_u64)
+                .map(|i| i as usize);
+            if let (Some(key), Some(vi)) = (key, v_idx) {
+                fields.insert(key, self.dep_synth_type(lang, ast, vi, ctx)?);
+            }
+        }
+        let mut m = Map::new();
+        m.insert("fields".to_string(), Value::Object(fields));
+        Ok(make_tag(ctx, "type.record", m))
     }
 
     /// `synth_new` — a `new` node reached *outside* an `assign` value
@@ -11989,6 +12052,35 @@ fn freeze_metas(v: &Value, inst: usize, pos: &mut usize) -> Value {
         Value::Array(xs) => Value::Array(xs.iter().map(|x| freeze_metas(x, inst, pos)).collect()),
         _ => v.clone(),
     }
+}
+
+/// Substitute a constraint shape's schematic index vars with a
+/// `family_app`'s index args — the `ev.<field>` projection path
+/// (`record_field_type` on `type.family_app{head, args}`). `vars` is
+/// the declaration's first-appearance var order (`"<head>.shape.vars"`);
+/// `args` is the goal's index telescope, positional. Vars without a
+/// corresponding arg stay rigid; extra args are ignored (the head's
+/// declared arity already bounds the telescope).
+pub(crate) fn subst_shape_vars(v: &Value, vars: &[String], args: &[Value]) -> Value {
+    fn go(v: &Value, vars: &[String], args: &[Value]) -> Value {
+        if tag_of(v) == Some("var")
+            && let Some(name) = v.get("name").and_then(Value::as_str)
+            && let Some(i) = vars.iter().position(|n| n == name)
+            && let Some(arg) = args.get(i)
+        {
+            return arg.clone();
+        }
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .map(|(k, x)| (k.clone(), go(x, vars, args)))
+                    .collect(),
+            ),
+            Value::Array(xs) => Value::Array(xs.iter().map(|x| go(x, vars, args)).collect()),
+            _ => v.clone(),
+        }
+    }
+    go(v, vars, args)
 }
 
 /// Guard the *goal* side of an instance lookup: wrap each rigid `var`

@@ -159,3 +159,54 @@ fn new_constraint_missing_instance_is_honest_error() {
         "expected missing-instance error naming Eq/Bool, got: {msg}"
     );
 }
+
+/// The learn-doc example (docs/learn "Instances and evidence",
+/// design/instance-unified-registry.md §2): `ev.evidence` projects
+/// through the constraint's declared dictionary *shape* — the
+/// `"<head>.shape"`/`"<head>.shape.vars"` results
+/// `synth_new_constraint_decl` records — with the schematic vars
+/// substituted by the `family_app`'s index args.
+const LEARN_DOC_SRC: &str = "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }\n\
+     Bool := { True : Bool, False : Bool }\n\
+     Eq := new Constraint(Type) { evidence : a ~> a ~> Bool }\n\
+     instance Eq(Nat) := { evidence: (x, y) ~> x == y }\n\
+     eqv<a, ev : Eq(a)> : a ~> a ~> Bool :=\n  x ~> y ~> ev.evidence(x, y)\n\
+     nat_eq : Bool := eqv(Zero)(Zero)\n";
+
+#[test]
+fn new_constraint_evidence_projection_typechecks() {
+    // `ev.evidence` on the `Eq(a)` binder yields `a ~> a ~> Bool`;
+    // `eqv(Zero)(Zero)` discharges `Eq(Nat)` by dictionary search and
+    // the result checks against the `Bool` annotation.
+    tc_full(LEARN_DOC_SRC);
+}
+
+#[test]
+fn new_constraint_explicit_evidence_binder() {
+    // The explicit `(ev : Eq(a))` form — no `<>` evidence binder —
+    // projects through the same shape path.
+    let src = format!(
+        "{LEARN_DOC_SRC}eqvE<a> : (ev : Eq(a)) ~> a ~> a ~> Bool := ev ~> x ~> y ~> ev.evidence(x, y)\n"
+    );
+    tc_full(&src);
+}
+
+#[test]
+fn new_constraint_shape_field_must_exist() {
+    // `ev.other` — the shape declares `evidence` only; projection of
+    // an undeclared field is an honest error.
+    let src = format!(
+        "{LEARN_DOC_SRC}bad<a, ev : Eq(a)> : a ~> a ~> Bool := x ~> y ~> ev.other(x, y)\n"
+    );
+    let lang = lang();
+    let ast = parse(&lang, &src);
+    let nbe = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));
+    let err = nbe
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect_err("ev.other must fail — no such shape field");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("other") || msg.contains("shape"),
+        "expected missing-shape-field error, got: {msg}"
+    );
+}
