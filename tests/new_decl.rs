@@ -195,9 +195,8 @@ fn new_constraint_explicit_evidence_binder() {
 fn new_constraint_shape_field_must_exist() {
     // `ev.other` — the shape declares `evidence` only; projection of
     // an undeclared field is an honest error.
-    let src = format!(
-        "{LEARN_DOC_SRC}bad<a, ev : Eq(a)> : a ~> a ~> Bool := x ~> y ~> ev.other(x, y)\n"
-    );
+    let src =
+        format!("{LEARN_DOC_SRC}bad<a, ev : Eq(a)> : a ~> a ~> Bool := x ~> y ~> ev.other(x, y)\n");
     let lang = lang();
     let ast = parse(&lang, &src);
     let nbe = NbeTypecheckEngine::new(Box::new(TreeWalkEngine::new()));

@@ -3003,9 +3003,7 @@ impl NbeTypecheckEngine {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        return Ok(dependent::subst_shape_vars(
-                            field_type, &vars, &goal_args,
-                        ));
+                        return Ok(dependent::subst_shape_vars(field_type, &vars, &goal_args));
                     }
                     let fields = container_type
                         .get("fields")
