@@ -874,6 +874,18 @@ fn node_name(node: &AstNode) -> Option<String> {
     })
 }
 
+/// The bound names of a closure params node — `param_names` for plain
+/// params, `param_bound_names` (the flattened destructured-binder set
+/// exec's `param_defs` application binds, ADR-0081) when the params
+/// carry patterns `param_names` cannot resolve.
+fn closure_param_names(lang: &Language, ast: &Ast, pnode: &AstNode) -> Option<Vec<String>> {
+    lang.param_names(ast, pnode)
+        .map(|(names, _rest)| names)
+        .ok()
+        .or_else(|| lang.param_bound_names(ast, pnode).ok())
+        .filter(|names| !names.is_empty())
+}
+
 /// Whether `name` is a builtin type-position identifier — the name table
 /// `dep_builtin_or_tag` resolves (`Bool`/`Nat`/`IO`/`Type`/`Pi`/…).
 /// Injected `with_global` seeds must not shadow these (they are
@@ -4367,6 +4379,9 @@ impl NbeTypecheckEngine {
             .param_names(ast, pnode)
             .ok()
             .and_then(|(names, _)| names.first().cloned())
+            .or_else(|| {
+                closure_param_names(lang, ast, pnode).and_then(|names| names.first().cloned())
+            })
             .or_else(|| node_name(pnode))
             .unwrap_or_else(|| "x".to_string());
         Some((name, body_idx.index()))
@@ -6311,10 +6326,18 @@ impl NbeTypecheckEngine {
                                         .flatten()
                                         .is_some();
                                 shaped
-                                    && lang
+                                    && (lang
                                         .param_names(ast, p)
-                                        .map(|(names, rest)| !names.is_empty() || rest.is_some())
+                                        .map(|(names, rest)| {
+                                            !names.is_empty() || rest.is_some()
+                                        })
                                         .unwrap_or(false)
+                                        // Destructured params
+                                        // (`([x, y]) ~>`, `({a, b}) ~>`)
+                                        // bind through `param_defs` —
+                                        // `param_bound_names` resolves
+                                        // the same binder set.
+                                        || closure_param_names(lang, ast, p).is_some())
                             })
                             .unwrap_or(false);
                         if binder {
@@ -6487,9 +6510,10 @@ impl NbeTypecheckEngine {
         let pnode = ast
             .get(params_idx)
             .ok_or_else(|| LangError::engine("dep_intro: params node out of bounds".to_string()))?;
-        let (names, _rest) = lang
-            .param_names(ast, pnode)
-            .map_err(|e| LangError::engine(e.to_string()))?;
+        // `closure_param_names` covers destructured params too — every
+        // pattern binder is introduced at the domain.
+        let names = closure_param_names(lang, ast, pnode)
+            .ok_or_else(|| LangError::engine("dep_intro: no param binders".to_string()))?;
         let dom = expected
             .get("param")
             .or_else(|| expected.get("kind"))
@@ -6498,8 +6522,12 @@ impl NbeTypecheckEngine {
             .unwrap_or(Value::Null);
         let mark = ctx.mark();
         let old_results = ctx.results.clone();
+        // Every bound name enters at the domain — destructured params
+        // (`([x, y]) ~>`) bind several names to the one pi domain.
+        for n in &names {
+            ctx.extend(n.clone(), dom.clone());
+        }
         let pname = names.first().cloned().unwrap_or_else(|| "x".to_string());
-        ctx.extend(pname.clone(), dom.clone());
         // The closure variable resolves to the function's own binder as a
         // rigid index term — `var{n} → var{n}` when names coincide.
         let closure_var = expected
@@ -7365,9 +7393,8 @@ impl NbeTypecheckEngine {
         let pnode = ast.get(params_idx).ok_or_else(|| {
             LangError::engine("apply_motive: params node out of bounds".to_string())
         })?;
-        let (names, _) = lang
-            .param_names(ast, pnode)
-            .map_err(|e| LangError::engine(e.to_string()))?;
+        let names = closure_param_names(lang, ast, pnode)
+            .ok_or_else(|| LangError::engine("apply_motive: no param binders".to_string()))?;
         let scrut_name = ast
             .get(AstRef::new(scrutinee_idx))
             .and_then(|n| if n.kind == "var" { node_name(n) } else { None })
@@ -11245,7 +11272,7 @@ impl NbeTypecheckEngine {
                     let body_idx =
                         role_child_ref(lang, node, "body").or_else(|| child_at(ast, node, 1))?;
                     let pnode = ast.get(params_idx)?;
-                    let (names, _rest) = lang.param_names(ast, pnode).ok()?;
+                    let names = closure_param_names(lang, ast, pnode)?;
                     let mut m = Map::new();
                     m.insert("__tag__".to_string(), Value::String("Lam".to_string()));
                     m.insert(

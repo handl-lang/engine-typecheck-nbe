@@ -355,6 +355,44 @@ impl NbeTypecheckEngine {
         .map_err(|e: LangError| e.with_node(node))
     }
 
+    /// `synth_function` for destructured params (`([x, y]) ~>`,
+    /// `({a, b}) ~>`, `(x, [y, z]) ~>`): `param_names` cannot resolve
+    /// patterns, so [`bind_closure_param_patterns`] binds every pattern
+    /// binder structurally (the same names `pattern_match::try_pattern`
+    /// binds at apply time — ADR-0081 `param_defs`) and returns the
+    /// param-side type. The result is the same
+    /// `type.function{param, body}` payload the plain-param path mints.
+    fn synth_function_param_patterns(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        params_ref: AstRef,
+        body_ref: AstRef,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let params_node = ast.get(params_ref).ok_or_else(|| {
+            LangError::engine(format!(
+                "synth_function: params node {} out of bounds",
+                params_ref.index()
+            ))
+        })?;
+        let param_type = bind_closure_param_patterns(lang, ast, params_ref, ctx)?;
+        let body_type = self.synth_node(lang, ast, body_ref, ctx)?;
+        // Zonk so callers see solved parameter types, same as the
+        // plain-param path.
+        let param_type = self.zonk(&param_type, ctx);
+        let body_type = self.zonk(&body_type, ctx);
+        let payload = serde_json::json!({"param": param_type, "body": body_type});
+        ctx.registry
+            .construct("type.function", &payload)
+            .ok_or_else(|| {
+                LangError::engine_node(
+                    "synth_function: construct failed for type.function",
+                    params_node,
+                )
+            })
+    }
+
     /// Check a node against an expected type by interpreting the `check`
     /// scheme (or synth-then-unify if no `check` scheme exists).
     fn check_node(
@@ -2405,6 +2443,22 @@ impl NbeTypecheckEngine {
                     // argument: the param side is a `type.array` whose element
                     // types are the fixed params (and, with a rest binding, an
                     // unknown-length tail).
+                    //
+                    // Destructured params (`([x, y]) ~>`, `({a, b}) ~>`,
+                    // `(x, [y, z]) ~>`) carry `param_defs` on the minted
+                    // arrow — `param_names` cannot resolve them, so the
+                    // binders are bound structurally instead: every name
+                    // `pattern_match::try_pattern` would bind at apply
+                    // time gets a fresh meta (or the pattern position's
+                    // type), and the param side is typed from the pattern
+                    // shapes (`type.array` for `sequence`, `type.record`
+                    // for `entries`) — mirroring `resolve_closure_params`
+                    // on the exec side (ADR-0081 `pattern_role` data).
+                    if lang.param_contains_patterns(ast, params_node) {
+                        let res = self
+                            .synth_function_param_patterns(lang, ast, params_ref, body_ref, ctx);
+                        return res.map_err(|e| e.with_node(node));
+                    }
                     let (param_names, rest_name) = lang
                         .param_names(ast, params_node)
                         .map_err(|e| LangError::engine_node(e.to_string(), node))?;
@@ -4875,9 +4929,21 @@ impl NbeTypecheckEngine {
                     params_ref.index()
                 ))
             })?;
-            let (param_names, rest_name) = lang
-                .param_names(ast, params_node)
-                .map_err(|e| LangError::engine_node(e.to_string(), step_node))?;
+            // Destructured step params (`({count}) ~>`, `([a, b]) ~>`)
+            // cannot resolve through `param_names` — bind every name
+            // the patterns bind (`param_bound_names`, the same set
+            // exec's `param_defs` application binds); the state-field
+            // lookup below then types record destructuring by name.
+            let (param_names, rest_name) = if lang.param_contains_patterns(ast, params_node) {
+                (
+                    lang.param_bound_names(ast, params_node)
+                        .map_err(|e| LangError::engine_node(e.to_string(), step_node))?,
+                    None,
+                )
+            } else {
+                lang.param_names(ast, params_node)
+                    .map_err(|e| LangError::engine_node(e.to_string(), step_node))?
+            };
             let array_pattern = lang.is_array_pattern(params_node);
             // The initial state synthesizes first — its record fields are
             // the step params' types (params destructure the state object
@@ -5354,9 +5420,17 @@ impl NbeTypecheckEngine {
                     params_ref.index()
                 ))
             })?;
-            let (param_names, rest_name) = lang
-                .param_names(ast, params_node)
-                .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+            // Destructured params (`([x, y]) ~>`, `({a, b}) ~>`) cannot
+            // resolve through `param_names` — `bind_closure_param_patterns`
+            // binds the pattern binders structurally instead (the same
+            // names exec's `param_defs` application binds).
+            let destructured = lang.param_contains_patterns(ast, params_node);
+            let (param_names, rest_name) = if destructured {
+                (Vec::new(), None)
+            } else {
+                lang.param_names(ast, params_node)
+                    .map_err(|e| LangError::engine_node(e.to_string(), node))?
+            };
             let array_pattern = lang.is_array_pattern(params_node);
             let mark = ctx.mark();
             let mut elems: Vec<Value> = Vec::with_capacity(param_names.len() + 1);
@@ -5376,10 +5450,9 @@ impl NbeTypecheckEngine {
                 ctx.extend(rest.clone(), rest_ty.clone());
                 elems.push(rest_ty);
             }
-            let body_res = self.loose_synth_node(lang, ast, body_ref, ctx);
-            ctx.restore(mark);
-            let body_ty = self.zonk(&body_res?, ctx);
-            let param_ty = if !array_pattern && param_names.len() == 1 && rest_name.is_none() {
+            let param_ty = if destructured {
+                bind_closure_param_patterns(lang, ast, params_ref, ctx)?
+            } else if !array_pattern && param_names.len() == 1 && rest_name.is_none() {
                 elems.into_iter().next().unwrap_or(Value::Null)
             } else {
                 ctx.registry
@@ -5388,6 +5461,9 @@ impl NbeTypecheckEngine {
                         LangError::engine("typecheck: loose fn: construct failed for type.array")
                     })?
             };
+            let body_res = self.loose_synth_node(lang, ast, body_ref, ctx);
+            ctx.restore(mark);
+            let body_ty = self.zonk(&body_res?, ctx);
             let ty = ctx
                 .registry
                 .construct(
@@ -6771,6 +6847,346 @@ fn is_record_entry_annot(lang: &Language, ast: &Ast, node: &AstNode) -> bool {
     // pattern leaves (`x: T` stays an annotation); `value`/`lit`
     // literals declare none.
     lang.pattern_role(&subject.kind).is_none() && subject.payload.as_str() == Some(name)
+}
+
+/// Whether a pattern binder name is a wildcard — `_`/`_*` bind nothing
+/// (`__fresh_`-prefixed desugar binders exempt), matching
+/// `pattern_match::try_pattern`/`Language::param_bound_names`.
+fn is_wildcard_binder(name: &str) -> bool {
+    name.starts_with('_') && !name.starts_with("__fresh_")
+}
+
+/// The binder name a pattern leaf carries — the payload string, the
+/// same reading `pattern_match::try_pattern`/`param_bound_names` apply
+/// (an object payload like `arr`'s `{name, children}` is *not* a
+/// binder name).
+fn pattern_leaf_name(node: &AstNode) -> Option<&str> {
+    node.payload.as_str()
+}
+
+/// Whether `node` in pattern position is a leaf binder — the
+/// `pattern_role: leaf` declaration, with the `kind == "var"` fallback
+/// `pattern_match::is_binder_node` applies for role-less shapes.
+fn is_pattern_leaf(lang: &Language, node: &AstNode) -> bool {
+    lang.pattern_role(&node.kind) == Some("leaf")
+        || (lang.pattern_role(&node.kind).is_none() && node.kind == "var")
+}
+
+/// Bind the destructured params of a closure params node and return the
+/// param-side type — the type-level counterpart of
+/// `resolve_closure_params`/`param_defs` on the exec side (ADR-0081).
+///
+/// A `sequence`/`entries` params node *is* the single pattern (one
+/// argument consumed whole); anything else is a params list whose
+/// top-level children are positional params — plain binders get a fresh
+/// meta exactly like the plain-param path, patterns recurse through
+/// [`bind_pattern_node`], and a trailing `rest` param takes
+/// `type.array{element: meta}`. Multi-param arrows keep the positional
+/// `type.array{elements: [...]}` encoding; a lone param keeps the unary
+/// shape.
+fn bind_closure_param_patterns(
+    lang: &Language,
+    ast: &Ast,
+    params_ref: AstRef,
+    ctx: &mut TypecheckContext,
+) -> Result<Value, LangError> {
+    let node = ast.get(params_ref).ok_or_else(|| {
+        LangError::engine(format!(
+            "typecheck: destructured params node {} out of bounds",
+            params_ref.index()
+        ))
+    })?;
+    if matches!(
+        lang.pattern_role(&node.kind),
+        Some("sequence") | Some("entries")
+    ) {
+        return bind_pattern_node(lang, ast, node, ctx, None);
+    }
+    let tops = lang.top_level_param_refs(ast, params_ref)?;
+    let mut elem_tys: Vec<Value> = Vec::with_capacity(tops.len());
+    let mut rest_ty: Option<Value> = None;
+    for top in tops {
+        let tnode = ast.get(top).ok_or_else(|| {
+            LangError::engine("typecheck: destructured param out of bounds".to_string())
+        })?;
+        if lang.pattern_role_is(&tnode.kind, "rest") == Some(true) {
+            // `...rest` binds the surplus args as an array; its subject
+            // pattern sees that tail array (a plain `var` subject binds
+            // the name to the array type directly).
+            let elem = meta_value(ctx.fresh_meta());
+            let arr = ctx
+                .registry
+                .construct("type.array", &serde_json::json!({"element": elem}))
+                .ok_or_else(|| {
+                    LangError::engine(
+                        "typecheck: destructured rest: construct failed for type.array".to_string(),
+                    )
+                })?;
+            if let Some(sref) = role_child_ref(lang, tnode, "subject")
+                && let Some(snode) = ast.get(sref)
+            {
+                bind_pattern_node(lang, ast, snode, ctx, Some(&arr))?;
+            }
+            rest_ty = Some(arr);
+        } else {
+            elem_tys.push(bind_pattern_node(lang, ast, tnode, ctx, None)?);
+        }
+    }
+    if elem_tys.len() == 1 && rest_ty.is_none() {
+        return Ok(elem_tys.pop().unwrap_or(Value::Null));
+    }
+    let mut elems = elem_tys;
+    if let Some(rest) = rest_ty {
+        elems.push(rest);
+    }
+    ctx.registry
+        .construct("type.array", &serde_json::json!({"elements": elems}))
+        .ok_or_else(|| {
+            LangError::engine(
+                "typecheck: destructured params: construct failed for type.array".to_string(),
+            )
+        })
+}
+
+/// Bind one destructured-parameter pattern and return the type its
+/// scrutinee must have — the typing counterpart of
+/// `pattern_match::try_pattern` (ADR-0061/0081), dispatched on
+/// `AstShapeDef::pattern_role`:
+///
+/// - `leaf`/`var` binders extend `ctx` with `expected` (or a fresh meta)
+///   unless wildcard; `rest` recurses into its `subject` against the
+///   tail-array type its parent built.
+/// - `sequence` (`[p, …, ...r]`) is `type.array{elements: [...]}`, or
+///   `type.array{element: meta}` when a rest child widens it — the same
+///   two encodings `synth_function`'s array-pattern path uses.
+/// - `entries` (`{k: p, …}`) is `type.record{fields: {k: T(p)}}`; the
+///   rest record and computed keys degrade to fresh metas.
+/// - `subject`-roled wrappers (`type-annot`-like) bind through the
+///   subject; `callee`-roled tag patterns bind their non-callee
+///   children to fresh metas; literals bind nothing.
+fn bind_pattern_node(
+    lang: &Language,
+    ast: &Ast,
+    node: &AstNode,
+    ctx: &mut TypecheckContext,
+    expected: Option<&Value>,
+) -> Result<Value, LangError> {
+    let fresh = |ctx: &mut TypecheckContext| meta_value(ctx.fresh_meta());
+    match lang.pattern_role(&node.kind) {
+        Some("leaf") => {
+            let ty = expected.cloned().unwrap_or_else(|| fresh(ctx));
+            if let Some(name) = pattern_leaf_name(node)
+                && !is_wildcard_binder(name)
+            {
+                ctx.extend(name.to_string(), ty.clone());
+            }
+            Ok(ty)
+        }
+        Some("rest") => {
+            if let Some(sref) = role_child_ref(lang, node, "subject")
+                && let Some(snode) = ast.get(sref)
+            {
+                return bind_pattern_node(lang, ast, snode, ctx, expected);
+            }
+            Ok(expected.cloned().unwrap_or_else(|| fresh(ctx)))
+        }
+        Some("sequence") => {
+            let mut positional: Vec<AstRef> = Vec::new();
+            let mut rest_ref: Option<AstRef> = None;
+            if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
+                for entry in children {
+                    let Some(idx) = entry.as_u64() else { continue };
+                    let r = AstRef::new(idx as usize);
+                    let Some(cn) = ast.get(r) else { continue };
+                    if lang.pattern_role_is(&cn.kind, "rest") == Some(true) {
+                        rest_ref = Some(r);
+                    } else {
+                        positional.push(r);
+                    }
+                }
+            }
+            // With a rest tail the array is homogeneous — every
+            // positional binder shares the element meta (the same
+            // reading `synth_function`'s array-pattern branch uses).
+            let elem_hint = rest_ref.is_some().then(|| meta_value(ctx.fresh_meta()));
+            let mut elems = Vec::with_capacity(positional.len());
+            for r in positional {
+                let pn = ast.get(r).ok_or_else(|| {
+                    LangError::engine(
+                        "typecheck: destructured param pattern child out of bounds".to_string(),
+                    )
+                })?;
+                elems.push(bind_pattern_node(lang, ast, pn, ctx, elem_hint.as_ref())?);
+            }
+            if let Some(rr) = rest_ref {
+                let elem = elem_hint.unwrap_or_else(|| meta_value(ctx.fresh_meta()));
+                let arr = ctx
+                    .registry
+                    .construct("type.array", &serde_json::json!({"element": elem}))
+                    .ok_or_else(|| {
+                        LangError::engine(
+                            "typecheck: destructured param: construct failed for type.array"
+                                .to_string(),
+                        )
+                    })?;
+                let rn = ast.get(rr).ok_or_else(|| {
+                    LangError::engine(
+                        "typecheck: destructured rest pattern out of bounds".to_string(),
+                    )
+                })?;
+                if let Some(sref) = role_child_ref(lang, rn, "subject")
+                    && let Some(snode) = ast.get(sref)
+                {
+                    bind_pattern_node(lang, ast, snode, ctx, Some(&arr))?;
+                }
+                return Ok(arr);
+            }
+            ctx.registry
+                .construct("type.array", &serde_json::json!({"elements": elems}))
+                .ok_or_else(|| {
+                    LangError::engine(
+                        "typecheck: destructured param: construct failed for type.array"
+                            .to_string(),
+                    )
+                })
+        }
+        Some("entries") => {
+            let mut fields = serde_json::Map::new();
+            let mut rest_ref: Option<AstRef> = None;
+            if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
+                for entry in children {
+                    let Some(idx) = entry.as_u64() else { continue };
+                    let r = AstRef::new(idx as usize);
+                    let Some(cn) = ast.get(r) else { continue };
+                    if lang.pattern_role_is(&cn.kind, "rest") == Some(true) {
+                        rest_ref = Some(r);
+                        continue;
+                    }
+                    // Shorthand entry (`{x, y}` parses the `var` itself as
+                    // the object child — key and binder are the same
+                    // name): the field is `x` and the value pattern is
+                    // the `var` leaf, matching `param_bound_names`.
+                    if lang.pattern_role_is(&cn.kind, "entry") != Some(true)
+                        && is_pattern_leaf(lang, cn)
+                    {
+                        if let Some(name) = pattern_leaf_name(cn)
+                            && !is_wildcard_binder(name)
+                        {
+                            let ty = meta_value(ctx.fresh_meta());
+                            ctx.extend(name.to_string(), ty.clone());
+                            fields.insert(name.to_string(), ty);
+                        }
+                        continue;
+                    }
+                    // `entry` nodes contribute `key → value-pattern`;
+                    // anything else is skipped (computed keys cannot be
+                    // named statically — the value pattern still binds).
+                    let key = role_child_ref(lang, cn, "key")
+                        .and_then(|k| ast.get(k))
+                        .and_then(pattern_leaf_name)
+                        .map(str::to_string);
+                    if let Some(vref) = role_child_ref(lang, cn, "value")
+                        && let Some(vnode) = ast.get(vref)
+                    {
+                        let ty = bind_pattern_node(lang, ast, vnode, ctx, None)?;
+                        if let Some(k) = key {
+                            fields.insert(k, ty);
+                        }
+                    } else if lang.pattern_role_is(&cn.kind, "entry") != Some(true) {
+                        // Keyless child that is not a leaf (e.g. a nested
+                        // pattern used directly) — bind its names even
+                        // though no static field key exists.
+                        bind_pattern_node(lang, ast, cn, ctx, None)?;
+                    }
+                }
+            }
+            if let Some(rr) = rest_ref {
+                // The rest record's leftover fields are unknowable
+                // statically — a fresh meta keeps the binder permissive.
+                let rest_ty = meta_value(ctx.fresh_meta());
+                let rn = ast.get(rr).ok_or_else(|| {
+                    LangError::engine(
+                        "typecheck: destructured rest pattern out of bounds".to_string(),
+                    )
+                })?;
+                if let Some(sref) = role_child_ref(lang, rn, "subject")
+                    && let Some(snode) = ast.get(sref)
+                {
+                    bind_pattern_node(lang, ast, snode, ctx, Some(&rest_ty))?;
+                }
+            }
+            ctx.registry
+                .construct(
+                    "type.record",
+                    &serde_json::json!({"fields": Value::Object(fields)}),
+                )
+                .ok_or_else(|| {
+                    LangError::engine(
+                        "typecheck: destructured param: construct failed for type.record"
+                            .to_string(),
+                    )
+                })
+        }
+        Some("entry") => {
+            // Reached directly — bind through the `value` role (the
+            // `key` child is a literal, never a binder).
+            if let Some(vref) = role_child_ref(lang, node, "value")
+                && let Some(vnode) = ast.get(vref)
+            {
+                return bind_pattern_node(lang, ast, vnode, ctx, expected);
+            }
+            Ok(expected.cloned().unwrap_or_else(|| fresh(ctx)))
+        }
+        _ => {
+            // `var` leaves on role-less shapes keep the legacy binder
+            // reading (`is_pattern_leaf`'s `kind == "var"` fallback).
+            if is_pattern_leaf(lang, node) {
+                let ty = expected.cloned().unwrap_or_else(|| fresh(ctx));
+                if let Some(name) = pattern_leaf_name(node)
+                    && !is_wildcard_binder(name)
+                {
+                    ctx.extend(name.to_string(), ty.clone());
+                }
+                return Ok(ty);
+            }
+            // `subject`-roled wrappers (`type-annot`-like) bind through
+            // the subject — the same reading `param_name` applies.
+            if let Some(sref) = role_child_ref(lang, node, "subject")
+                && let Some(snode) = ast.get(sref)
+            {
+                return bind_pattern_node(lang, ast, snode, ctx, expected);
+            }
+            // `callee`-roled tag patterns (`Ctor(x, y)`): the arg
+            // children bind to fresh metas; the scrutinee's ctor type
+            // is not statically known here.
+            if lang
+                .child_role_index(&node.kind, "callee")
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let callee_pos = lang
+                    .child_role_index_for(node, "callee")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
+                    for (i, entry) in children.iter().enumerate() {
+                        if i == callee_pos {
+                            continue;
+                        }
+                        let Some(idx) = entry.as_u64() else { continue };
+                        if let Some(cn) = ast.get(AstRef::new(idx as usize)) {
+                            bind_pattern_node(lang, ast, cn, ctx, None)?;
+                        }
+                    }
+                }
+            }
+            // Literal/other patterns bind nothing — the position gets a
+            // fresh meta.
+            Ok(expected.cloned().unwrap_or_else(|| fresh(ctx)))
+        }
+    }
 }
 
 /// Encode a metavariable id as `{"__meta__": id}`.

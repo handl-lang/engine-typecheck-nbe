@@ -317,9 +317,6 @@ fn eval_body_node(
             let Some(pnode) = ast.get(params_idx) else {
                 return Ok(stuck_val("function", vec![]));
             };
-            let Ok((names, _rest)) = lang.param_names(ast, pnode) else {
-                return Ok(stuck_val("function", vec![]));
-            };
             let env_vals: std::collections::HashMap<Rc<str>, Value> = env
                 .iter()
                 .map(|(k, v)| {
@@ -336,9 +333,64 @@ fn eval_body_node(
             let sub = ast
                 .instantiate(body_idx, lang, &env_vals)
                 .map_err(|e| EvalError::Op(format!("apply_arrow: instantiate: {e}")))?;
+            let body_def = TaggedValue::from(handl_language::ast_value(&sub));
+            // Destructured/array-pattern params cannot be spelled as a
+            // positional `params` list — mint the boundary arrow value
+            // instead, carrying `param_defs`/`array_pattern` exactly
+            // like `resolve_closure_params` does on the exec side
+            // (ADR-0081). `params` holds the flattened bound names.
+            // `apply_body_value` interprets them via `try_pattern_val`.
+            if lang.param_contains_patterns(ast, pnode) || lang.is_array_pattern(pnode) {
+                // `params` carries the flattened bound names (exec's
+                // `ClosureParams::names`): `param_names` for the plain
+                // array-pattern path, `param_bound_names` when patterns
+                // are present (rest bindings live inside `param_defs`).
+                let (names, rest) = if lang.param_contains_patterns(ast, pnode) {
+                    (lang.param_bound_names(ast, pnode).unwrap_or_default(), None)
+                } else {
+                    lang.param_names(ast, pnode).unwrap_or_default()
+                };
+                let params_sub = ast
+                    .subtree(params_idx)
+                    .map_err(|e| EvalError::Op(format!("apply_arrow: params subtree: {e}")))?;
+                let arrow = TaggedValue::Arrow {
+                    params: names.into(),
+                    rest: rest.map(Rc::from),
+                    array_pattern: lang.param_single_sequence(ast, params_idx)
+                        || lang.is_array_pattern(pnode),
+                    param_defs: if lang.param_contains_patterns(ast, pnode) {
+                        Some(Rc::new(TaggedValue::from(handl_language::ast_value(
+                            &params_sub,
+                        ))))
+                    } else {
+                        None
+                    },
+                    body_def: Rc::new(body_def),
+                    binds: Rc::new(
+                        env.iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.clone(),
+                                    handl_value::nbe::quote(
+                                        &handl_value::nbe::MetaStore::default(),
+                                        0,
+                                        v,
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    handlers: Rc::from(Vec::new()),
+                    sig: None,
+                };
+                return Ok(Val::Const(arrow));
+            }
+            let Ok((names, _rest)) = lang.param_names(ast, pnode) else {
+                return Ok(stuck_val("function", vec![]));
+            };
             Ok(Val::Arrow(Rc::new(ArrowVal {
                 params: names.into(),
-                body_def: TaggedValue::from(handl_language::ast_value(&sub)),
+                body_def,
                 binds: Rc::new(env.clone()),
             })))
         }
@@ -580,21 +632,52 @@ fn apply_body_value(
         };
         let arrow: Rc<ArrowVal> = match f {
             Val::Arrow(a) => a,
-            Val::Const(TaggedValue::Arrow {
-                params,
-                body_def,
-                binds,
-                ..
-            }) => Rc::new(ArrowVal {
-                params,
-                body_def: (*body_def).clone(),
-                binds: Rc::new(
-                    binds
-                        .iter()
-                        .map(|(k, v)| (k.clone(), Val::Const(v.clone())))
-                        .collect(),
-                ),
-            }),
+            Val::Const(tv) => {
+                // Boundary arrows carrying destructured params
+                // (`param_defs` — `([x, y]) ~>`, `({a, b}) ~>`) or the
+                // plain `array_pattern` flag (`[x, y] ~>`) cannot be
+                // spelled as a positional `params` list — apply them
+                // through the pattern matcher instead of degrading to
+                // first-param-binds-all (the `ArrowVal` projection
+                // would lose `param_defs`/`array_pattern`/`rest`).
+                if matches!(
+                    &tv,
+                    TaggedValue::Arrow {
+                        param_defs: Some(_),
+                        ..
+                    } | TaggedValue::Arrow {
+                        array_pattern: true,
+                        ..
+                    }
+                ) {
+                    let mut all_args = Vec::with_capacity(args.size_hint().0 + 1);
+                    all_args.push(arg);
+                    all_args.extend(args);
+                    return apply_destructured_arrow(tv, all_args, lang, fuel, lvl);
+                }
+                match tv {
+                    TaggedValue::Arrow {
+                        params,
+                        body_def,
+                        binds,
+                        ..
+                    } => Rc::new(ArrowVal {
+                        params,
+                        body_def: (*body_def).clone(),
+                        binds: Rc::new(
+                            binds
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Val::Const(v.clone())))
+                                .collect(),
+                        ),
+                    }),
+                    other => {
+                        let mut stuck = vec![Val::Const(other), arg];
+                        stuck.extend(args);
+                        return Ok(stuck_val("call", stuck));
+                    }
+                }
+            }
             Val::Rigid { lvl, spine } => {
                 let mut s = spine;
                 s.push(arg);
@@ -657,6 +740,361 @@ fn apply_body_value(
         }
         *fuel -= 1;
         f = eval_body_node(&ast, AstRef::new(ast.len() - 1), &env2, lang, fuel, lvl)?;
+    }
+}
+
+/// Apply a boundary arrow carrying destructured params — `param_defs`
+/// (`([x, y]) ~>`, `({a, b}) ~>`, `[x, [y, z]] ~>`) or the plain
+/// `array_pattern` flag (`[x, y] ~>`) — to `args`. Mirrors
+/// `apply_arrow_patterns`/`resolve_closure_params` on the exec side
+/// (ADR-0081): the `param_defs` arena's top-level patterns each match
+/// their argument via [`try_pattern_val`], a trailing `rest` pattern
+/// binds the surplus tail, and surplus args past the fixed patterns
+/// curry through [`apply_body_value`]. Arity/pattern mismatches
+/// produce `stuck.call`/`stuck.match` neutrals rather than errors —
+/// the NBE domain's honest-open convention.
+fn apply_destructured_arrow(
+    arrow: TaggedValue,
+    args: Vec<Val>,
+    lang: Option<&Language>,
+    fuel: &mut u32,
+    lvl: Lvl,
+) -> Result<Val, EvalError> {
+    let TaggedValue::Arrow {
+        params,
+        rest,
+        param_defs,
+        body_def,
+        binds,
+        ..
+    } = &arrow
+    else {
+        return Err(EvalError::Op("apply_arrow: not an arrow value".into()));
+    };
+    let (params, rest, param_defs, body_def, binds) = (
+        params.clone(),
+        rest.clone(),
+        param_defs.clone(),
+        body_def.clone(),
+        binds.clone(),
+    );
+    let stuck_call = |args: Vec<Val>| {
+        Ok(stuck_val(
+            "call",
+            std::iter::once(Val::Const(arrow.clone()))
+                .chain(args)
+                .collect(),
+        ))
+    };
+    let mut env2: FxHashMap<Rc<str>, Val> = binds
+        .iter()
+        .map(|(k, v)| (k.clone(), Val::Const(v.clone())))
+        .collect();
+    let mut curry: Vec<Val> = Vec::new();
+    if let Some(pd) = &param_defs {
+        let Some(lang) = lang else {
+            return stuck_call(args);
+        };
+        let pat_ast = decode_body(pd)?;
+        if pat_ast.is_empty() {
+            return stuck_call(args);
+        }
+        // The params-node subtree's root is the last arena node —
+        // the same convention `body_def` uses.
+        let params_ref = AstRef::new(pat_ast.len() - 1);
+        let tops = lang
+            .top_level_param_refs(&pat_ast, params_ref)
+            .map_err(|e| EvalError::Op(format!("apply_arrow: param_defs: {e}")))?;
+        let root = pat_ast
+            .get(params_ref)
+            .ok_or_else(|| EvalError::Op("apply_arrow: param_defs root".into()))?;
+        let root_is_pattern = matches!(
+            lang.pattern_role(&root.kind),
+            Some("sequence") | Some("entries")
+        );
+        if root_is_pattern {
+            // Single pattern (`[x, y] ~>`, `{a, b} ~>`): one scrutinee,
+            // surplus args curry.
+            let Some(scrut) = args.first() else {
+                return stuck_call(args);
+            };
+            curry = args[1..].to_vec();
+            if !try_pattern_val(lang, &pat_ast, params_ref, scrut, &mut env2)? {
+                return Ok(stuck_val("match", vec![scrut.clone()]));
+            }
+        } else {
+            // Params list: top-level children are positional patterns;
+            // a `rest` pattern (at most one, last) binds the surplus
+            // tail as an array.
+            let mut fixed: Vec<AstRef> = Vec::with_capacity(tops.len());
+            let mut rest_ref: Option<AstRef> = None;
+            for t in tops {
+                let n = pat_ast
+                    .get(t)
+                    .ok_or_else(|| EvalError::Op("apply_arrow: param_defs child".into()))?;
+                if lang.pattern_role_is(&n.kind, "rest") == Some(true) {
+                    if rest_ref.is_some() {
+                        return Err(EvalError::Op("apply_arrow: multiple rest params".into()));
+                    }
+                    rest_ref = Some(t);
+                } else {
+                    fixed.push(t);
+                }
+            }
+            if args.len() < fixed.len() {
+                return stuck_call(args);
+            }
+            for (i, pat_ref) in fixed.iter().enumerate() {
+                if !try_pattern_val(lang, &pat_ast, *pat_ref, &args[i], &mut env2)? {
+                    return Ok(stuck_val("match", vec![args[i].clone()]));
+                }
+            }
+            let split = fixed.len();
+            if let Some(rr) = rest_ref {
+                // The tail binds as an array *value* — `Val`s quote back
+                // to tagged data (`__neutral__` for open terms).
+                let tail_vals: Vec<TaggedValue> = args[split..]
+                    .iter()
+                    .map(|v| {
+                        handl_value::nbe::quote(&handl_value::nbe::MetaStore::default(), lvl, v)
+                    })
+                    .collect();
+                let tail = Val::Const(TaggedValue::Arr(Rc::from(tail_vals)));
+                bind_rest_pattern_val(lang, &pat_ast, rr, tail, &mut env2)?;
+            } else if args.len() > split {
+                curry = args[split..].to_vec();
+            }
+        }
+    } else {
+        // `array_pattern` (`[x, y] ~>`, `[x, ...rest] ~>`): one array
+        // argument destructured positionally — fixed names bind to
+        // leading elements, the rest binding receives the tail.
+        if args.len() != 1 {
+            return stuck_call(args);
+        }
+        let Val::Const(TaggedValue::Arr(arr)) = &args[0] else {
+            return stuck_call(args);
+        };
+        let fixed = params.len();
+        if arr.len() < fixed || (rest.is_none() && arr.len() != fixed) {
+            return stuck_call(args);
+        }
+        let (head, tail) = arr.split_at(fixed);
+        for (i, p) in params.iter().enumerate() {
+            env2.insert(Rc::from(p.as_str()), Val::Const(head[i].clone()));
+        }
+        if let Some(r) = &rest {
+            env2.insert(
+                r.clone(),
+                Val::Const(TaggedValue::Arr(Rc::from(tail.to_vec()))),
+            );
+        }
+    }
+    let body_ast = decode_body(&body_def)?;
+    if body_ast.is_empty() {
+        return stuck_call(args);
+    }
+    if *fuel == 0 {
+        return Ok(stuck_val("fuel", vec![]));
+    }
+    *fuel -= 1;
+    let mut result = eval_body_node(
+        &body_ast,
+        AstRef::new(body_ast.len() - 1),
+        &env2,
+        lang,
+        fuel,
+        lvl,
+    )?;
+    if !curry.is_empty() {
+        result = apply_body_value(result, curry, lang, fuel, lvl)?;
+    }
+    Ok(result)
+}
+
+/// Bind a `rest` pattern node's subject against the tail value — a
+/// plain `var` subject binds the name directly (wildcards bind
+/// nothing); anything else recurses through [`try_pattern_val`],
+/// matching exec's `rest` handling in `apply_arrow_patterns`.
+fn bind_rest_pattern_val(
+    lang: &Language,
+    ast: &Ast,
+    rest_ref: AstRef,
+    tail: Val,
+    env: &mut FxHashMap<Rc<str>, Val>,
+) -> Result<(), EvalError> {
+    let rn = ast
+        .get(rest_ref)
+        .ok_or_else(|| EvalError::Op("apply_arrow: rest pattern".into()))?;
+    let Some(sref) = crate::role_child_ref(lang, rn, "subject") else {
+        return Ok(());
+    };
+    let snode = ast
+        .get(sref)
+        .ok_or_else(|| EvalError::Op("apply_arrow: rest subject".into()))?;
+    let is_leaf = lang.pattern_role(&snode.kind) == Some("leaf")
+        || (lang.pattern_role(&snode.kind).is_none() && snode.kind == "var");
+    if is_leaf && let Some(name) = snode.payload.as_str() {
+        if !crate::is_wildcard_binder(name) {
+            env.insert(Rc::from(name), tail);
+        }
+        return Ok(());
+    }
+    try_pattern_val(lang, ast, sref, &tail, env).map(|_| ())
+}
+
+/// `pattern_match::try_pattern` over the `Val` domain: leaf binders
+/// bind *any* scrutinee (irrefutable — including `Flex`/`Rigid`
+/// neutrals); `sequence`/`entries` patterns need a `Const` array/object
+/// scrutinee and recurse element/field-wise; `subject`-roled wrappers
+/// (`type-annot`-like) unwrap; role-less `var` keeps the legacy binder
+/// reading. Tag (`callee`-roled) and literal patterns report no match
+/// rather than guess — the caller surfaces a `stuck.match` neutral.
+fn try_pattern_val(
+    lang: &Language,
+    ast: &Ast,
+    pat: AstRef,
+    scrut: &Val,
+    env: &mut FxHashMap<Rc<str>, Val>,
+) -> Result<bool, EvalError> {
+    let node = ast
+        .get(pat)
+        .ok_or_else(|| EvalError::Op("apply_arrow: pattern node out of bounds".into()))?;
+    match lang.pattern_role(&node.kind) {
+        Some("leaf") => {
+            let Some(name) = node.payload.as_str() else {
+                return Ok(false);
+            };
+            if crate::is_wildcard_binder(name) {
+                return Ok(true);
+            }
+            env.insert(Rc::from(name), scrut.clone());
+            Ok(true)
+        }
+        Some("rest") => {
+            // A `rest` node reached directly matches its subject
+            // against the (already tail-array) scrutinee.
+            match crate::role_child_ref(lang, node, "subject") {
+                Some(sref) => try_pattern_val(lang, ast, sref, scrut, env),
+                None => Ok(true),
+            }
+        }
+        Some("sequence") => {
+            let Val::Const(TaggedValue::Arr(arr)) = scrut else {
+                return Ok(false);
+            };
+            let mut positional: Vec<AstRef> = Vec::new();
+            let mut rest_ref: Option<AstRef> = None;
+            if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
+                for entry in children {
+                    let Some(idx) = entry.as_u64() else { continue };
+                    let r = AstRef::new(idx as usize);
+                    let Some(cn) = ast.get(r) else { continue };
+                    if lang.pattern_role_is(&cn.kind, "rest") == Some(true) {
+                        rest_ref = Some(r);
+                    } else {
+                        positional.push(r);
+                    }
+                }
+            }
+            let n = positional.len();
+            if (rest_ref.is_none() && arr.len() != n) || arr.len() < n {
+                return Ok(false);
+            }
+            for (i, pr) in positional.iter().enumerate() {
+                if !try_pattern_val(lang, ast, *pr, &Val::Const(arr[i].clone()), env)? {
+                    return Ok(false);
+                }
+            }
+            if let Some(rr) = rest_ref {
+                let tail = Val::Const(TaggedValue::Arr(Rc::from(arr[n..].to_vec())));
+                bind_rest_pattern_val(lang, ast, rr, tail, env)?;
+            }
+            Ok(true)
+        }
+        Some("entries") => {
+            let Val::Const(TaggedValue::Obj(obj)) = scrut else {
+                return Ok(false);
+            };
+            let mut rest_ref: Option<AstRef> = None;
+            let mut entries: Vec<(String, AstRef)> = Vec::new();
+            if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
+                for entry in children {
+                    let Some(idx) = entry.as_u64() else { continue };
+                    let r = AstRef::new(idx as usize);
+                    let Some(cn) = ast.get(r) else { continue };
+                    if lang.pattern_role_is(&cn.kind, "rest") == Some(true) {
+                        rest_ref = Some(r);
+                        continue;
+                    }
+                    // `entry` nodes: literal `key` child names the
+                    // field, `value` child is the sub-pattern. A
+                    // computed key cannot be resolved statically —
+                    // report no match rather than guess.
+                    let Some(kref) = crate::role_child_ref(lang, cn, "key") else {
+                        continue;
+                    };
+                    let Some(knode) = ast.get(kref) else { continue };
+                    let Some(key) = knode.payload.as_str().map(str::to_string) else {
+                        return Ok(false);
+                    };
+                    let Some(vref) = crate::role_child_ref(lang, cn, "value") else {
+                        continue;
+                    };
+                    entries.push((key, vref));
+                }
+            }
+            let mut matched: Vec<String> = Vec::with_capacity(entries.len());
+            for (key, vref) in &entries {
+                let Some(field) = obj.get(key.as_str()) else {
+                    return Ok(false);
+                };
+                matched.push(key.clone());
+                if !try_pattern_val(lang, ast, *vref, &Val::Const(field.clone()), env)? {
+                    return Ok(false);
+                }
+            }
+            if let Some(rr) = rest_ref {
+                let rest_obj: rustc_hash::FxHashMap<Rc<str>, TaggedValue> = obj
+                    .iter()
+                    .filter(|(k, _)| !matched.iter().any(|m| m.as_str() == k.as_ref()))
+                    .map(|(k, v)| (Rc::clone(k), v.clone()))
+                    .collect();
+                bind_rest_pattern_val(
+                    lang,
+                    ast,
+                    rr,
+                    Val::Const(TaggedValue::Obj(Rc::new(rest_obj))),
+                    env,
+                )?;
+            }
+            Ok(true)
+        }
+        Some("entry") => {
+            // Reached directly — the `value` child holds the pattern.
+            match crate::role_child_ref(lang, node, "value") {
+                Some(vref) => try_pattern_val(lang, ast, vref, scrut, env),
+                None => Ok(false),
+            }
+        }
+        _ => {
+            // Role-less `var` keeps the legacy binder reading
+            // (`is_binder_node`'s `kind == "var"` fallback).
+            if lang.pattern_role(&node.kind).is_none() && node.kind == "var" {
+                let Some(name) = node.payload.as_str() else {
+                    return Ok(false);
+                };
+                if !crate::is_wildcard_binder(name) {
+                    env.insert(Rc::from(name), scrut.clone());
+                }
+                return Ok(true);
+            }
+            // `subject`-roled wrappers (`type-annot`-like) unwrap.
+            if let Some(sref) = crate::role_child_ref(lang, node, "subject") {
+                return try_pattern_val(lang, ast, sref, scrut, env);
+            }
+            Ok(false)
+        }
     }
 }
 

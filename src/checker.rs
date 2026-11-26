@@ -1214,17 +1214,29 @@ pub fn lift(lvl: Lvl, tv: &TaggedValue) -> Val {
             params,
             body_def,
             binds,
+            param_defs,
+            array_pattern,
             ..
-        } => Val::Arrow(Rc::new(ArrowVal {
-            params: params.clone(),
-            body_def: (**body_def).clone(),
-            binds: Rc::new(
-                binds
-                    .iter()
-                    .map(|(k, v)| (k.clone(), lift(lvl, v)))
-                    .collect(),
-            ),
-        })),
+        } => {
+            // Destructured/array-pattern arrows cannot be spelled as a
+            // positional `params` list — `ArrowVal` has no `param_defs`/
+            // `array_pattern`/`rest` channel, so projecting would lose
+            // the destructuring and mis-bind at apply. Keep the boundary
+            // value whole; `judgments::apply_body_value` interprets it.
+            if param_defs.is_some() || *array_pattern {
+                return Val::Const(tv.clone());
+            }
+            Val::Arrow(Rc::new(ArrowVal {
+                params: params.clone(),
+                body_def: (**body_def).clone(),
+                binds: Rc::new(
+                    binds
+                        .iter()
+                        .map(|(k, v)| (k.clone(), lift(lvl, v)))
+                        .collect(),
+                ),
+            }))
+        }
         TaggedValue::Obj(m) => {
             // The `__tag__` bridge (ADR-0154 §3 / spec WS-E): a legacy
             // tagged type value `{"__tag__": t}` lifts to `Nominal(t)`;

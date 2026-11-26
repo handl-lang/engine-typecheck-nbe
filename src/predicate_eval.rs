@@ -732,6 +732,14 @@ fn function_param_body(ast: &Ast, node: &AstNode, lang: &Language) -> Option<(Ve
     let param_idx = children[0].as_u64()? as usize;
     let body_idx = children[1].as_u64()? as usize;
     let param_node = ast.get(AstRef::new(param_idx))?;
+    // `param_bound_names` resolves plain params *and* flattens
+    // destructured patterns (`([a, b]) ~>`, `({x, y}) ~>`) to the same
+    // binder set exec's `param_defs` application binds (ADR-0081) —
+    // `param_name`/`param_names` cannot spell patterns and degraded
+    // to empty names here.
+    if let Ok(names) = lang.param_bound_names(ast, param_node) {
+        return Some((names, body_idx));
+    }
     // A bare `var` (or `type-annot` wrapping one) carries the name directly;
     // a `paren`/`array` wrapper holds multiple `var` children.
     let names = if let Ok(name) = lang.param_name(ast, param_node) {
