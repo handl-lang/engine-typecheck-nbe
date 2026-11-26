@@ -238,6 +238,47 @@ fn graded_arrow_mode_descriptor() {
     );
 }
 
+/// PL-0004 E0: `Effects` is the canonical effect-row algebra head —
+/// `~[Effects(S)]~>` mints a `type.mode` descriptor selecting
+/// `mode.algebra.Effects` (the `globals.yaml` instance M2/M3 read).
+/// The grade payload `S` evaluates through the same annotation
+/// evaluator call-head modes use; record-row payloads elaborate in
+/// E1 (`@ [Effects(S)]`), so E0 covers the descriptor + registry
+/// path, not inline row literals.
+#[test]
+fn graded_arrow_effects_mode_descriptor() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            // `Effects` must be a bound name for the grade child to
+            // synthesize — the `new Algebra(…)` declaration kit will
+            // carry. (The `new` instance table and the
+            // `mode.algebra.*` globals registry are still disjoint —
+            // the M2/M3 bridge gap; the descriptor head is what
+            // selects `mode.algebra.Effects` here.)
+            "Algebra<c : Type> := { mkAlgebra : (compose : c ~> c ~> c, unit : c, order : c ~> c ~> Bool) ~> Algebra }",
+            "Effects := new Algebra(Nat) { compose: (a, b) ~> a, unit: 0, order: (a, b) ~> true }",
+            "S := 0",
+            "dedupe := (g >>> g) ~[Effects(S)]~> g",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "graded arrow with an Effects-headed mode should check, got {:?}",
+        diags_of(&result)
+    );
+    let found = result.node_types.values().any(|t| {
+        let s = serde_json::to_string(t).unwrap_or_default();
+        s.contains("\"name\":\"mode\"") && s.contains("Effects")
+    });
+    assert!(
+        found,
+        "expected a type.mode descriptor carrying head `Effects` in node_types"
+    );
+}
+
 /// `IO<puts, fs>` — the brace-free sig record: bare names declare ops
 /// (`type.unknown` payload), `name : T` declares the payload type.
 /// Widening/coverage rules are identical to `IO<{ … }>`.
