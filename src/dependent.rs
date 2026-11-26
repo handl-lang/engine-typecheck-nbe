@@ -774,6 +774,41 @@ pub(crate) fn domain_quote(v: &Val, ctx: &TypecheckContext) -> Value {
     ))
 }
 
+/// Quote-side counterpart of [`remap_tagged_metas`] (PL-0004 E3):
+/// `domain_quote` spells unsolved domain metas
+/// `{"__neutral__": {"head": "meta", "id": n}}` — the tagged meta
+/// store cannot address domain ids, so each distinct domain meta
+/// re-mints as a fresh `__meta__` (memoized: shared metas stay
+/// shared). Everything else passes through unchanged — the
+/// `__former__`/`__sym__` spellings are already boundary JSON.
+fn quote_domain_metas(v: &Value, map: &mut HashMap<u64, u64>, ctx: &mut TypecheckContext) -> Value {
+    let is_domain_meta = v.as_object().is_some_and(|o| o.len() == 1)
+        && v.get("__neutral__")
+            .and_then(|n| n.get("head"))
+            .and_then(Value::as_str)
+            == Some("meta");
+    if is_domain_meta
+        && let Some(id) = v
+            .get("__neutral__")
+            .and_then(|n| n.get("id"))
+            .and_then(Value::as_u64)
+    {
+        let mid = *map.entry(id).or_insert_with(|| ctx.fresh_meta());
+        return meta_value(mid);
+    }
+    match v {
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), quote_domain_metas(x, map, ctx)))
+                .collect(),
+        ),
+        Value::Array(xs) => {
+            Value::Array(xs.iter().map(|x| quote_domain_metas(x, map, ctx)).collect())
+        }
+        _ => v.clone(),
+    }
+}
+
 /// Whether `v` is a `Former{type.io}` application — either `__former__`
 /// spelling (quote's `{"sym", "args"}` or the surface `{"indices"}`).
 /// Identity is the seeded-sym *handle* (`Sym::seeded("type.io")` spells
@@ -10464,6 +10499,27 @@ impl NbeTypecheckEngine {
         if let Some(mu) = ctx.mode_set_cache.get(&mode_idx) {
             return Ok(mu.clone());
         }
+        // PL-0004 E3: mode metavariables are scoped to one mode
+        // expression's elaboration — `@ m` on two different
+        // ascriptions denotes two *independent* metas (no
+        // cross-binding generalization; the M3.5 annotation-required
+        // discipline). Bound names (results/Γ/globals) never reach
+        // the meta path — they stay rigid var terms.
+        let saved = std::mem::take(&mut ctx.mode_metas);
+        let res = self.elaborate_mode_set_inner(lang, ast, mode_idx, ctx);
+        ctx.mode_metas = saved;
+        res
+    }
+
+    /// [`elaborate_mode_set`](Self::elaborate_mode_set) body — runs
+    /// with `ctx.mode_metas` freshly scoped for this mode expression.
+    fn elaborate_mode_set_inner(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        mode_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
         let node = ast.get(AstRef::new(mode_idx)).ok_or_else(|| {
             LangError::engine(format!("mode_ascribe: mode node {mode_idx} out of bounds"))
         })?;
@@ -10609,20 +10665,17 @@ impl NbeTypecheckEngine {
         }
         // Bare mode element — the whole child is the payload. An
         // unevaluable mode is the honest bound (fresh meta + warning).
+        // PL-0004 E3: an unbound `var` payload already arrived as the
+        // elaboration-scoped mode metavariable (`mode_payload_value`
+        // minted it with the warning); this check is the defensive
+        // leftover for var-term raws that resolve nowhere.
         let raw = self.mode_payload_value(lang, ast, e_idx, ctx);
-        // A bare `var` payload that resolves nowhere is a mode
-        // metavariable — the M3 honest bound: it passes, with a
-        // warning naming the gap (rigid bound vars in `results`/Γ are
-        // legitimate mode polymorphism and stay silent).
         if let Some(name) = raw
             .get("name")
             .and_then(Value::as_str)
             .filter(|_| raw.get("__tag__").and_then(Value::as_str) == Some("var"))
         {
-            let resolvable = ctx.results.contains_key(name)
-                || ctx.lookup(name).is_some()
-                || lang.globals.contains_key(name);
-            if !resolvable {
+            if !Self::mode_name_resolvable(lang, ctx, name) {
                 ctx.diagnostics.push(TypecheckDiagnostic {
                     severity: "warning".to_string(),
                     message: format!(
@@ -10637,6 +10690,28 @@ impl NbeTypecheckEngine {
         em.insert("arg".to_string(), Value::Null);
         em.insert("raw".to_string(), raw);
         Ok((None, Value::Object(em)))
+    }
+
+    /// Whether a mode-expression `var` name resolves to something
+    /// real — a `results` binding, a Γ entry, or a global. Unresolvable
+    /// names are mode metavariables (PL-0004 E3).
+    fn mode_name_resolvable(lang: &Language, ctx: &TypecheckContext, name: &str) -> bool {
+        ctx.results.contains_key(name)
+            || ctx.lookup(name).is_some()
+            || lang.globals.contains_key(name)
+    }
+
+    /// The elaboration-scoped mode metavariable for `name` (PL-0004
+    /// E3): one tagged meta per name per `elaborate_mode_set` call —
+    /// repeated occurrences share it (they unify/substitute), distinct
+    /// ascriptions mint distinct metas.
+    fn mode_meta_id(ctx: &mut TypecheckContext, name: &str) -> u64 {
+        if let Some(id) = ctx.mode_metas.get(name) {
+            return *id;
+        }
+        let id = ctx.fresh_meta();
+        ctx.mode_metas.insert(name.to_string(), id);
+        id
     }
 
     /// A mode payload value: record literals (`{op: A ~> B}` — the
@@ -10675,6 +10750,36 @@ impl NbeTypecheckEngine {
             return self
                 .io_sig(lang, ast, idx, ctx)
                 .unwrap_or_else(|_| honest(ctx));
+        }
+        // PL-0004 E3 mode metavariable: a bare `var` payload that
+        // resolves nowhere mints (or reuses, within this elaboration)
+        // the elaboration-scoped tagged meta — the name then
+        // unifies/substitutes during checking (row-poly `Effects(s)`).
+        // Bound names stay rigid var terms — silent, as before.
+        let mut vn = node;
+        while vn.kind == "paren" {
+            match children_of(vn)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+            {
+                Some(inner) => vn = inner,
+                None => break,
+            }
+        }
+        if vn.kind == "var"
+            && let Some(name) = node_name(vn)
+            && !Self::mode_name_resolvable(lang, ctx, &name)
+        {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: format!(
+                    "mode ascription: mode metavariable `{name}` does not resolve — bound to a fresh meta (honest bound)"
+                ),
+                span: vn.span,
+            });
+            let id = Self::mode_meta_id(ctx, &name);
+            return meta_value(id);
         }
         // Type-expression kinds synthesize as types first (an arrow
         // payload is a *type*, not a closure value); everything else
@@ -10750,9 +10855,12 @@ impl NbeTypecheckEngine {
         Ok(ty)
     }
 
-    // -- PL-0004 E2: ambient-mode consumers --------------------------
+    // -- PL-0004 E2/E3: ambient-mode consumers ------------------------
     //
     // E1 plumbed the `Γ ⊢ t : A @ μ` slot; E2 is its first consumer.
+    // E3 adds mode metavariables (elaboration-scoped `__meta__`s for
+    // unbound `@` vars — they unify/substitute during checking) and
+    // the `Val`-descriptor compose bridge for non-`Effects` heads.
     // The ambient mode is a tagged `type.mode_set` `Value` —
     // `{"__tag__": "type.mode_set", "modes": [{head, arg, raw}, …]}` —
     // distinct from the `Val`-domain `type.mode` descriptors the
@@ -10761,51 +10869,81 @@ impl NbeTypecheckEngine {
     // `{name: A ~> B}` (every entry an operation type — the
     // payload-only `perform` mint is gone on this path).
 
-    /// The `Effects` row of an ambient `type.mode_set` value — the
-    /// `arg` record of the `Effects` element (`{op: A ~> B}` entries).
-    /// `None` when the set has no `Effects` element or its payload is
-    /// not a record (a mode metavariable — the honest bound).
-    fn mode_set_effects_row(mu: &Value) -> Option<Map<String, Value>> {
+    /// The `Effects` element's raw payload (`arg`) of an ambient
+    /// `type.mode_set` value — `Some` for any `Effects` head, record
+    /// *or* symbolic; `None` when the set has no `Effects` element.
+    /// PL-0004 E3 splits "no element" from "symbolic payload" here so
+    /// consumers honest-bound the latter instead of reading it as the
+    /// pure `{}` row.
+    fn mode_set_effects_payload(mu: &Value) -> Option<Value> {
         mu.get("modes")?
             .as_array()?
             .iter()
             .find(|el| el.get("head").and_then(Value::as_str) == Some("Effects"))
             .and_then(|el| el.get("arg"))
-            .and_then(Value::as_object)
             .cloned()
     }
 
-    /// The `(head, arg)` elements of a `type.mode_set` value — `head`
-    /// `None` for bare modes (the `head: null` triple spelling).
-    fn mode_set_elements(mu: &Value) -> Vec<(Option<String>, Value)> {
+    /// A *concrete* `Effects` row payload: a plain record
+    /// (`{op: A ~> B}` entries). Symbolic payloads — `__meta__`
+    /// metavariables (E3 mode metas), `__tag__` var terms (bound mode
+    /// vars), domain-encoded values — are not rows; callers treat
+    /// them as the honest bound.
+    fn plain_effects_row(v: &Value) -> Option<Map<String, Value>> {
+        if v.get("__tag__").is_some() || extract_meta_id(v).is_some() || is_domain_encoded(v) {
+            return None;
+        }
+        v.as_object().cloned()
+    }
+
+    /// The `Effects` row of an ambient `type.mode_set` value — the
+    /// `arg` record of the `Effects` element (`{op: A ~> B}` entries).
+    /// `None` when the set has no `Effects` element *or* its payload is
+    /// symbolic (a mode metavariable / bound mode var — the honest
+    /// bound; [`mode_set_effects_payload`] tells the cases apart).
+    fn mode_set_effects_row(mu: &Value) -> Option<Map<String, Value>> {
+        Self::mode_set_effects_payload(mu).and_then(|p| Self::plain_effects_row(&p))
+    }
+
+    /// The `(head, arg, raw)` elements of a `type.mode_set` value —
+    /// `head` `None` for bare modes (the `head: null` triple
+    /// spelling). `raw` is preserved verbatim: bare modes carry their
+    /// payload there (`arg` is `null`), so dropping it would lose the
+    /// mode value at the next rebuild (PL-0004 E3).
+    fn mode_set_elements(mu: &Value) -> Vec<(Option<String>, Value, Value)> {
         mu.get("modes")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
             .iter()
             .map(|el| {
+                let arg = el.get("arg").cloned().unwrap_or(Value::Null);
+                let raw = el.get("raw").cloned().unwrap_or_else(|| arg.clone());
                 (
                     el.get("head").and_then(Value::as_str).map(str::to_string),
-                    el.get("arg").cloned().unwrap_or(Value::Null),
+                    arg,
+                    raw,
                 )
             })
             .collect()
     }
 
-    /// Rebuild a `type.mode_set` value from `(head, arg)` elements —
-    /// the `{head, arg, raw}` triple spelling `elaborate_mode_set`
-    /// mints (`raw` mirrors `arg`: consumers read `head`/`arg` only).
-    fn mode_set_value(elements: Vec<(Option<String>, Value)>, ctx: &TypecheckContext) -> Value {
+    /// Rebuild a `type.mode_set` value from `(head, arg, raw)`
+    /// elements — the triple spelling `elaborate_mode_set` mints.
+    fn mode_set_value(
+        elements: Vec<(Option<String>, Value, Value)>,
+        ctx: &TypecheckContext,
+    ) -> Value {
         let modes = elements
             .into_iter()
-            .map(|(head, arg)| {
+            .map(|(head, arg, raw)| {
                 let mut em = Map::new();
                 em.insert(
                     "head".to_string(),
                     head.map(Value::String).unwrap_or(Value::Null),
                 );
-                em.insert("arg".to_string(), arg.clone());
-                em.insert("raw".to_string(), arg);
+                em.insert("arg".to_string(), arg);
+                em.insert("raw".to_string(), raw);
                 Value::Object(em)
             })
             .collect();
@@ -10832,8 +10970,9 @@ impl NbeTypecheckEngine {
         ctx: &TypecheckContext,
     ) -> Value {
         let mut elements = base.map(Self::mode_set_elements).unwrap_or_default();
-        elements.retain(|(h, _)| h.as_deref() != Some("Effects"));
-        elements.push((Some("Effects".to_string()), Value::Object(row.clone())));
+        elements.retain(|(h, _, _)| h.as_deref() != Some("Effects"));
+        let row_v = Value::Object(row.clone());
+        elements.push((Some("Effects".to_string()), row_v.clone(), row_v));
         Self::mode_set_value(elements, ctx)
     }
 
@@ -10875,58 +11014,97 @@ impl NbeTypecheckEngine {
     /// element per head): same-head payloads compose — `Effects`
     /// rows union with the E0 entry-merge rule (shared ops must
     /// unify; a decided conflict degrades *that entry* to a fresh
-    /// meta + warning, never the whole row) — heads present on one
-    /// side only pass through. Non-`Effects` shared heads have no
-    /// `Value`-domain compose yet (the `Val`-descriptor
-    /// `mode_compose_vals` machinery is E3's bridge) → honest bound:
-    /// fresh meta payload + warning.
+    /// meta + warning, never the whole row); every other head — and
+    /// bare modes — crosses the `Val`-descriptor bridge (PL-0004 E3;
+    /// [`compose_mode_element`]) — heads present on one side only
+    /// pass through.
     fn mode_sets_compose(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> Value {
         let mut out = Self::mode_set_elements(a);
-        for (hb, argb) in Self::mode_set_elements(b) {
-            match out.iter_mut().find(|(h, _)| *h == hb) {
+        for (hb, argb, rawb) in Self::mode_set_elements(b) {
+            match out.iter_mut().find(|(h, _, _)| *h == hb) {
                 Some(slot) => {
-                    slot.1 = self.compose_mode_payload(hb.as_deref(), &slot.1, &argb, ctx);
+                    let (na, nr) = self.compose_mode_element(
+                        hb.as_deref(),
+                        &slot.1,
+                        &slot.2,
+                        &argb,
+                        &rawb,
+                        ctx,
+                    );
+                    slot.1 = na;
+                    slot.2 = nr;
                 }
-                None => out.push((hb, argb)),
+                None => out.push((hb, argb, rawb)),
             }
         }
         Self::mode_set_value(out, ctx)
     }
 
-    /// One same-head payload composition inside [`mode_sets_compose`].
-    fn compose_mode_payload(
+    /// One same-head element composition inside
+    /// [`mode_sets_compose`] — returns the composed `(arg, raw)`.
+    ///
+    /// `Effects` rows union with the E0 entry-merge rule; a symbolic
+    /// payload (mode metavariable / bound row var) cannot union
+    /// without a solver — honest bound: fresh meta + warning.
+    ///
+    /// Every other head — and bare modes — crosses the `Val`
+    /// -descriptor bridge (PL-0004 E3; the gap E2 flagged): the
+    /// `(head, arg, raw)` triples mint `Former{type.mode}`
+    /// descriptors, [`Checker::mode_compose_vals`] composes them
+    /// under the governing `mode.algebra.*` (canonical default:
+    /// numeric add / record-row union / equality), and the composite
+    /// quotes back — unsolved domain metas re-mint as tagged
+    /// `__meta__`s ([`quote_domain_metas`]) so the honest bound stays
+    /// a unifiable metavariable.
+    fn compose_mode_element(
         &self,
         head: Option<&str>,
-        a: &Value,
-        b: &Value,
+        a_arg: &Value,
+        a_raw: &Value,
+        b_arg: &Value,
+        b_raw: &Value,
         ctx: &mut TypecheckContext,
-    ) -> Value {
-        if head == Some("Effects")
-            && let (Some(ma), Some(mb)) = (a.as_object(), b.as_object())
-        {
-            return Value::Object(self.effects_rows_union(ma, mb, ctx));
-        }
+    ) -> (Value, Value) {
         if head == Some("Effects") {
-            // A non-record `Effects` payload (mode metavariable) —
-            // undecidable, honest bound.
-            ctx.diagnostics.push(TypecheckDiagnostic {
-                severity: "warning".to_string(),
-                message:
-                    "mode compose: `Effects` payload is not a row record — bound to a fresh meta (honest bound)"
-                        .to_string(),
-                span: None,
-            });
-            return meta_value(ctx.fresh_meta());
+            return match (
+                Self::plain_effects_row(a_arg),
+                Self::plain_effects_row(b_arg),
+            ) {
+                (Some(ma), Some(mb)) => {
+                    let row = self.effects_rows_union(&ma, &mb, ctx);
+                    (Value::Object(row.clone()), Value::Object(row))
+                }
+                _ => {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message:
+                            "mode compose: `Effects` payload is not a row record — bound to a fresh meta (honest bound)"
+                                .to_string(),
+                        span: None,
+                    });
+                    let m = meta_value(ctx.fresh_meta());
+                    (m.clone(), m)
+                }
+            };
         }
-        let hname = head.unwrap_or("<default>");
-        ctx.diagnostics.push(TypecheckDiagnostic {
-            severity: "warning".to_string(),
-            message: format!(
-                "mode compose: no ambient compose for algebra `{hname}` — bound to a fresh meta (honest bound; E3 bridges instance-table algebras)"
-            ),
-            span: None,
-        });
-        meta_value(ctx.fresh_meta())
+        // Lift both sides into the `Val` domain (tagged `__meta__`
+        // leaves remap to fresh domain metas), compose the
+        // descriptors, quote the composite back.
+        let la_arg = domain_lift(a_arg, ctx);
+        let la_raw = domain_lift(a_raw, ctx);
+        let lb_arg = domain_lift(b_arg, ctx);
+        let lb_raw = domain_lift(b_raw, ctx);
+        let da = ctx.vcheck.mode_desc(head, la_arg, la_raw);
+        let db = ctx.vcheck.mode_desc(head, lb_arg, lb_raw);
+        let dc = ctx.vcheck.mode_compose_vals(&da, &db);
+        let (_h, ca, cr) = ctx.vcheck.mode_descriptor_parts(&dc);
+        let qa = domain_quote(&ca, ctx);
+        let qr = domain_quote(&cr, ctx);
+        let mut mmap = HashMap::new();
+        (
+            quote_domain_metas(&qa, &mut mmap, ctx),
+            quote_domain_metas(&qr, &mut mmap, ctx),
+        )
     }
 
     /// `Effects` row union with the E0 entry-merge rule (PL-0004 E0;
@@ -10981,16 +11159,78 @@ impl NbeTypecheckEngine {
     /// `Effects` element (pure effects bound = `{}`), are decided
     /// structurally; un-unifiable entries are the honest bound — a
     /// warning, not a rejection.
+    ///
+    /// PL-0004 E3 mode metavariables: an *expected*-side `Effects`
+    /// payload that is an unsolved `__meta__` instantiates to the
+    /// actual row (`?μ := S` — the substitution a row-polymorphic
+    /// ascription performs at the use site; a pure value instantiates
+    /// it to `{}`). A *symbolic actual* row (mode metavariable or
+    /// bound row var) cannot be enumerated — honest bound, warning +
+    /// pass; a symbolic *expected* row that is not a meta is likewise
+    /// undecidable — warning + pass (previously it read as the empty
+    /// row and rejected every effect).
     pub(crate) fn check_mode_subsumption(
         &self,
         actual: &Value,
         expected: &Value,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
-        let Some(a_row) = Self::mode_set_effects_row(actual) else {
+        let a_pay = Self::mode_set_effects_payload(actual).map(|p| self.zonk(&p, ctx));
+        let e_pay = Self::mode_set_effects_payload(expected).map(|p| self.zonk(&p, ctx));
+        let a_row = a_pay.as_ref().and_then(Self::plain_effects_row);
+        // Expected-side metavariable instantiation — only when the
+        // actual row is known (concrete record, or genuinely pure).
+        let actual_known = a_row.is_some() || a_pay.is_none();
+        if actual_known && let Some(ep) = e_pay.as_ref().filter(|p| extract_meta_id(p).is_some()) {
+            let row = a_row.clone().unwrap_or_default();
+            let mark = ctx.store_mark();
+            if self.dep_unify(ep, &Value::Object(row), ctx).is_ok() {
+                return Ok(());
+            }
+            ctx.store_restore(mark);
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message:
+                    "mode subsumption: expected `Effects` row metavariable would not instantiate — passing (honest bound)"
+                        .to_string(),
+                span: None,
+            });
+            return Ok(());
+        }
+        let Some(a_row) = a_row else {
+            // No concrete actual row: either no `Effects` element
+            // (pure — nothing to check) or a symbolic payload (a mode
+            // metavariable / bound row var — membership undecidable,
+            // the honest bound).
+            if a_pay.is_some() {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message:
+                        "mode subsumption: the value's `Effects` row is symbolic — passing (honest bound)"
+                            .to_string(),
+                    span: None,
+                });
+            }
             return Ok(());
         };
-        let e_row = Self::mode_set_effects_row(expected).unwrap_or_default();
+        let e_row = match e_pay.as_ref().and_then(Self::plain_effects_row) {
+            Some(r) => r,
+            None => match e_pay {
+                // No `Effects` element on the expected side — the
+                // pure effects bound `{}`.
+                None => Map::new(),
+                Some(_) => {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message:
+                            "mode subsumption: the ascription's `Effects` row is symbolic — passing (honest bound)"
+                                .to_string(),
+                        span: None,
+                    });
+                    return Ok(());
+                }
+            },
+        };
         for (k, va) in &a_row {
             match e_row.get(k) {
                 None => {
@@ -11542,52 +11782,65 @@ impl NbeTypecheckEngine {
         // non-arrow entry — keeps the legacy codomain path with a
         // warning: the dual-path transition (the smoke corpus still
         // spells effects `IO<…>`; E1 already deprecates the former).
-        if let Some(mu) = ctx.ambient_mode.clone()
-            && let Some(row) = Self::mode_set_effects_row(&mu)
-        {
-            match row.get(&op_name).cloned() {
-                Some(entry) => {
-                    let entry = self.zonk(&entry, ctx);
-                    if tag_of(&entry) == Some("type.function") {
-                        // `op : A ~> B` — check the argument against
-                        // the declared domain, yield the codomain.
-                        let dom = entry.get("param").cloned().unwrap_or(Value::Null);
-                        let cod = entry.get("body").cloned().unwrap_or(Value::Null);
-                        self.dep_unify(&arg_ty, &dom, ctx).map_err(|e| {
+        if let Some(mu) = ctx.ambient_mode.clone() {
+            if let Some(row) = Self::mode_set_effects_row(&mu) {
+                match row.get(&op_name).cloned() {
+                    Some(entry) => {
+                        let entry = self.zonk(&entry, ctx);
+                        if tag_of(&entry) == Some("type.function") {
+                            // `op : A ~> B` — check the argument against
+                            // the declared domain, yield the codomain.
+                            let dom = entry.get("param").cloned().unwrap_or(Value::Null);
+                            let cod = entry.get("body").cloned().unwrap_or(Value::Null);
+                            self.dep_unify(&arg_ty, &dom, ctx).map_err(|e| {
                             LangError::engine(format!(
                                 "typecheck: perform: argument does not match op `{op_name}`'s domain: {e}"
                             ))
                         })?;
-                        ctx.performed_effects.push((op_name.clone(), entry.clone()));
-                        return Ok(self.zonk(&cod, ctx));
-                    }
-                    // Payload-style entry (`op: T`, not `A ~> B`) —
-                    // the honest bound: the entry reads as both the
-                    // request and the result.
-                    ctx.diagnostics.push(TypecheckDiagnostic {
+                            ctx.performed_effects.push((op_name.clone(), entry.clone()));
+                            return Ok(self.zonk(&cod, ctx));
+                        }
+                        // Payload-style entry (`op: T`, not `A ~> B`) —
+                        // the honest bound: the entry reads as both the
+                        // request and the result.
+                        ctx.diagnostics.push(TypecheckDiagnostic {
                         severity: "warning".to_string(),
                         message: format!(
                             "perform: op `{op_name}`'s ambient row entry is not an arrow type `A ~> B` — treating it as domain and codomain (honest bound)"
                         ),
                         span: op_node.span,
                     });
-                    self.dep_unify(&arg_ty, &entry, ctx).map_err(|e| {
+                        self.dep_unify(&arg_ty, &entry, ctx).map_err(|e| {
                         LangError::engine(format!(
                             "typecheck: perform: argument does not match op `{op_name}`'s signature: {e}"
                         ))
                     })?;
-                    ctx.performed_effects.push((op_name.clone(), entry.clone()));
-                    return Ok(entry);
-                }
-                None => {
-                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        ctx.performed_effects.push((op_name.clone(), entry.clone()));
+                        return Ok(entry);
+                    }
+                    None => {
+                        ctx.diagnostics.push(TypecheckDiagnostic {
                         severity: "warning".to_string(),
                         message: format!(
                             "perform: op `{op_name}` is not in the ambient mode's `Effects` row — minting `IO{{…}}` (deprecated transition path)"
                         ),
                         span: op_node.span,
                     });
+                    }
                 }
+            } else if Self::mode_set_effects_payload(&mu).is_some() {
+                // PL-0004 E3: a symbolic `Effects` payload (mode
+                // metavariable / bound row var) makes op membership
+                // undecidable — warn + the legacy `IO` mint stays
+                // (the E2 dual-path decision: warn+mint until the
+                // corpus migrates; documented, not enforced).
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "perform: op `{op_name}` — the ambient `Effects` row is symbolic (mode metavariable) — minting `IO{{…}}` (honest bound)"
+                    ),
+                    span: op_node.span,
+                });
             }
         }
         let mut sig = Map::new();
@@ -12178,6 +12431,15 @@ impl NbeTypecheckEngine {
         handle_idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<(), LangError> {
+        // PL-0004 E3: a symbolic `Effects` payload on the handled
+        // computation (mode metavariable / bound row var) makes
+        // coverage undecidable — honest bound, passthrough (the
+        // residual can't be computed without the row).
+        if target_mode.as_ref().is_some_and(|m| {
+            Self::mode_set_effects_payload(m).is_some() && Self::mode_set_effects_row(m).is_none()
+        }) {
+            return Ok(());
+        }
         let mut sig_obj = target_mode.as_ref().and_then(Self::mode_set_effects_row);
         for (op, entry) in used_effects {
             sig_obj

@@ -1172,6 +1172,14 @@ impl Checker {
         }
     }
 
+    /// The `(head, arg, raw)` triple of a `Former{type.mode}`
+    /// descriptor — the read side of [`Checker::mode_desc`] for the
+    /// PL-0004 E3 `Value`-descriptor bridge (non-descriptor values
+    /// read as bare modes over themselves, same as `mode_parts`).
+    pub(crate) fn mode_descriptor_parts(&self, m: &Val) -> (Option<String>, Val, Val) {
+        self.mode_parts(m)
+    }
+
     /// `(head, arg, raw)` of a `Former{type.mode}` descriptor —
     /// `head` `Some(name)` for call-head modes (`Cost(3)` selects
     /// `mode.algebra.Cost`), `None` for bare modes; `arg` the payload
@@ -1240,7 +1248,9 @@ impl Checker {
     /// `mode.algebra.<head>`; bare modes compose raws under
     /// `mode.algebra.default`; mismatched heads take the honest bound.
     /// Subsumption is M3 — this only computes the composite mode.
-    fn mode_compose_vals(&mut self, a: &Val, b: &Val) -> Val {
+    /// `pub(crate)` for the PL-0004 E3 `Value`-descriptor bridge
+    /// (`dependent::compose_mode_element`).
+    pub(crate) fn mode_compose_vals(&mut self, a: &Val, b: &Val) -> Val {
         let null = || Val::Const(TaggedValue::Null);
         let (ha, aa, ra) = self.mode_parts(a);
         let (hb, ab, rb) = self.mode_parts(b);

@@ -6566,6 +6566,14 @@ struct TypecheckContext {
     /// target's synthesis and rewrites the slice to the residual, so
     /// nested handles propagate exactly the unhandled ops outward.
     performed_effects: Vec<(String, Value)>,
+    /// Elaboration-scoped mode metavariables (PL-0004 E3): `name →
+    /// tagged meta id` for unbound `var`s inside `@ μ` ascriptions.
+    /// Scoped to a single `elaborate_mode_set` call — repeated
+    /// occurrences of one name share the meta (they unify/substitute
+    /// during checking), while distinct ascriptions mint distinct
+    /// metas (no cross-binding generalization; the M3.5
+    /// annotation-required discipline).
+    mode_metas: HashMap<String, u64>,
     /// Ambient modes of named bindings (PL-0004 E2): `(name, mode_set
     /// or Null, gamma_len at bind)` — `mode_of_node` resolves a `var`
     /// operand's judgement mode for `>>>` row composition, `handle`
@@ -6647,6 +6655,7 @@ impl TypecheckContext {
             node_modes: HashMap::new(),
             mode_set_cache: HashMap::new(),
             performed_effects: Vec::new(),
+            mode_metas: HashMap::new(),
             binding_modes: Vec::new(),
         }
     }
