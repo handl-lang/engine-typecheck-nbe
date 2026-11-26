@@ -2118,6 +2118,33 @@ impl NbeTypecheckEngine {
                     // `type.ctor_sig` — with checker-owned strict positivity.
                     self.synth_data_judgment(lang, ast, node_ref, ctx)
                 }
+                "check_inductive_spec" => {
+                    // PL-0003 I2: strict positivity over an
+                    // `inductive.spec` *value* — `incoming` (Seq-threaded,
+                    // e.g. after a `result "F.spec"` op) or args[0]'s
+                    // scheme value. Returns `type.unit`; a negative
+                    // occurrence is a hard error — the same verdict
+                    // `synth_data`'s declaration-time check gives, now
+                    // re-checkable on computed specs.
+                    let spec = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    dependent::check_inductive_spec(&spec)?;
+                    ctx.registry
+                        .construct("type.unit", &Value::Null)
+                        .ok_or_else(|| {
+                            LangError::engine("check_inductive_spec: construct type.unit failed")
+                        })
+                }
                 "synth_instance" => {
                     // `instance <C(i⃗)> := <dict>` (phase-3 WS-A): elaborate
                     // the constraint former application, enforce coherence,
@@ -3004,6 +3031,27 @@ impl NbeTypecheckEngine {
                             })
                             .unwrap_or_default();
                         return Ok(dependent::subst_shape_vars(field_type, &vars, &goal_args));
+                    }
+                    // `inductive.spec` — the spec value itself is the
+                    // container (PL-0003 I2): `synth_data` binds
+                    // `"<F>.spec"` in Γ, so `Nat.spec` resolves to the
+                    // spec record and `Nat.spec.ctors` / `.params` /
+                    // `.name` project its fields. The field *value*
+                    // rides the type channel — the same data-as-type
+                    // convention `results` values already use; spec
+                    // consumers (`check_inductive_spec`, I3's generic
+                    // eliminators) read the record, not a `type.*` tag.
+                    if container_type.get("__tag__").and_then(|t| t.as_str())
+                        == Some("inductive.spec")
+                    {
+                        return container_type
+                            .get(field_name.as_str())
+                            .cloned()
+                            .ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "record_field_type: inductive.spec has no field '{field_name}'"
+                                ))
+                            });
                     }
                     let fields = container_type
                         .get("fields")

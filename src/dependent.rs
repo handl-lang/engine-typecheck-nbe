@@ -3270,10 +3270,26 @@ fn spec_ctor_sig(
     Ok(Some(sig))
 }
 
-/// Strict positivity over the ctor-arg AST (checker-owned, ADR-0152 §4):
-/// the defined former must not occur in a *domain* position. `occurs` is
-/// any occurrence; a `call(->, dom, cod)`/`function` node's domain child
-/// is the negative position.
+// ---------------------------------------------------------------------------
+// Strict positivity (PL-0003 I2)
+// ---------------------------------------------------------------------------
+//
+// Strict positivity is the `check_inductive_spec` judgment over the
+// spec's *owned* type-expr node records (`{kind, span, payload}` with
+// `payload.children`/`payload.body` holding nested owned records —
+// the [`owned_payload`] shape) instead of source AST nodes. The walks
+// below carry the full syntactic rule the retired AST positivity walk
+// (ADR-0152 §4) implemented: the defined former must not occur in a
+// *domain* position — a `call(->, dom, cod)`/`function` node's domain
+// child is the negative position. Only the container differs, which is
+// what lets the judgment re-check *computed* specs that never had a
+// source `data` node. [`occurs_name`] itself stays — `dep_synth_type`'s
+// sigma-dependence check uses the same any-occurrence walk over AST.
+
+/// Any-occurrence walk over AST type-exprs (checker-owned, ADR-0152 §4):
+/// does `node` mention `name` (a `var` leaf) anywhere? Used by the
+/// sigma-dependence check in `dep_synth_type`; positivity itself now
+/// runs on spec values via [`owned_occurs_name`].
 fn occurs_name(ast: &Ast, node: &AstNode, name: &str) -> bool {
     if node.kind == "var" {
         return node.payload.as_str() == Some(name);
@@ -3293,65 +3309,140 @@ fn occurs_name(ast: &Ast, node: &AstNode, name: &str) -> bool {
     false
 }
 
-fn positivity_ok(ast: &Ast, node: &AstNode, name: &str) -> bool {
-    match node.kind.as_str() {
+/// `payload.children` of an owned spec node — the nested owned records
+/// (twin of [`children_of`] for the value representation).
+fn owned_children_of(v: &Value) -> Option<&Vec<Value>> {
+    v.as_object()?.get("payload")?.get("children")?.as_array()
+}
+
+/// `payload.body` of an owned spec node, when present.
+fn owned_body_of(v: &Value) -> Option<&Value> {
+    v.as_object()?.get("payload")?.get("body")
+}
+
+/// Value-level `occurs`: does the owned type-expr `v` mention `name`
+/// (a `var` leaf whose payload is the name) anywhere? `children` are
+/// walked first, then `body` — the same order the retired AST walk
+/// used.
+fn owned_occurs_name(v: &Value, name: &str) -> bool {
+    if !is_owned_node_value(v) {
+        return false;
+    }
+    if v.get("kind").and_then(Value::as_str) == Some("var") {
+        return v.get("payload").and_then(Value::as_str) == Some(name);
+    }
+    if let Some(kids) = owned_children_of(v)
+        && kids.iter().any(|c| owned_occurs_name(c, name))
+    {
+        return true;
+    }
+    if let Some(b) = owned_body_of(v) {
+        return owned_occurs_name(b, name);
+    }
+    false
+}
+
+/// Value-level positivity: the owned type-expr `v` must not mention
+/// `name` in a domain (negative) position — `function` params and
+/// `->`/`~>` call domains are negative; every other child position is
+/// positive.
+fn owned_positivity_ok(v: &Value, name: &str) -> bool {
+    if !is_owned_node_value(v) {
+        // Scalar payload entries and non-node children carry no
+        // occurrence — the same "absent child" reading the AST walk
+        // gives an out-of-bounds index.
+        return true;
+    }
+    let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+    let kids = owned_children_of(v);
+    match kind {
         "function" => {
             // params child is the domain — the former must not occur.
-            let kids = children_of(node).cloned().unwrap_or_default();
-            let dom = kids.first().and_then(Value::as_u64);
-            let cod = kids.get(1).and_then(Value::as_u64);
-            let dom_bad = dom
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .is_some_and(|n| occurs_name(ast, n, name));
+            let dom_bad = kids
+                .and_then(|k| k.first())
+                .is_some_and(|n| owned_occurs_name(n, name));
             if dom_bad {
                 return false;
             }
-            cod.and_then(|i| ast.get(AstRef::new(i as usize)))
-                .is_none_or(|n| positivity_ok(ast, n, name))
+            kids.and_then(|k| k.get(1))
+                .is_none_or(|n| owned_positivity_ok(n, name))
         }
         "call" => {
-            let kids = children_of(node).cloned().unwrap_or_default();
-            let callee_is_arrow = kids
-                .first()
-                .and_then(Value::as_u64)
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .is_some_and(|n| {
-                    n.kind == "var"
-                        && (n.payload.as_str() == Some("->") || n.payload.as_str() == Some("~>"))
-                });
-            if callee_is_arrow && kids.len() >= 3 {
+            let callee_is_arrow = kids.and_then(|k| k.first()).is_some_and(|n| {
+                is_owned_node_value(n)
+                    && n.get("kind").and_then(Value::as_str) == Some("var")
+                    && matches!(
+                        n.get("payload").and_then(Value::as_str),
+                        Some("->") | Some("~>")
+                    )
+            });
+            if callee_is_arrow && kids.is_some_and(|k| k.len() >= 3) {
                 let dom_bad = kids
-                    .get(1)
-                    .and_then(Value::as_u64)
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .is_some_and(|n| occurs_name(ast, n, name));
+                    .and_then(|k| k.get(1))
+                    .is_some_and(|n| owned_occurs_name(n, name));
                 if dom_bad {
                     return false;
                 }
                 return kids
-                    .get(2)
-                    .and_then(Value::as_u64)
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .is_none_or(|n| positivity_ok(ast, n, name));
+                    .and_then(|k| k.get(2))
+                    .is_none_or(|n| owned_positivity_ok(n, name));
             }
             // Other applications: args are positive positions.
-            kids.iter().all(|c| {
-                c.as_u64()
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .is_none_or(|n| positivity_ok(ast, n, name))
-            })
+            kids.is_none_or(|k| k.iter().all(|c| owned_positivity_ok(c, name)))
         }
-        _ => {
-            if let Some(kids) = children_of(node) {
-                return kids.iter().all(|c| {
-                    c.as_u64()
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .is_none_or(|n| positivity_ok(ast, n, name))
-                });
+        _ => kids.is_none_or(|k| k.iter().all(|c| owned_positivity_ok(c, name))),
+    }
+}
+
+/// `check_inductive_spec` — strict positivity over an `inductive.spec`
+/// *value* (PL-0003 I2): every ctor arg domain (`ctors[].args[].type`)
+/// must be positive in the spec's `name`. This is the declaration-time
+/// check `synth_data_judgment` runs on the spec it binds, and the
+/// re-checkable judgment computed specs go through — the desugar
+/// native's `check_strict_positivity` keeps its early-error mirror on
+/// source. `Err` names the offending constructor, matching the
+/// `synth_data` positivity diagnostic's shape. `pub(crate)` so the
+/// `check_inductive_spec` judgment op can re-check computed specs.
+pub(crate) fn check_inductive_spec(spec: &Value) -> Result<(), LangError> {
+    if tag_of(spec) != Some("inductive.spec") {
+        return Err(LangError::engine(
+            "check_inductive_spec: expected an inductive.spec value".to_string(),
+        ));
+    }
+    let family = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    for c in spec
+        .get("ctors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let cname = c
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        for a in c
+            .get("args")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let Some(t) = a.get("type") else {
+                continue;
+            };
+            if is_owned_node_value(t) && !owned_positivity_ok(t, &family) {
+                return Err(LangError::engine(format!(
+                    "check_inductive_spec: strict positivity violated: constructor \
+                     '{cname}' mentions '{family}' in a negative position"
+                )));
             }
-            true
         }
     }
+    Ok(())
 }
 
 impl NbeTypecheckEngine {
@@ -5119,10 +5210,12 @@ impl NbeTypecheckEngine {
                 fields.insert("name".to_string(), Value::String(name.clone()));
                 fields.insert("params".to_string(), Value::Array(vec![]));
                 fields.insert("ctors".to_string(), Value::Array(vec![]));
-                ctx.bind_result(
-                    format!("{name}.spec"),
-                    make_tag(ctx, "inductive.spec", fields),
-                );
+                let spec = make_tag(ctx, "inductive.spec", fields);
+                // PL-0003 I2: same `F.spec` Γ/results bindings as the
+                // AST path — the spec is empty here but the projection
+                // surface is identical.
+                ctx.extend(format!("{name}.spec"), spec.clone());
+                ctx.bind_result(format!("{name}.spec"), spec);
             }
             let mut m = Map::new();
             return Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)));
@@ -5134,20 +5227,14 @@ impl NbeTypecheckEngine {
             ));
         };
         // Strict positivity — the checker owns it (it sees the sigs).
-        for c in &ctors {
-            for (_, ty_idx) in &c.args {
-                if let Some(ti) = ty_idx
-                    && let Some(n) = ast.get(AstRef::new(*ti))
-                    && !positivity_ok(ast, n, &name)
-                {
-                    return Err(LangError::engine(format!(
-                        "synth_data: strict positivity violated: constructor '{}' \
-                                 mentions '{name}' in a negative position",
-                        c.name
-                    )));
-                }
-            }
-        }
+        // PL-0003 I2: the check is the `check_inductive_spec` judgment
+        // over the spec *value* — built up front (pure data: owned
+        // type-expr records, no bindings yet) so a violation still
+        // fails before any Γ/`results` binding, the same fail-fast
+        // point the AST walk had. The same judgment re-checks computed
+        // specs at use sites.
+        let spec = inductive_spec_value(ctx, ast, &name, &params, &ctors);
+        check_inductive_spec(&spec)?;
         // `base` = the parameter sorts (`type.array` of them).
         let mut elems = Vec::with_capacity(params.len());
         for p in &params {
@@ -5187,14 +5274,18 @@ impl NbeTypecheckEngine {
             });
             ctx.extend(c.name.clone(), sig);
         }
-        // PL-0003 I1 — `inductive.spec`: the declaration's spec as an
+        // PL-0003 I1/I2 — `inductive.spec`: the declaration's spec as an
         // owned data value (type-exprs are owned node records, not AST
         // indices), bound in `results` under `"<name>.spec"` alongside
-        // the `type.family`/`type.ctor_sig` bindings. Inert for now;
-        // I2+ consumes it (positivity, spec-driven match). `results`
-        // (not Γ) is the value channel — the spec is data, not a type.
+        // the `type.family`/`type.ctor_sig` bindings AND in Γ under the
+        // same key so `Nat.spec` / `field_access(Nat, "spec")` resolve
+        // to the spec value itself (the `F.rec` scope-binding
+        // convention — `record_field_type`'s `type.family` arm reads Γ).
+        // `results` (not Γ) is the value channel for spec *consumers*
+        // (`spec_ctor_sig`, `check_inductive_spec`); the Γ entry is the
+        // user-facing projection.
         if !name.is_empty() {
-            let spec = inductive_spec_value(ctx, ast, &name, &params, &ctors);
+            ctx.extend(format!("{name}.spec"), spec.clone());
             ctx.bind_result(format!("{name}.spec"), spec);
         }
         // WS-C coverage census: the family's ctor list + the reverse
@@ -6294,6 +6385,26 @@ impl NbeTypecheckEngine {
             && schema == "Constraint"
         {
             return self.synth_new_constraint_decl(lang, ast, node, name, type_idx, dict_idx, ctx);
+        }
+        // `Inductive` is not a `new` schema the checker expands here
+        // (PL-0003 I2): the parse layer lowers a well-formed
+        // `X := new Inductive { C : F(i⃗), … }` family record to the
+        // `data` node `synth_data` consumes, so a `new` node that
+        // still names `Inductive` is malformed — a field codomain that
+        // does not name the declared family, or schema arguments the
+        // inductive form does not take. Report honestly instead of
+        // minting a mode family named `X`.
+        if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
+            && schema == "Inductive"
+        {
+            return Err(LangError::engine_node(
+                "synth_new: `new Inductive` expects a constructor record \
+                 `{ C : F(i⃗), … }` whose codomains name the declared family \
+                 `F` — well-formed `X := new Inductive { … }` declarations \
+                 lower to `data` at parse time"
+                    .to_string(),
+                node,
+            ));
         }
         // `T(args)` — the algebra former application — must elaborate
         // as a type (well-formedness; names the algebra `Algebra` is

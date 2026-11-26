@@ -11558,3 +11558,150 @@ fn synth_data_binds_inductive_spec() {
     assert!(vcons_result.get("kind").is_some());
     assert!(vcons_result.get("payload").is_some());
 }
+
+// ---------------------------------------------------------------------------
+// PL-0003 I2 — `check_inductive_spec` judgment + `F.spec` gamma binding
+// ---------------------------------------------------------------------------
+
+/// Owned spec-node record (`{kind, span, payload}`) for
+/// `check_inductive_spec` tests — the value representation
+/// `inductive_spec_value` mints (scalar `payload` for `var` leaves).
+fn owned_node(kind: &str, payload: Value) -> Value {
+    json!({"kind": kind, "span": null, "payload": payload})
+}
+
+/// A `var` owned node — `payload` is the bare name string.
+fn owned_var(name: &str) -> Value {
+    owned_node("var", json!(name))
+}
+
+/// A `function` owned node — `payload.children` = `[domain, codomain]`.
+fn owned_fun(dom: Value, cod: Value) -> Value {
+    owned_node("function", json!({"children": [dom, cod]}))
+}
+
+/// An `inductive.spec` value for `check_inductive_spec` tests: one ctor
+/// `C` whose args carry the given owned type-exprs.
+fn spec_with_arg_tys(name: &str, arg_tys: Vec<Value>) -> Value {
+    let args: Vec<Value> = arg_tys
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| json!({"name": format!("a{i}"), "type": t}))
+        .collect();
+    json!({
+        "__tag__": "inductive.spec",
+        "__registry__": "handl.canonical",
+        "name": name,
+        "params": [],
+        "ctors": [{"name": "C", "args": args, "result": null, "bare": false}],
+    })
+}
+
+/// `const(spec) >>> check_inductive_spec` — the judgment op reads the
+/// Seq-threaded `incoming` spec value; `type.unit` on success.
+fn check_spec_rule(spec: Value) -> Term {
+    td(TermData::seq(
+        arr_native_lit("const", vec![], spec),
+        arr_judgment_lit("check_inductive_spec", vec![], Value::Null),
+    ))
+}
+
+#[test]
+fn check_inductive_spec_accepts_positive_spec() {
+    let engine = engine();
+    let mut lang = Language::new();
+    lang.types
+        .merge(TypeRuleDef::new(
+            "type.test",
+            "test",
+            check_spec_rule(spec_with_arg_tys("Pos", vec![owned_var("Pos")])),
+        ))
+        .unwrap();
+    let mut ast = Ast::new();
+    ast.push(AstNode::new("test"));
+    let result = engine
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect("positive spec must pass check_inductive_spec");
+    assert_eq!(
+        result.typ.get("__tag__").and_then(Value::as_str),
+        Some("type.unit")
+    );
+}
+
+#[test]
+fn check_inductive_spec_nested_positive_accepted() {
+    // `f : Nat ~> Pos` — `Pos` occurs only in the codomain of the arg's
+    // function type: a positive position, accepted.
+    let engine = engine();
+    let mut lang = Language::new();
+    let arg_ty = owned_fun(owned_var("Nat"), owned_var("Pos"));
+    lang.types
+        .merge(TypeRuleDef::new(
+            "type.test",
+            "test",
+            check_spec_rule(spec_with_arg_tys("Pos", vec![arg_ty])),
+        ))
+        .unwrap();
+    let mut ast = Ast::new();
+    ast.push(AstNode::new("test"));
+    engine
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect("codomain occurrence is positive — must pass");
+}
+
+#[test]
+fn check_inductive_spec_rejects_negative_occurrence() {
+    // `f : Pos ~> Nat` — `Pos` occurs in the domain of the arg's
+    // function type: a negative position, rejected.
+    let engine = engine();
+    let mut lang = Language::new();
+    let arg_ty = owned_fun(owned_var("Pos"), owned_var("Nat"));
+    lang.types
+        .merge(TypeRuleDef::new(
+            "type.test",
+            "test",
+            check_spec_rule(spec_with_arg_tys("Pos", vec![arg_ty])),
+        ))
+        .unwrap();
+    let mut ast = Ast::new();
+    ast.push(AstNode::new("test"));
+    let err = engine
+        .typecheck(&lang, &TypecheckRequest::new(ast))
+        .expect_err("domain occurrence must fail strict positivity");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("strict positivity") && msg.contains("Pos"),
+        "expected positivity violation naming Pos, got: {msg}"
+    );
+}
+
+#[test]
+fn synth_data_binds_spec_in_gamma_for_projection() {
+    // `synth_data` binds `"<F>.spec"` in Γ as well as `results` — the
+    // `record_field_type` `type.family` arm reads Γ, so `Nat.spec`
+    // projects through the same scope-binding convention `F.rec` uses.
+    let lang = handl_kit_data_prelude::language_from_yaml().expect("canonical language");
+    let _ = handl_plugin_lib_handl::install_default_language(lang.clone());
+    let eng = engine();
+    let mut ctx = TypecheckContext::new("handl.canonical", HashMap::new());
+    let tokens = hnl_tool_lex_pattern::lex(&lang, "Nat := { Zero : Nat }").expect("lex");
+    let parser = hnl_tool_parse_pratt::PrattEngine::new();
+    let req = hnl_tool_parse::ParserRequest::new(tokens);
+    let ast = hnl_tool_parse::ParserEngine::parse(&parser, &lang, &req).expect("parse");
+    let data_idx = ast
+        .nodes()
+        .iter()
+        .position(|n| n.kind == "data")
+        .expect("data node");
+    eng.synth_data_judgment(&lang, &ast, handl_language::AstRef::new(data_idx), &mut ctx)
+        .expect("synth_data Nat");
+    let bound = ctx
+        .lookup("Nat.spec")
+        .expect("Nat.spec bound in gamma")
+        .clone();
+    assert_eq!(
+        bound.get("__tag__").and_then(Value::as_str),
+        Some("inductive.spec")
+    );
+    assert_eq!(bound.get("name").and_then(Value::as_str), Some("Nat"));
+}
