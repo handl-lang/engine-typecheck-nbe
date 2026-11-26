@@ -685,6 +685,45 @@ pub(crate) fn is_domain_encoded(v: &Value) -> bool {
     }
 }
 
+/// Whether a boundary `__former__` JSON reifies a `type.hom`
+/// application carrying the mode index (≥4 args — pl-0002 M2). Both
+/// spellings are recognized: quote's `{"__former__": {"sym": S,
+/// "args": […]}}` and the surface `{"__former__": S, "indices": […]}`.
+fn json_mode_hom(v: &Value) -> bool {
+    let Some(f) = v.get("__former__") else {
+        return false;
+    };
+    let hom = checker::type_sym("type.hom").handle();
+    let head_is_hom = |s: &Value| -> bool {
+        let inner = s.get("__sym__").unwrap_or(s);
+        if let Some(h) = inner.get("handle").and_then(Value::as_u64) {
+            return h == hom;
+        }
+        matches!(
+            inner.get("name").and_then(Value::as_str),
+            Some("type.hom" | "hom")
+        )
+    };
+    if let Some(obj) = f.as_object() {
+        if let Some(s) = obj.get("sym") {
+            let args = obj.get("args").or_else(|| obj.get("indices"));
+            return head_is_hom(s)
+                && args
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.len() >= 4);
+        }
+        // `{"__former__": <sym>}` — the sym payload itself; indices
+        // are siblings on the parent object.
+        if head_is_hom(f) {
+            return v
+                .get("indices")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.len() >= 4);
+        }
+    }
+    false
+}
+
 /// Rewrite tagged `{"__meta__": n}` leaves into `{"__neutral__":
 /// {"head":"meta","id": m}}` carrying *fresh* domain metas — the two
 /// meta stores never alias: a tagged meta crossing the domain bridge
@@ -702,11 +741,19 @@ pub(crate) fn remap_tagged_metas(
         return serde_json::json!({"__neutral__": {"head": "meta", "id": m, "spine": []}});
     }
     match v {
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| (k.clone(), remap_tagged_metas(x, map, ctx)))
-                .collect(),
-        ),
+        Value::Object(o) => {
+            // A mode-carrying `Hom` reified through `domain_quote`
+            // (pl-0002 M2) latches the conv mode-strip — the lift
+            // side of the round trip.
+            if !ctx.vcheck.mode_homs && json_mode_hom(v) {
+                ctx.vcheck.mode_homs = true;
+            }
+            Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), remap_tagged_metas(x, map, ctx)))
+                    .collect(),
+            )
+        }
         Value::Array(xs) => {
             Value::Array(xs.iter().map(|x| remap_tagged_metas(x, map, ctx)).collect())
         }
@@ -809,10 +856,27 @@ fn nullary_domain(param: &Value) -> bool {
 /// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
 /// as boundary JSON (the `__former__` encoding).
 fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
+    hom_former_mode(d, a, b, None, ctx)
+}
+
+/// `hom_former` with the optional mode index (pl-0002 M2): `Some(m)`
+/// emits the 4-index `Hom(d, a, b, m)` carrying the mode descriptor —
+/// graded arrows only; dims never produce one.
+fn hom_former_mode(
+    d: Val,
+    a: Val,
+    b: Val,
+    mode: Option<Val>,
+    ctx: &TypecheckContext,
+) -> Value {
+    let mut args = vec![d, a, b];
+    if let Some(m) = mode {
+        args.push(m);
+    }
     domain_quote(
         &Val::Former {
             head: checker::type_sym("type.hom"),
-            args: vec![d, a, b],
+            args,
         },
         ctx,
     )
@@ -832,7 +896,7 @@ fn dim_meta(ctx: &mut TypecheckContext) -> Val {
 fn hom_dim_lit(v: &Val) -> Option<u64> {
     if let Val::Former { head, args } = v
         && head.handle() == checker::type_sym("type.hom").handle()
-        && args.len() == 3
+        && args.len() >= 3
         && let Val::Const(TaggedValue::Int(m)) = &args[0]
     {
         return u64::try_from(*m).ok();
@@ -872,6 +936,57 @@ fn node_name(node: &AstNode) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::to_string)
     })
+}
+
+/// The `new` declaration's schema head — the `type` child's callee
+/// name (`Inductive`/`Algebra`/`Constraint`, the registry kinds of
+/// design/instance-unified-registry.md §2) plus the argument node
+/// indices. `paren` layers unwrap; `call`/`index_app`/`dimension`
+/// share the `[callee, args…]` layout; a bare `var` is the
+/// parameterless form (`new T { … }`). Returns `None` for a `type`
+/// child that is not a name-headed application.
+fn new_decl_schema(
+    lang: &Language,
+    ast: &Ast,
+    type_idx: usize,
+) -> Option<(String, Vec<usize>)> {
+    let mut node = ast.get(AstRef::new(type_idx))?;
+    while node.kind == "paren" {
+        let i = children_of(node)?.first()?.as_u64()? as usize;
+        node = ast.get(AstRef::new(i))?;
+    }
+    if node.kind == "var" {
+        return node_name(node).map(|n| (n, Vec::new()));
+    }
+    if !matches!(node.kind.as_str(), "call" | "index_app" | "dimension") {
+        return None;
+    }
+    let kids = children_of(node)?;
+    let callee_role = lang
+        .child_role_index(&node.kind, "callee")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let args_role = lang
+        .child_role_index(&node.kind, "args")
+        .ok()
+        .flatten()
+        .unwrap_or(callee_role + 1);
+    let mut callee = ast.get(AstRef::new(
+        kids.get(callee_role)?.as_u64()? as usize,
+    ))?;
+    while callee.kind == "paren" {
+        let i = children_of(callee)?.first()?.as_u64()? as usize;
+        callee = ast.get(AstRef::new(i))?;
+    }
+    let name = node_name(callee)?;
+    let args = kids
+        .iter()
+        .skip(args_role)
+        .filter_map(Value::as_u64)
+        .map(|v| v as usize)
+        .collect();
+    Some((name, args))
 }
 
 /// Whether `name` is a builtin type-position identifier — the name table
@@ -3016,13 +3131,18 @@ fn spec_node_index(
         let end = sp.get("end").and_then(Value::as_u64)? as usize;
         Some(handl_language::Span { start, end })
     });
-    // Materialize `children`/`body` first — each recursion re-borrows
-    // `ctx`, so the arena borrow below never spans a recursive call.
-    let mut payload = match obj.get("payload") {
-        Some(Value::Object(p)) => p.clone(),
+    // Scalar payloads (`var` name strings, `value`/`lit` literals) pass
+    // through verbatim — only object payloads can carry `children`/`body`
+    // arena references to rewrite.
+    let raw_payload = obj.get("payload").cloned().unwrap_or(Value::Null);
+    let mut payload = match &raw_payload {
+        Value::Object(p) => p.clone(),
         _ => Map::new(),
     };
-    if let Some(Value::Array(items)) = payload.get("children").cloned() {
+    let payload_is_obj = matches!(raw_payload, Value::Object(_));
+    if payload_is_obj
+        && let Some(Value::Array(items)) = payload.get("children").cloned()
+    {
         let mut idxs = Vec::with_capacity(items.len());
         for c in &items {
             if is_owned_node_value(c) {
@@ -3035,7 +3155,8 @@ fn spec_node_index(
     }
     let mut body_idx = Value::Null;
     let mut body_done = false;
-    if let Some(raw) = payload.get("body")
+    if payload_is_obj
+        && let Some(raw) = payload.get("body")
         && is_owned_node_value(raw)
     {
         body_idx = Value::from(spec_node_index(ctx, ast, raw)? as u64);
@@ -3050,7 +3171,11 @@ fn spec_node_index(
     let node = AstNode {
         kind,
         span,
-        payload: Value::Object(payload),
+        payload: if payload_is_obj {
+            Value::Object(payload)
+        } else {
+            raw_payload
+        },
     };
     let arena = ctx
         .spec_ast
@@ -3799,14 +3924,15 @@ impl NbeTypecheckEngine {
                         as usize;
                     let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
                     // Well-formedness: the grade expression must
-                    // elaborate; its type is discarded (grades are a
-                    // separate axis — no `type.hom` slot carries it).
+                    // elaborate; the mode descriptor (pl-0002 M2)
+                    // rides the optional 4th `type.hom` index.
                     let _grade = self.dep_synth_type(lang, ast, grade_idx, ctx)?;
                     let tgt = self.dep_synth_type(lang, ast, tgt_idx, ctx)?;
+                    let mode = self.mode_descriptor(lang, ast, grade_idx, ctx)?;
                     let dim_v = Val::Const(TaggedValue::Int(1));
                     let va = domain_lift(&src, ctx);
                     let vb = domain_lift(&tgt, ctx);
-                    Ok(hom_former(dim_v, va, vb, ctx))
+                    Ok(hom_former_mode(dim_v, va, vb, Some(mode), ctx))
                 }
                 "absurd" | "if" | "match" | "object" | "index" => {
                     // Non-type positions in annotations — leave them open.
@@ -6218,6 +6344,17 @@ impl NbeTypecheckEngine {
         let dict_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
             LangError::engine_node("synth_new: missing dict child".to_string(), node)
         })? as usize;
+        // Schema dispatch (design/instance-unified-registry.md): the
+        // `type` child's head names the registry kind — `Constraint(…)`
+        // declares a constraint head (an evidence dictionary *shape*),
+        // every other head keeps the mode-family path below.
+        if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
+            && schema == "Constraint"
+        {
+            return self.synth_new_constraint_decl(
+                lang, ast, node, name, type_idx, dict_idx, ctx,
+            );
+        }
         // `T(args)` — the algebra former application — must elaborate
         // as a type (well-formedness; names the algebra `Algebra` is
         // M2's to define). Its first index argument is the carrier
@@ -6259,6 +6396,96 @@ impl NbeTypecheckEngine {
             &constraint,
             dict_idx,
         )?;
+        Ok(())
+    }
+
+    /// `X := new Constraint(S…) { shape }` — the `Constraint` schema of
+    /// the unified `new` registry (design/instance-unified-registry.md
+    /// §2): one declaration machinery for `Inductive`/`Algebra`/
+    /// `Constraint`, with the schema head choosing what registers.
+    ///
+    /// 1. `X : type.family{name: X, base: [S₁,…,Sₙ]}` — the schema
+    ///    arguments are the constraint's *index sorts*: `new
+    ///    Constraint(Type)` declares the same head the record-spelling
+    ///    `X<a : Type>` inductive-family form produces, so `X(T)` in
+    ///    type position mints `type.family_app{X, [T]}` through the
+    ///    ordinary family-application reading.
+    /// 2. The dict child is the *evidence dictionary shape* — a
+    ///    signature record (`{ evidence : a ~> a ~> Bool }`), not a
+    ///    dictionary value. It is checked at instance sites (deferred —
+    ///    `instance X(T) := dict` currently gets the same
+    ///    well-formedness-only treatment every dict does); here it
+    ///    synthesizes for well-formedness under implicitly-generalized
+    ///    index vars and is recorded as `"<name>.shape"` in `results`
+    ///    for that future check.
+    ///
+    /// No `(head, args) ↦ dict` entry registers — the shape is not a
+    /// dictionary, and instances come from `instance` declarations
+    /// alone. `instance X(T) := dict` and `<…, ev : X(a)>` evidence
+    /// binders then flow through the unchanged `synth_instance` /
+    /// `resolve_instance` machinery: the head is a declared
+    /// `type.family`, coherence is declaration-time no-overlap, and
+    /// dictionary search discharges implicit former-app binders.
+    ///
+    /// `name` is the `assign` target — the constraint head, which a
+    /// `new`-node-local judgment cannot see.
+    fn synth_new_constraint_decl(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        name: &str,
+        type_idx: usize,
+        dict_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let Some((_schema, sort_idx)) = new_decl_schema(lang, ast, type_idx) else {
+            return Err(LangError::engine_node(
+                "synth_new: `new Constraint` needs a `Constraint(S…)` type child".to_string(),
+                node,
+            ));
+        };
+        // The schema arguments are index *sorts* — one `base` element
+        // each, elaborated exactly like a `data` family's parameter
+        // sorts (`Eq<a : Type>`'s `Type`).
+        let mut elems = Vec::with_capacity(sort_idx.len());
+        for i in sort_idx {
+            elems.push(self.dep_synth_type(lang, ast, i, ctx)?);
+        }
+        let mut base_m = Map::new();
+        base_m.insert("elements".to_string(), Value::Array(elems));
+        let base = make_tag(ctx, "type.array", base_m);
+        let mut fm = Map::new();
+        fm.insert("name".to_string(), Value::String(name.to_string()));
+        fm.insert("base".to_string(), base);
+        ctx.extend(name.to_string(), make_tag(ctx, "type.family", fm));
+        // The dictionary shape — a signature record. Unbound index
+        // vars implicitly generalize rigidly (the `synth_instance`
+        // convention) so schematic fields like `a ~> a ~> Bool`
+        // elaborate; the synthesized record is kept under
+        // `"<name>.shape"` for the deferred instance-site check.
+        let mut gen_vars = Vec::new();
+        collect_unbound_index_vars(ast, AstRef::new(dict_idx), ctx, &mut gen_vars);
+        let old_results = ctx.results.clone();
+        for n in &gen_vars {
+            ctx.bind_result(n.clone(), var_term(n));
+        }
+        let shape = self.synth_node(lang, ast, AstRef::new(dict_idx), ctx);
+        ctx.results = old_results;
+        match shape {
+            Ok(s) => {
+                ctx.bind_result(format!("{name}.shape"), s);
+            }
+            Err(e) => {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "synth_new: constraint `{name}` dictionary shape failed to synthesize: {e}"
+                    ),
+                    span: node.span,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -7498,16 +7725,20 @@ impl NbeTypecheckEngine {
                     // materialization during instantiation would leave a
                     // grown superset in `ctx.spec_ast`; keep it (indices
                     // into the taken arena stay valid — same prefix).
-                    let arena = ctx.spec_ast.take().ok_or_else(|| {
-                        LangError::engine(
-                            "match: spec ctor sig without spec arena".to_string(),
-                        )
-                    })?;
-                    let r = self.instantiate_ctor_full(lang, &arena, sig, ctx);
-                    if ctx.spec_ast.is_none() {
-                        ctx.spec_ast = Some(arena);
+                    // `spec_ast` is `None` exactly when this sig
+                    // materialized no nodes (all-`null` type-exprs —
+                    // e.g. bare enum ctors), in which case no spec index
+                    // exists and the source arena is equivalent.
+                    match ctx.spec_ast.take() {
+                        Some(arena) => {
+                            let r = self.instantiate_ctor_full(lang, &arena, sig, ctx);
+                            if ctx.spec_ast.is_none() {
+                                ctx.spec_ast = Some(arena);
+                            }
+                            r?
+                        }
+                        None => self.instantiate_ctor_full(lang, ast, sig, ctx)?,
                     }
-                    r?
                 } else {
                     self.instantiate_ctor_full(lang, ast, sig, ctx)?
                 };
@@ -9862,12 +10093,125 @@ impl NbeTypecheckEngine {
         Ok(hom_former(dim_v, va, vb, ctx))
     }
 
+    /// Describe a grade/mode child as a `type.mode` descriptor
+    /// (`{head, arg, raw}` — pl-0002 M2; the model's
+    /// `mode_descriptor_` port): `Cost(3)` — a `call` whose callee is
+    /// a `var` — yields head `Cost`, payload the evaluated `3`, and
+    /// `raw` the `Cost(3)` application (the self-describing
+    /// call-head form); anything else yields head `null` and the
+    /// evaluated mode value as `raw` (bare modes compose under
+    /// `mode.algebra.default`). Payload arguments evaluate through
+    /// `eval_ann_node` — the same fuel-bounded evaluator annotation
+    /// checks use. A child the evaluator cannot reduce degrades to
+    /// the honest meta + warning, never a silent drop.
+    fn mode_descriptor(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Val, LangError> {
+        let node = ast.get(AstRef::new(node_idx)).ok_or_else(|| {
+            LangError::engine(format!("mode_descriptor: node {node_idx} out of bounds"))
+        })?;
+        // Unwrap one `paren` layer (the model's `mode_descriptor_`).
+        let (g_idx, g) = if node.kind == "paren" {
+            match children_of(node)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+            {
+                Some(i) => match ast.get(AstRef::new(i as usize)) {
+                    Some(inner) => (i as usize, inner),
+                    None => (node_idx, node),
+                },
+                None => (node_idx, node),
+            }
+        } else {
+            (node_idx, node)
+        };
+        if g.kind == "call" {
+            let kids = children_of(g).cloned().unwrap_or_default();
+            let callee_role = lang
+                .child_role_index("call", "callee")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let args_role = lang
+                .child_role_index("call", "args")
+                .ok()
+                .flatten()
+                .unwrap_or(1);
+            let head = kids
+                .get(callee_role)
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                .map(|cn| {
+                    // Unwrap a parenthesized callee too.
+                    if cn.kind == "paren" {
+                        children_of(cn)
+                            .and_then(|c| c.first())
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .unwrap_or(cn)
+                    } else {
+                        cn
+                    }
+                })
+                .filter(|cn| cn.kind == "var")
+                .and_then(node_name)
+                .filter(|n| !n.is_empty());
+            if let Some(h) = head {
+                // Call-head mode: evaluate each argument child; the
+                // first is the payload, all of them rebuild `raw`.
+                let mut arg_vals = Vec::new();
+                for i in args_role..kids.len() {
+                    let Some(ci) = kids[i].as_u64() else {
+                        arg_vals.push(Value::Null);
+                        continue;
+                    };
+                    match self.eval_ann_node(lang, ast, ci as usize, ctx) {
+                        Ok(v) => arg_vals.push(v),
+                        Err(_) => arg_vals.push(Value::Null),
+                    }
+                }
+                let payload = arg_vals.first().cloned().unwrap_or(Value::Null);
+                let raw_v = domain_lift(&app_term(var_term(&h), arg_vals), ctx);
+                let arg_v = domain_lift(&payload, ctx);
+                ctx.vcheck.mode_homs = true;
+                return Ok(ctx.vcheck.mode_desc(Some(&h), arg_v, raw_v));
+            }
+        }
+        // Bare mode: the whole child evaluates to the payload.
+        match self.eval_ann_node(lang, ast, g_idx, ctx) {
+            Ok(ev) => {
+                let raw_v = domain_lift(&ev, ctx);
+                ctx.vcheck.mode_homs = true;
+                Ok(ctx.vcheck.mode_desc(
+                    None,
+                    Val::Const(TaggedValue::Null),
+                    raw_v,
+                ))
+            }
+            Err(_) => {
+                let m = ctx.vcheck.mode_honest("mode child does not evaluate");
+                ctx.vcheck.mode_homs = true;
+                Ok(ctx.vcheck.mode_desc(
+                    None,
+                    Val::Const(TaggedValue::Null),
+                    m,
+                ))
+            }
+        }
+    }
+
     /// `A ~[G]~> B` — a graded arrow is a 1-cell with a grade annotation
-    /// (graded-arrows.md §4 P1): the emitted former is `Hom(1, src, tgt)`
-    /// — the grade never enters the `type.hom` index (ADR-0153 §6) — and
-    /// the grade child still synthesizes so names resolve and
-    /// diagnostics fire (well-formedness only; grade constraint
-    /// enforcement is deferred).
+    /// (graded-arrows.md §4 P1): the emitted former is
+    /// `Hom(1, src, tgt, mode)` — the mode descriptor rides the
+    /// optional 4th `type.hom` index (pl-0002 M2; conversion strips
+    /// it until M3 subsumption) — and the grade child still
+    /// synthesizes so names resolve and diagnostics fire
+    /// (well-formedness only; grade constraint enforcement is
+    /// deferred).
     pub(crate) fn synth_graded_arrow_judgment(
         &self,
         lang: &Language,
@@ -9913,11 +10257,13 @@ impl NbeTypecheckEngine {
         })(ctx);
         ctx.restore(law_mark);
         let (src, tgt) = judged?;
-        // A graded arrow is a 1-cell: `Hom(1, src, tgt)`.
+        // A graded arrow is a 1-cell: `Hom(1, src, tgt, mode)` — the
+        // mode descriptor rides the optional 4th index (pl-0002 M2).
+        let mode = self.mode_descriptor(lang, ast, grade_idx, ctx)?;
         let dim_v = Val::Const(TaggedValue::Int(1));
         let va = domain_lift(&src, ctx);
         let vb = domain_lift(&tgt, ctx);
-        Ok(hom_former(dim_v, va, vb, ctx))
+        Ok(hom_former_mode(dim_v, va, vb, Some(mode), ctx))
     }
 
     /// Bind the free `var`s of a `~[N]~>` law endpoint to fresh metas —
@@ -10161,7 +10507,11 @@ impl NbeTypecheckEngine {
                     .max()
                     .map(|m| Val::Const(TaggedValue::Int(m as i64)))
                     .unwrap_or_else(|| dim_meta(ctx));
-                Ok(hom_former(d, va, vb, ctx))
+                // The unchecked store still carries the composed mode
+                // (pl-0002 M2) — operands' descriptors paste through
+                // the same `mode.algebra.*` data.
+                let mode = ctx.vcheck.compose_cell_modes(&va, &vb);
+                Ok(hom_former_mode(d, va, vb, mode, ctx))
             }
         }
     }

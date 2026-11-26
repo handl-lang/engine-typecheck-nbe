@@ -6190,12 +6190,31 @@ impl TypecheckEngine for NbeTypecheckEngine {
         // The root node is the LAST node in the arena (Pratt convention).
         let root_ref = AstRef::new(req.ast.len() - 1);
         let mut ctx = TypecheckContext::new(&self.registry_id, self.globals.clone());
+        // Mode algebras (pl-0002 M2): `mode.algebra.*` language globals
+        // seed the `Val`-domain registry `comp_axis_of` consults when
+        // graded-arrow modes compose.
+        ctx.vcheck.mode_algebras = lang
+            .globals
+            .iter()
+            .filter(|(k, _)| k.starts_with("mode.algebra."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let typ = self.synth_node(lang, &req.ast, root_ref, &mut ctx)?;
         // Final evidence-obligation drain (phase-3 WS-A): deferred
         // instance goals whose index metas solved through the
         // expected-type unify retry once more; still-open obligations
         // are honest errors, never a silently unsolved dictionary meta.
         self.retry_pending_instances(&mut ctx, true)?;
+        // Mode-compose honest bounds minted inside the `Val` domain
+        // (pl-0002 M2): the `Checker` has no diagnostic channel, so
+        // its warnings drain here as `warning` diagnostics.
+        for w in std::mem::take(&mut ctx.vcheck.mode_warnings) {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: w,
+                span: None,
+            });
+        }
         // Zonk pass over every *reported* type — `node_types` (the
         // LSP's hover), the module `typ`, and each `Sig_m` field
         // (phase-3 spec / `hnl lsp` v2). A node's type is recorded
