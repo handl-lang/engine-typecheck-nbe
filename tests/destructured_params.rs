@@ -12,7 +12,7 @@ use hnl_tool_parse::{ParserEngine, ParserRequest};
 use hnl_tool_parse_pratt::PrattEngine;
 use hnl_tool_typecheck::{TypecheckEngine, TypecheckRequest};
 use hnl_tool_typecheck_nbe::NbeTypecheckEngine;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn lang() -> Language {
     let kit = handl_kit_data_prelude::assemble().expect("canonical assembly");
@@ -115,6 +115,22 @@ fn nested_sequence_pattern_types_recursively() {
         Some(2),
         "inner elements: {}",
         elems[1]
+    );
+}
+
+fn t_number() -> Value {
+    json!({"__tag__":"type.number","__registry__":"handl.canonical"})
+}
+
+/// `{x, y}` shorthand entries bind at the *value* level too: applying
+/// `g := ({x, y}) ~> x` destructures the record argument through
+/// `try_pattern_val` — the `entries` branch used to skip non-`entry`
+/// leaf children, so `x` stayed unbound (myco I-010 follow-up).
+#[test]
+fn shorthand_entries_bind_at_value_level() {
+    assert_eq!(
+        tc("do { g := ({x, y}) ~> x; r := {x: 1, y: 2}; g(r) }"),
+        t_number(),
     );
 }
 

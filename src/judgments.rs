@@ -1018,6 +1018,7 @@ fn try_pattern_val(
             };
             let mut rest_ref: Option<AstRef> = None;
             let mut entries: Vec<(String, AstRef)> = Vec::new();
+            let mut matched: Vec<String> = Vec::new();
             if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
                 for entry in children {
                     let Some(idx) = entry.as_u64() else { continue };
@@ -1025,6 +1026,24 @@ fn try_pattern_val(
                     let Some(cn) = ast.get(r) else { continue };
                     if lang.pattern_role_is(&cn.kind, "rest") == Some(true) {
                         rest_ref = Some(r);
+                        continue;
+                    }
+                    // Shorthand entry (`{x}` parses the leaf `var` itself
+                    // as the object child — key and binder are the same
+                    // name), mirroring `bind_pattern_node`'s entries
+                    // branch: the field is `x` and the value pattern is
+                    // the leaf node itself.
+                    if lang.pattern_role_is(&cn.kind, "entry") != Some(true)
+                        && crate::is_pattern_leaf(lang, cn)
+                        && let Some(name) = crate::pattern_leaf_name(cn)
+                    {
+                        let Some(field) = obj.get(name).cloned() else {
+                            return Ok(false);
+                        };
+                        matched.push(name.to_string());
+                        if !try_pattern_val(lang, ast, r, &Val::Const(field), env)? {
+                            return Ok(false);
+                        }
                         continue;
                     }
                     // `entry` nodes: literal `key` child names the
@@ -1044,7 +1063,6 @@ fn try_pattern_val(
                     entries.push((key, vref));
                 }
             }
-            let mut matched: Vec<String> = Vec::with_capacity(entries.len());
             for (key, vref) in &entries {
                 let Some(field) = obj.get(key.as_str()) else {
                     return Ok(false);

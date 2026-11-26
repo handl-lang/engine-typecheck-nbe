@@ -150,12 +150,27 @@ fn parity_null_literal() {
 }
 
 // ===========================================================================
-// Part B-2: Arithmetic (all operands type.number → type.number)
+// Part B-2: Arithmetic (binary.add is homogeneous — operands unify with
+// each other, result is the operand type; the rest are type.number →
+// type.number)
 // ===========================================================================
 
 #[test]
 fn parity_add() {
     assert_eq!(tc("1 + 2"), t_number());
+}
+
+#[test]
+fn parity_add_str_concat() {
+    // `+` is overloaded at runtime (`bin_add_pair`: Str+Str concatenates,
+    // Num+Num adds). The `type.binary.add` rule is the homogeneous
+    // approximation — operands unify with each other, result is the
+    // operand type — so string concatenation synthesizes type.string.
+    // Regression: lib-route's `pct_decode` (`acc + char.from_code_point(..)`)
+    // failed with "cannot unify — expected Number, got Str" when the rule
+    // hardcoded type.number on both operands.
+    assert_eq!(tc("\"a\" + \"b\""), t_string());
+    assert_eq!(tc("\"a\" + \"b\" + \"c\""), t_string());
 }
 
 #[test]
