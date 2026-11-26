@@ -1318,9 +1318,7 @@ impl NbeTypecheckEngine {
                                 ctx.registry
                                     .construct("type.interval", &Value::Null)
                                     .ok_or_else(|| {
-                                        LangError::engine(
-                                            "lookup: construct type.interval failed",
-                                        )
+                                        LangError::engine("lookup: construct type.interval failed")
                                     })
                             }
                         }

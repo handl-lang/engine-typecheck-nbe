@@ -80,10 +80,7 @@ fn insert_module_sig_field(
         inner.insert("fields".to_string(), Value::Object(Map::new()));
         *entry = make_tag(ctx, "type.record", inner);
     }
-    if let Some(inner_fields) = entry
-        .get_mut("fields")
-        .and_then(Value::as_object_mut)
-    {
+    if let Some(inner_fields) = entry.get_mut("fields").and_then(Value::as_object_mut) {
         insert_module_sig_field(inner_fields, rest, ty, ctx);
     }
 }
@@ -707,10 +704,7 @@ fn json_mode_hom(v: &Value) -> bool {
     if let Some(obj) = f.as_object() {
         if let Some(s) = obj.get("sym") {
             let args = obj.get("args").or_else(|| obj.get("indices"));
-            return head_is_hom(s)
-                && args
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| a.len() >= 4);
+            return head_is_hom(s) && args.and_then(Value::as_array).is_some_and(|a| a.len() >= 4);
         }
         // `{"__former__": <sym>}` — the sym payload itself; indices
         // are siblings on the parent object.
@@ -862,13 +856,7 @@ fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
 /// `hom_former` with the optional mode index (pl-0002 M2): `Some(m)`
 /// emits the 4-index `Hom(d, a, b, m)` carrying the mode descriptor —
 /// graded arrows only; dims never produce one.
-fn hom_former_mode(
-    d: Val,
-    a: Val,
-    b: Val,
-    mode: Option<Val>,
-    ctx: &TypecheckContext,
-) -> Value {
+fn hom_former_mode(d: Val, a: Val, b: Val, mode: Option<Val>, ctx: &TypecheckContext) -> Value {
     let mut args = vec![d, a, b];
     if let Some(m) = mode {
         args.push(m);
@@ -945,11 +933,7 @@ fn node_name(node: &AstNode) -> Option<String> {
 /// share the `[callee, args…]` layout; a bare `var` is the
 /// parameterless form (`new T { … }`). Returns `None` for a `type`
 /// child that is not a name-headed application.
-fn new_decl_schema(
-    lang: &Language,
-    ast: &Ast,
-    type_idx: usize,
-) -> Option<(String, Vec<usize>)> {
+fn new_decl_schema(lang: &Language, ast: &Ast, type_idx: usize) -> Option<(String, Vec<usize>)> {
     let mut node = ast.get(AstRef::new(type_idx))?;
     while node.kind == "paren" {
         let i = children_of(node)?.first()?.as_u64()? as usize;
@@ -972,9 +956,7 @@ fn new_decl_schema(
         .ok()
         .flatten()
         .unwrap_or(callee_role + 1);
-    let mut callee = ast.get(AstRef::new(
-        kids.get(callee_role)?.as_u64()? as usize,
-    ))?;
+    let mut callee = ast.get(AstRef::new(kids.get(callee_role)?.as_u64()? as usize))?;
     while callee.kind == "paren" {
         let i = children_of(callee)?.first()?.as_u64()? as usize;
         callee = ast.get(AstRef::new(i))?;
@@ -3122,9 +3104,7 @@ fn spec_node_index(
     let kind = obj
         .get("kind")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LangError::engine("inductive.spec: owned node missing kind".to_string())
-        })?
+        .ok_or_else(|| LangError::engine("inductive.spec: owned node missing kind".to_string()))?
         .to_string();
     let span = obj.get("span").and_then(|sp| {
         let start = sp.get("start").and_then(Value::as_u64)? as usize;
@@ -3140,9 +3120,7 @@ fn spec_node_index(
         _ => Map::new(),
     };
     let payload_is_obj = matches!(raw_payload, Value::Object(_));
-    if payload_is_obj
-        && let Some(Value::Array(items)) = payload.get("children").cloned()
-    {
+    if payload_is_obj && let Some(Value::Array(items)) = payload.get("children").cloned() {
         let mut idxs = Vec::with_capacity(items.len());
         for c in &items {
             if is_owned_node_value(c) {
@@ -3221,25 +3199,17 @@ fn spec_ctor_sig(
     if family.is_empty() {
         return Ok(None);
     }
-    let Some(spec) = ctx
-        .results
-        .get(&format!("{family}.spec"))
-        .cloned()
-    else {
+    let Some(spec) = ctx.results.get(&format!("{family}.spec")).cloned() else {
         return Ok(None);
     };
     if tag_of(&spec) != Some("inductive.spec") {
         return Ok(None);
     }
-    let Some(c) = spec
-        .get("ctors")
-        .and_then(Value::as_array)
-        .and_then(|cs| {
-            cs.iter()
-                .find(|c| c.get("name").and_then(Value::as_str) == Some(ctor))
-                .cloned()
-        })
-    else {
+    let Some(c) = spec.get("ctors").and_then(Value::as_array).and_then(|cs| {
+        cs.iter()
+            .find(|c| c.get("name").and_then(Value::as_str) == Some(ctor))
+            .cloned()
+    }) else {
         return Ok(None);
     };
     // Owned type-expr → spec-arena index; `null`/non-node stays `null`
@@ -3253,9 +3223,7 @@ fn spec_ctor_sig(
         .unwrap_or_default()
     {
         let node = match p.get("sort") {
-            Some(v) if is_owned_node_value(v) => {
-                Value::from(spec_node_index(ctx, ast, v)? as u64)
-            }
+            Some(v) if is_owned_node_value(v) => Value::from(spec_node_index(ctx, ast, v)? as u64),
             _ => Value::Null,
         };
         params.push(serde_json::json!({
@@ -3272,9 +3240,7 @@ fn spec_ctor_sig(
         .unwrap_or_default()
     {
         let node = match a.get("type") {
-            Some(v) if is_owned_node_value(v) => {
-                Value::from(spec_node_index(ctx, ast, v)? as u64)
-            }
+            Some(v) if is_owned_node_value(v) => Value::from(spec_node_index(ctx, ast, v)? as u64),
             _ => Value::Null,
         };
         args.push(serde_json::json!({
@@ -3283,9 +3249,7 @@ fn spec_ctor_sig(
         }));
     }
     let result = match c.get("result") {
-        Some(v) if is_owned_node_value(v) => {
-            Value::from(spec_node_index(ctx, ast, v)? as u64)
-        }
+        Some(v) if is_owned_node_value(v) => Value::from(spec_node_index(ctx, ast, v)? as u64),
         _ => Value::Null,
     };
     let spec_name = spec
@@ -3429,7 +3393,7 @@ impl NbeTypecheckEngine {
                             return Err(LangError::engine(format!(
                                 "dep_synth_type: node {} out of bounds",
                                 idx
-                            )))
+                            )));
                         }
                     }
                 }
@@ -3473,13 +3437,10 @@ impl NbeTypecheckEngine {
                                     })
                             });
                             if dependent {
-                                let param =
-                                    self.dep_synth_type(lang, ast, bs[0].1, ctx)?;
+                                let param = self.dep_synth_type(lang, ast, bs[0].1, ctx)?;
                                 let rest: Vec<Value> = bs[1..]
                                     .iter()
-                                    .map(|(n, a)| {
-                                        serde_json::json!({"name": n, "annot": a})
-                                    })
+                                    .map(|(n, a)| serde_json::json!({"name": n, "annot": a}))
                                     .collect();
                                 let last_annot = bs.last().map(|(_, a)| *a).unwrap_or(0);
                                 let mut m = Map::new();
@@ -3904,24 +3865,15 @@ impl NbeTypecheckEngine {
                             "dep_synth_type: graded_arrow missing operands",
                         ));
                     }
-                    let src_idx = kids[0]
-                        .as_u64()
-                        .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: graded_arrow src index")
-                        })?
-                        as usize;
-                    let grade_idx = kids[1]
-                        .as_u64()
-                        .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: graded_arrow grade index")
-                        })?
-                        as usize;
-                    let tgt_idx = kids[2]
-                        .as_u64()
-                        .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: graded_arrow tgt index")
-                        })?
-                        as usize;
+                    let src_idx = kids[0].as_u64().ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow src index")
+                    })? as usize;
+                    let grade_idx = kids[1].as_u64().ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow grade index")
+                    })? as usize;
+                    let tgt_idx = kids[2].as_u64().ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow tgt index")
+                    })? as usize;
                     let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
                     // Well-formedness: the grade expression must
                     // elaborate; the mode descriptor (pl-0002 M2)
@@ -4400,10 +4352,7 @@ impl NbeTypecheckEngine {
                                 && let Some(k) = node_name(n)
                             {
                                 let mut u = Map::new();
-                                m.insert(
-                                    k,
-                                    make_tag(ctx, "type.unknown", std::mem::take(&mut u)),
-                                );
+                                m.insert(k, make_tag(ctx, "type.unknown", std::mem::take(&mut u)));
                             }
                         }
                         Value::Object(m)
@@ -4855,11 +4804,7 @@ impl NbeTypecheckEngine {
     /// for anything else (untyped `var`, computed subject, non-annot).
     /// Shared by the dependent-pair `paren` arm and the typed-param
     /// `function` arm of [`Self::dep_synth_type`].
-    fn typed_binder(
-        lang: &Language,
-        ast: &Ast,
-        idx: usize,
-    ) -> Option<(String, usize)> {
+    fn typed_binder(lang: &Language, ast: &Ast, idx: usize) -> Option<(String, usize)> {
         let n = ast.get(AstRef::new(idx))?;
         if n.kind != "type-annot" && role_child_ref(lang, n, "annot").is_none() {
             return None;
@@ -4911,12 +4856,9 @@ impl NbeTypecheckEngine {
             .and_then(Value::as_str)
             .unwrap_or("x")
             .to_string();
-        let hannot = head
-            .get("annot")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                LangError::engine("dep_closure_chain: rest entry missing annot idx".to_string())
-            })? as usize;
+        let hannot = head.get("annot").and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine("dep_closure_chain: rest entry missing annot idx".to_string())
+        })? as usize;
         let param = self.dep_synth_type(lang, ast, hannot, ctx)?;
         let chain = bc.get("chain").and_then(Value::as_str).unwrap_or("sigma");
         if chain == "pi" {
@@ -6351,9 +6293,7 @@ impl NbeTypecheckEngine {
         if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
             && schema == "Constraint"
         {
-            return self.synth_new_constraint_decl(
-                lang, ast, node, name, type_idx, dict_idx, ctx,
-            );
+            return self.synth_new_constraint_decl(lang, ast, node, name, type_idx, dict_idx, ctx);
         }
         // `T(args)` — the algebra former application — must elaborate
         // as a type (well-formedness; names the algebra `Algebra` is
@@ -7481,7 +7421,10 @@ impl NbeTypecheckEngine {
         // `rest`-chain closures may carry no `body_child_idx` (sigma
         // chains terminate on the last binder's annotation), so the
         // index is only required on the non-chain path below.
-        let body_idx = bc.get("body_child_idx").and_then(Value::as_u64).map(|v| v as usize);
+        let body_idx = bc
+            .get("body_child_idx")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
         let bound = eval_index(term, ctx);
         // Occurs guard: `var_name` occurring inside its own binding
         // term (`Sigma(Nat, m ~> Vec(m, a))` applied at `var{m}+1` —
@@ -7512,9 +7455,8 @@ impl NbeTypecheckEngine {
         {
             self.dep_closure_chain(lang, ast, bc, rest, ctx)
         } else {
-            let body_idx = body_idx.ok_or_else(|| {
-                LangError::engine("dep_closure_apply: no body idx".to_string())
-            })?;
+            let body_idx = body_idx
+                .ok_or_else(|| LangError::engine("dep_closure_apply: no body idx".to_string()))?;
             self.dep_synth_type(lang, ast, body_idx, ctx)
         };
         match old {
@@ -10186,20 +10128,14 @@ impl NbeTypecheckEngine {
             Ok(ev) => {
                 let raw_v = domain_lift(&ev, ctx);
                 ctx.vcheck.mode_homs = true;
-                Ok(ctx.vcheck.mode_desc(
-                    None,
-                    Val::Const(TaggedValue::Null),
-                    raw_v,
-                ))
+                Ok(ctx
+                    .vcheck
+                    .mode_desc(None, Val::Const(TaggedValue::Null), raw_v))
             }
             Err(_) => {
                 let m = ctx.vcheck.mode_honest("mode child does not evaluate");
                 ctx.vcheck.mode_homs = true;
-                Ok(ctx.vcheck.mode_desc(
-                    None,
-                    Val::Const(TaggedValue::Null),
-                    m,
-                ))
+                Ok(ctx.vcheck.mode_desc(None, Val::Const(TaggedValue::Null), m))
             }
         }
     }

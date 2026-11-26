@@ -462,25 +462,28 @@ impl Checker {
                     })
                 }
             }
-            Val::Rigid { lvl, spine } => self.strip_spine_modes(spine.0.iter()).map(|args| {
-                Val::Rigid {
-                    lvl: *lvl,
-                    spine: Spine(args),
-                }
-            }),
-            Val::Flex { meta, spine } => self
-                .strip_spine_modes(spine.0.iter())
-                .map(|args| Val::Flex {
-                    meta: *meta,
-                    spine: Spine(args),
-                }),
-            Val::Unfold { name, spine, value } => self
-                .strip_spine_modes(spine.0.iter())
-                .map(|args| Val::Unfold {
-                    name: name.clone(),
-                    spine: Spine(args),
-                    value: value.clone(),
-                }),
+            Val::Rigid { lvl, spine } => {
+                self.strip_spine_modes(spine.0.iter())
+                    .map(|args| Val::Rigid {
+                        lvl: *lvl,
+                        spine: Spine(args),
+                    })
+            }
+            Val::Flex { meta, spine } => {
+                self.strip_spine_modes(spine.0.iter())
+                    .map(|args| Val::Flex {
+                        meta: *meta,
+                        spine: Spine(args),
+                    })
+            }
+            Val::Unfold { name, spine, value } => {
+                self.strip_spine_modes(spine.0.iter())
+                    .map(|args| Val::Unfold {
+                        name: name.clone(),
+                        spine: Spine(args),
+                        value: value.clone(),
+                    })
+            }
             Val::Arrow(a) => {
                 let mut changed = false;
                 let mut binds = (*a.binds).clone();
@@ -506,10 +509,7 @@ impl Checker {
 
     /// Strip helper for elimination spines — `None` when no element
     /// changed (avoids rebuilding the `Val` wrapper).
-    fn strip_spine_modes<'a>(
-        &mut self,
-        args: impl Iterator<Item = &'a Val>,
-    ) -> Option<Vec<Val>> {
+    fn strip_spine_modes<'a>(&mut self, args: impl Iterator<Item = &'a Val>) -> Option<Vec<Val>> {
         let mut changed = false;
         let mut out = Vec::new();
         for arg in args {
@@ -1082,12 +1082,7 @@ impl Checker {
             };
             (sub(sa, sb), sub(ta_b, tb_b))
         };
-        Ok(self.hom_with_mode(
-            Val::Const(TaggedValue::Int(d as i64)),
-            src,
-            tgt,
-            &cell_mode,
-        ))
+        Ok(self.hom_with_mode(Val::Const(TaggedValue::Int(d as i64)), src, tgt, &cell_mode))
     }
 
     /// `Hom(d, s, t)` with the optional mode index attached
@@ -1168,10 +1163,7 @@ impl Checker {
     /// `null` placeholder (a call with no args, or a bare mode whose
     /// payload is `raw`).
     fn mode_payload(&self, arg: &Val, raw: &Val) -> Val {
-        if matches!(
-            self.metas.force_head(arg),
-            Val::Const(TaggedValue::Null)
-        ) {
+        if matches!(self.metas.force_head(arg), Val::Const(TaggedValue::Null)) {
             raw.clone()
         } else {
             arg.clone()
@@ -1230,9 +1222,7 @@ impl Checker {
         // heads): no single algebra governs the pair — honest bound.
         let hname = ha.as_deref().unwrap_or("<default>");
         let gname = hb.as_deref().unwrap_or("<default>");
-        let m = self.mode_honest(&format!(
-            "mismatched mode algebras ({hname} vs {gname})"
-        ));
+        let m = self.mode_honest(&format!("mismatched mode algebras ({hname} vs {gname})"));
         self.mode_desc(None, null(), m)
     }
 
@@ -1242,12 +1232,7 @@ impl Checker {
     /// JSON and cannot hold closures, so user algebras arrive as named
     /// ops until the instance machinery lands). Anything else is the
     /// honest bound (the model's `mode_apply_compose_`).
-    fn mode_apply_compose(
-        &mut self,
-        alg: Option<serde_json::Value>,
-        a: &Val,
-        b: &Val,
-    ) -> Val {
+    fn mode_apply_compose(&mut self, alg: Option<serde_json::Value>, a: &Val, b: &Val) -> Val {
         let op = alg
             .as_ref()
             .and_then(|g| g.get("compose"))
@@ -1265,9 +1250,7 @@ impl Checker {
                     self.mode_honest("modes differ under `eq`")
                 }
             }
-            Some(other) => {
-                self.mode_honest(&format!("unknown algebra compose op `{other}`"))
-            }
+            Some(other) => self.mode_honest(&format!("unknown algebra compose op `{other}`")),
             None => self.mode_honest("algebra has no applicable compose"),
         }
     }
@@ -1281,9 +1264,7 @@ impl Checker {
             return n;
         }
         let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
-        if let (Val::Const(TaggedValue::Obj(_)), Val::Const(TaggedValue::Obj(_))) =
-            (fa, fb)
-        {
+        if let (Val::Const(TaggedValue::Obj(_)), Val::Const(TaggedValue::Obj(_))) = (fa, fb) {
             return self.mode_rows_union(a, b);
         }
         if self.mode_val_eq(a, b) {
@@ -1305,9 +1286,7 @@ impl Checker {
     /// silent pick. Non-record operands are the honest bound too.
     fn mode_rows_union(&mut self, a: &Val, b: &Val) -> Val {
         let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
-        if let (Val::Const(TaggedValue::Obj(x)), Val::Const(TaggedValue::Obj(y))) =
-            (fa, fb)
-        {
+        if let (Val::Const(TaggedValue::Obj(x)), Val::Const(TaggedValue::Obj(y))) = (fa, fb) {
             for (k, v) in y.iter() {
                 if let Some(w) = x.get(k.as_ref())
                     && !handl_value::eq(w, v)
@@ -1376,8 +1355,7 @@ impl Checker {
     /// `handle_sig_check` convention).
     pub(crate) fn mode_honest(&mut self, what: &str) -> Val {
         let m = self.fresh_meta(Val::Universe(0));
-        self.mode_warnings
-            .push(format!("mode compose: {what}"));
+        self.mode_warnings.push(format!("mode compose: {what}"));
         self.meta_val(m)
     }
 
