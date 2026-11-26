@@ -1473,7 +1473,7 @@ impl Checker {
             (Val::Arrow(x), Val::Arrow(y)) => x
                 .binds
                 .iter()
-                .all(|(k, v)| y.binds.get(k).map_or(true, |w| self.mode_walk_sub(v, w))),
+                .all(|(k, v)| y.binds.get(k).is_none_or(|w| self.mode_walk_sub(v, w))),
             _ => true,
         }
     }
