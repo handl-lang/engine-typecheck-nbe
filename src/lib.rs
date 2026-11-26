@@ -2212,7 +2212,7 @@ impl NbeTypecheckEngine {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_handle: node out of bounds".to_string())
                     })?;
-                    self.synth_handle_judgment(lang, ast, node, ctx)
+                    self.synth_handle_judgment(lang, ast, node, node_ref.index(), ctx)
                 }
                 "synth_dim_arrow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
@@ -2311,7 +2311,7 @@ impl NbeTypecheckEngine {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_flow: node out of bounds".to_string())
                     })?;
-                    self.synth_flow_judgment(lang, ast, node, ctx)
+                    self.synth_flow_judgment(lang, ast, node, node_ref.index(), ctx)
                 }
                 "synth_axis_flow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
@@ -2628,12 +2628,21 @@ impl NbeTypecheckEngine {
                     // hits the same `mode_ascribe` arm; the mode-set
                     // cache keeps elaboration single.
                     let mode_scope = self.mode_ascription_at(lang, ast, type_idx, ctx)?;
-                    let prev_mode = mode_scope.map(|m| ctx.ambient_mode.replace(m));
+                    let prev_mode = mode_scope.clone().map(|m| ctx.ambient_mode.replace(m));
                     let expr_res = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx);
                     if let Some(p) = prev_mode {
                         ctx.ambient_mode = p;
                     }
                     let expr_type = expr_res?;
+                    // PL-0004 E2: effect widening — the subject's own
+                    // ambient mode must be ≤ the ascribed μ (the
+                    // `Effects` algebra's `order`/`row_width` at the
+                    // ambient site). Terms with no recorded mode pass.
+                    if let Some(mu_a) = &mode_scope
+                        && let Some(mu_v) = self.mode_of_node(ast, expr_idx, ctx)
+                    {
+                        self.check_mode_subsumption(&mu_v, mu_a, ctx)?;
+                    }
                     let type_node = ast.get(AstRef::new(type_idx)).ok_or_else(|| {
                         LangError::engine(format!(
                             "synth_type_annot: type node {} out of bounds",
@@ -6549,6 +6558,22 @@ struct TypecheckContext {
     /// annotation pre-scan (`synth_type_annot`) and `dep_synth_type`'s
     /// `mode_ascribe` arm reach it (no duplicate diagnostics).
     mode_set_cache: HashMap<usize, Value>,
+    /// Effects performed under the ambient mode, in synthesis order
+    /// (PL-0004 E2): `(op name, op row-entry type `A ~> B`)` appended
+    /// by `synth_perform`'s ambient arm — the judgement-mode extension
+    /// `perform` records so `handle` can compute the residual row.
+    /// `synth_handle_judgment` slices from a mark taken before its
+    /// target's synthesis and rewrites the slice to the residual, so
+    /// nested handles propagate exactly the unhandled ops outward.
+    performed_effects: Vec<(String, Value)>,
+    /// Ambient modes of named bindings (PL-0004 E2): `(name, mode_set
+    /// or Null, gamma_len at bind)` — `mode_of_node` resolves a `var`
+    /// operand's judgement mode for `>>>` row composition, `handle`
+    /// coverage, and ascription subsumption. The `gamma_len` stamp
+    /// keeps entries honest under `mark`/`restore`: an entry is valid
+    /// only while `gamma.len() >= stamp` (its binding is still in
+    /// scope), so popped scopes never leak modes to later siblings.
+    binding_modes: Vec<(String, Value, usize)>,
 }
 
 /// A registered dictionary instance (phase-3 WS-A): the elaboration
@@ -6621,6 +6646,8 @@ impl TypecheckContext {
             ambient_mode: None,
             node_modes: HashMap::new(),
             mode_set_cache: HashMap::new(),
+            performed_effects: Vec::new(),
+            binding_modes: Vec::new(),
         }
     }
 
@@ -6709,6 +6736,30 @@ impl TypecheckContext {
     /// Look up a binding by index in Γ (0 = outermost).
     fn lookup_index(&self, idx: usize) -> Option<&Value> {
         self.gamma.get(idx).map(|(_, v)| v)
+    }
+
+    /// Record a named binding's ambient mode (PL-0004 E2). Call *after*
+    /// [`extend`](Self::extend) so the `gamma_len` stamp marks the
+    /// binding's scope: the entry stays valid while
+    /// `gamma.len() >= stamp` and is ignored once `restore` pops past
+    /// it. `None` pushes the `Null` marker — an un-annotated binding
+    /// shadows an outer mode-carrying binding of the same name rather
+    /// than inheriting its mode.
+    fn bind_mode(&mut self, name: String, mode: Option<Value>) {
+        self.binding_modes
+            .push((name, mode.unwrap_or(Value::Null), self.gamma.len()));
+    }
+
+    /// The ambient mode recorded for `name` by [`bind_mode`](Self::bind_mode)
+    /// — reverse scan (innermost first), skipping entries whose scope
+    /// stamp outlived a `restore`. `Value::Null` marks "bound without a
+    /// mode" (pure); callers treat it as no mode.
+    fn lookup_binding_mode(&self, name: &str) -> Option<&Value> {
+        self.binding_modes
+            .iter()
+            .rev()
+            .find(|(n, _, stamp)| n == name && *stamp <= self.gamma.len())
+            .map(|(_, m, _)| m)
     }
 
     /// The `TermData` form of a lang-owned rule `Term`, converting once
