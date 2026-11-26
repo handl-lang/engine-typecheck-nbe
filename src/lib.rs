@@ -2226,6 +2226,12 @@ impl NbeTypecheckEngine {
                     })?;
                     self.synth_graded_arrow_judgment(lang, ast, node, ctx)
                 }
+                "synth_mode_ascribe" => {
+                    // PL-0004 E1: `e @ μ` in term position — synth the
+                    // subject under the ascribed ambient mode and record
+                    // the mode set on the node (`Γ ⊢ t : A @ μ`).
+                    self.synth_mode_ascribe_judgment(lang, ast, node_ref.index(), ctx)
+                }
                 "synth_transport" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_transport: node out of bounds".to_string())
@@ -2614,7 +2620,20 @@ impl NbeTypecheckEngine {
                             node,
                         )
                     })? as usize;
-                    let expr_type = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx)?;
+                    // PL-0004 E1: `expr : T @ μ` — a `mode_ascribe`
+                    // annotation carries the judgement's ambient mode.
+                    // Elaborate it *before* judging the subject so the
+                    // subject checks under `μ` (`None` = pure — the
+                    // un-annotated default). `dep_synth_type` below
+                    // hits the same `mode_ascribe` arm; the mode-set
+                    // cache keeps elaboration single.
+                    let mode_scope = self.mode_ascription_at(lang, ast, type_idx, ctx)?;
+                    let prev_mode = mode_scope.map(|m| ctx.ambient_mode.replace(m));
+                    let expr_res = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx);
+                    if let Some(p) = prev_mode {
+                        ctx.ambient_mode = p;
+                    }
+                    let expr_type = expr_res?;
                     let type_node = ast.get(AstRef::new(type_idx)).ok_or_else(|| {
                         LangError::engine(format!(
                             "synth_type_annot: type node {} out of bounds",
@@ -6512,6 +6531,24 @@ struct TypecheckContext {
     /// escape into elaborated `type.pi`/`type.sigma` closures still
     /// resolve against the appended nodes.
     spec_ast: Option<Ast>,
+    /// The ambient mode `μ` of the judgement currently being checked
+    /// (PL-0004 E1; `Γ ⊢ t : A @ μ`): `Some(mode_set)` while the
+    /// subject/value of a `T @ μ` ascription is judged, `None` = the
+    /// pure/empty mode — un-annotated code is unaffected. Mode sets
+    /// are the tagged `type.mode_set` values
+    /// [`NbeTypecheckEngine::elaborate_mode_set`] mints; consumers
+    /// (perform/handle modality, mode-polymorphic instantiation) are
+    /// E2/E3 — E1 plumbs the slot and records ascriptions only.
+    ambient_mode: Option<Value>,
+    /// Ascribed mode sets by `mode_ascribe` node index — the
+    /// judgement metadata `Γ ⊢ t : A @ μ` records (the mode is never
+    /// part of `A`).
+    node_modes: HashMap<usize, Value>,
+    /// Elaborated mode sets by *mode-expression* child index — lets a
+    /// `mode_ascribe` node's set elaborate once even when both the
+    /// annotation pre-scan (`synth_type_annot`) and `dep_synth_type`'s
+    /// `mode_ascribe` arm reach it (no duplicate diagnostics).
+    mode_set_cache: HashMap<usize, Value>,
 }
 
 /// A registered dictionary instance (phase-3 WS-A): the elaboration
@@ -6581,6 +6618,9 @@ impl TypecheckContext {
             scheme_td: HashMap::new(),
             loose: 0,
             spec_ast: None,
+            ambient_mode: None,
+            node_modes: HashMap::new(),
+            mode_set_cache: HashMap::new(),
         }
     }
 

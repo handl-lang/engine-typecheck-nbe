@@ -3578,6 +3578,29 @@ impl NbeTypecheckEngine {
                         })?;
                     self.dep_synth_type(lang, ast, annot.index(), ctx)
                 }
+                "mode_ascribe" => {
+                    // `T @ μ` in type position (PL-0004 E1): the `type`
+                    // child synthesizes unchanged — the mode is
+                    // judgement metadata (`Γ ⊢ t : A @ μ` keeps `A`
+                    // and `μ` separate), never part of the type. The
+                    // elaborated mode set is recorded on the node for
+                    // `synth_type_annot`/`synth_assign` to scope the
+                    // ambient mode over the judged subject/value.
+                    let ty_idx = role_child_ref(lang, node, "type")
+                        .or_else(|| child_at(ast, node, 0))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: mode_ascribe missing type child")
+                        })?;
+                    let mode_idx = role_child_ref(lang, node, "mode")
+                        .or_else(|| child_at(ast, node, 1))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: mode_ascribe missing mode child")
+                        })?;
+                    let ty = self.dep_synth_type(lang, ast, ty_idx.index(), ctx)?;
+                    let mu = self.elaborate_mode_set(lang, ast, mode_idx.index(), ctx)?;
+                    ctx.node_modes.insert(idx, mu);
+                    Ok(ty)
+                }
                 "value" | "lit" => Ok(node.payload.clone()),
                 "var" => self.dep_synth_var_type(lang, ast, node, ctx),
                 "field-access" => {
@@ -4136,7 +4159,13 @@ impl NbeTypecheckEngine {
             "Null" => "type.null",
             // Bare `IO` = `IO(⊤)` — the arity-0 `Former{type.io}`
             // (any signature) for backward compat (ADR-0153 §4).
+            // PL-0004 E1 deprecation, same as the applied form.
             "IO" => {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: "`IO` is deprecated (PL-0004 effects-as-ambient-modes): effects are ambient modes — write the judgement `T @ [Effects(S)]` instead".to_string(),
+                    span: None,
+                });
                 return Ok(domain_quote(
                     &Val::Former {
                         head: checker::type_sym("type.io"),
@@ -4415,6 +4444,16 @@ impl NbeTypecheckEngine {
                     // canonical `Former{type.io}` data. The sig index is
                     // an op-signature record — `{op: T, …}` entries
                     // synthesize their value types; `IO()` is `IO(⊤)`.
+                    // PL-0004 E1 deprecation: the codomain former is
+                    // retired in the final state — effects are ambient
+                    // modes (`T @ [Effects(S)]`). Warn, don't reject:
+                    // the corpus migrates phase by phase (pl-0004 E1
+                    // blast-radius decision — diagnostic, not removal).
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: "`IO(…)`/`IO<…>` is deprecated (PL-0004 effects-as-ambient-modes): effects are ambient modes — write the judgement `T @ [Effects(S)]` instead".to_string(),
+                        span: node.span,
+                    });
                     // The brace-free `IO<puts, fs>` / `IO<puts: T, fs>`
                     // spelling — the `dimension` node's argument list,
                     // unambiguous there: each arg is an expression, a
@@ -6405,6 +6444,16 @@ impl NbeTypecheckEngine {
                     .to_string(),
                 node,
             ));
+        }
+        // PL-0004 E1: `X := new Algebra(…)` heads resolve in `@ [X(p), …]`
+        // mode ascriptions — name-level resolution only; the algebra's
+        // `compose`/`unit`/`order` live in the instance table the `Val`
+        // domain cannot evaluate, so composing through the head still
+        // takes the honest bound until the bridge lands (E2+).
+        if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
+            && schema == "Algebra"
+        {
+            ctx.vcheck.algebra_heads.insert(name.to_string());
         }
         // `T(args)` — the algebra former application — must elaborate
         // as a type (well-formedness; names the algebra `Algebra` is
@@ -10341,6 +10390,366 @@ impl NbeTypecheckEngine {
         }
     }
 
+    // -- PL-0004 E1: `@ μ` ambient-mode ascription ---------------------
+    //
+    // `T @ μ` mints a `mode_ascribe` node (grammar.mode_ascribe.infix).
+    // The mode is judgement metadata — `Γ ⊢ t : A @ μ` keeps `A` and
+    // `μ` separate — so `dep_synth_type`'s `mode_ascribe` arm returns
+    // the `type` child's synthesis unchanged and records the
+    // elaborated mode set on the node. The helpers below turn the mode
+    // *expression* (`[Effects(S), Cost(3)]`, `m`, `Effects(S)`, `[]`)
+    // into the canonical tagged `type.mode_set` value.
+
+    /// The mode child index of a `mode_ascribe` node at `idx`,
+    /// unwrapping `paren` layers — `None` for any other kind.
+    fn mode_ascribe_mode_child(&self, lang: &Language, ast: &Ast, idx: usize) -> Option<usize> {
+        let mut node = ast.get(AstRef::new(idx))?;
+        while node.kind == "paren" {
+            let i = children_of(node)?.first()?.as_u64()? as usize;
+            node = ast.get(AstRef::new(i))?;
+        }
+        if node.kind != "mode_ascribe" {
+            return None;
+        }
+        role_child_ref(lang, node, "mode")
+            .or_else(|| child_at(ast, node, 1))
+            .map(|r| r.index())
+    }
+
+    /// The ambient mode a `type`-position node ascribes, if it is a
+    /// `mode_ascribe` (possibly under `paren`s): elaborates the mode
+    /// set and returns `Some(μ)`. `synth_type_annot` calls this *before*
+    /// judging the subject so `expr : T @ μ` checks `expr` under `μ`;
+    /// `dep_synth_type`'s own `mode_ascribe` arm populates
+    /// `ctx.node_modes` when the annotation elaborates.
+    pub(crate) fn mode_ascription_at(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<Value>, LangError> {
+        let Some(mode_idx) = self.mode_ascribe_mode_child(lang, ast, idx) else {
+            return Ok(None);
+        };
+        Ok(Some(self.elaborate_mode_set(lang, ast, mode_idx, ctx)?))
+    }
+
+    /// Elaborate a `@ μ` mode expression into the canonical
+    /// `{"__tag__": "type.mode_set", "modes": […]}` value (PL-0004 E1).
+    /// Each element mirrors the `type.mode` descriptor triple
+    /// `{head, arg, raw}`: `Algebra(payload)` call-heads carry the
+    /// algebra name + first evaluated payload arg + the
+    /// self-describing `App` form; bare modes carry `head`/`arg` null
+    /// and the evaluated mode value as `raw`.
+    ///
+    /// Set semantics (design/effects-ambient-modes.md §1): an `array`
+    /// operand is the bracketed set — order irrelevant, one element
+    /// per algebra head, duplicate heads *rejected*; any other operand
+    /// is a single mode element (`@ m`, `@ Effects(S)`).
+    ///
+    /// Head resolution: `mode.algebra.<head>` globals or heads declared
+    /// by `X := new Algebra(…)` (`Checker::algebra_heads`). An
+    /// unresolvable head passes with a warning — the mode-metavariable
+    /// honest bound (M3 posture), never a rejection. Cached per
+    /// mode-expression node so pre-scan and `dep_synth_type` elaborate
+    /// once.
+    pub(crate) fn elaborate_mode_set(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        mode_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        if let Some(mu) = ctx.mode_set_cache.get(&mode_idx) {
+            return Ok(mu.clone());
+        }
+        let node = ast.get(AstRef::new(mode_idx)).ok_or_else(|| {
+            LangError::engine(format!("mode_ascribe: mode node {mode_idx} out of bounds"))
+        })?;
+        // `[…]` is the set form; anything else is one mode element.
+        let element_idxs: Vec<usize> = if node.kind == "array" {
+            children_of(node)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|v| v as usize)
+                .collect()
+        } else {
+            vec![mode_idx]
+        };
+        let mut modes = Vec::with_capacity(element_idxs.len());
+        let mut heads = std::collections::HashSet::new();
+        for ei in element_idxs {
+            let enode = ast.get(AstRef::new(ei)).ok_or_else(|| {
+                LangError::engine(format!("mode_ascribe: element node {ei} out of bounds"))
+            })?;
+            let (head, element) = self.mode_element(lang, ast, ei, enode, ctx)?;
+            if let Some(h) = &head {
+                if !heads.insert(h.clone()) {
+                    return Err(LangError::engine_node(
+                        format!(
+                            "mode ascription: duplicate algebra head `{h}` — a mode set holds one element per algebra"
+                        ),
+                        enode,
+                    ));
+                }
+                let registered = ctx
+                    .vcheck
+                    .mode_algebras
+                    .contains_key(&format!("mode.algebra.{h}"))
+                    || ctx.vcheck.algebra_heads.contains(h);
+                if !registered {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "mode ascription: unknown algebra head `{h}` — passing (honest bound; declare it with `new Algebra` or register `mode.algebra.{h}`)"
+                        ),
+                        span: enode.span,
+                    });
+                }
+            }
+            modes.push(element);
+        }
+        let mut m = Map::new();
+        m.insert(
+            "__tag__".to_string(),
+            Value::String("type.mode_set".to_string()),
+        );
+        m.insert(
+            "__registry__".to_string(),
+            Value::String(ctx.registry.registry_id().to_string()),
+        );
+        m.insert("modes".to_string(), Value::Array(modes));
+        let set = Value::Object(m);
+        ctx.mode_set_cache.insert(mode_idx, set.clone());
+        Ok(set)
+    }
+
+    /// One `@ […]` element → `(head, element)` where `element` is the
+    /// `{head, arg, raw}` JSON triple. `Algebra(payload)` — a `call`
+    /// whose callee unwraps to a `var` — is a call-head mode;
+    /// anything else evaluates as a bare mode. A mode expression the
+    /// evaluator cannot reduce degrades to a fresh meta + warning —
+    /// the honest bound, never a silent drop (the `mode_descriptor`
+    /// convention).
+    fn mode_element(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(Option<String>, Value), LangError> {
+        // Unwrap one `paren` layer (the model's `mode_descriptor_`).
+        let (e_idx, e) = if node.kind == "paren" {
+            match children_of(node)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+            {
+                Some(i) => match ast.get(AstRef::new(i as usize)) {
+                    Some(inner) => (i as usize, inner),
+                    None => (idx, node),
+                },
+                None => (idx, node),
+            }
+        } else {
+            (idx, node)
+        };
+        if e.kind == "call" {
+            let kids = children_of(e).cloned().unwrap_or_default();
+            let callee_role = lang
+                .child_role_index("call", "callee")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let args_role = lang
+                .child_role_index("call", "args")
+                .ok()
+                .flatten()
+                .unwrap_or(1);
+            let head = kids
+                .get(callee_role)
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                .map(|cn| {
+                    if cn.kind == "paren" {
+                        children_of(cn)
+                            .and_then(|c| c.first())
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .unwrap_or(cn)
+                    } else {
+                        cn
+                    }
+                })
+                .filter(|cn| cn.kind == "var")
+                .and_then(node_name)
+                .filter(|n| !n.is_empty());
+            if let Some(h) = head {
+                // Call-head mode: each argument elaborates as a mode
+                // payload; the first is `arg`, all rebuild `raw`.
+                let mut arg_vals = Vec::new();
+                for i in args_role..kids.len() {
+                    let Some(ci) = kids[i].as_u64() else {
+                        arg_vals.push(Value::Null);
+                        continue;
+                    };
+                    arg_vals.push(self.mode_payload_value(lang, ast, ci as usize, ctx));
+                }
+                let payload = arg_vals.first().cloned().unwrap_or(Value::Null);
+                let raw = app_term(var_term(&h), arg_vals);
+                let mut em = Map::new();
+                em.insert("head".to_string(), Value::String(h.clone()));
+                em.insert("arg".to_string(), payload);
+                em.insert("raw".to_string(), raw);
+                return Ok((Some(h), Value::Object(em)));
+            }
+        }
+        // Bare mode element — the whole child is the payload. An
+        // unevaluable mode is the honest bound (fresh meta + warning).
+        let raw = self.mode_payload_value(lang, ast, e_idx, ctx);
+        // A bare `var` payload that resolves nowhere is a mode
+        // metavariable — the M3 honest bound: it passes, with a
+        // warning naming the gap (rigid bound vars in `results`/Γ are
+        // legitimate mode polymorphism and stay silent).
+        if let Some(name) = raw
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|_| raw.get("__tag__").and_then(Value::as_str) == Some("var"))
+        {
+            let resolvable = ctx.results.contains_key(name)
+                || ctx.lookup(name).is_some()
+                || lang.globals.contains_key(name);
+            if !resolvable {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "mode ascription: mode metavariable `{name}` does not resolve — passing (honest bound)"
+                    ),
+                    span: e.span,
+                });
+            }
+        }
+        let mut em = Map::new();
+        em.insert("head".to_string(), Value::Null);
+        em.insert("arg".to_string(), Value::Null);
+        em.insert("raw".to_string(), raw);
+        Ok((None, Value::Object(em)))
+    }
+
+    /// A mode payload value: record literals (`{op: A ~> B}` — the
+    /// `Effects(S)` row shape) elaborate entry-wise through `io_sig`,
+    /// the same op-name → value-type reading `IO<{…}>` sigs use.
+    /// Every other payload evaluates as an annotation term first
+    /// (`Cost(3)` → `3`, `Session(!T)` → the symbolic term), falling
+    /// back to type synthesis for type-expression payloads and to a
+    /// fresh meta + warning — the honest bound — when neither works.
+    fn mode_payload_value(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Value {
+        let Some(node) = ast.get(AstRef::new(idx)) else {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: "mode ascription: payload node out of bounds — honest bound".to_string(),
+                span: None,
+            });
+            return meta_value(ctx.fresh_meta());
+        };
+        let honest = |ctx: &mut TypecheckContext| -> Value {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message:
+                    "mode ascription: payload does not elaborate — bound to a fresh meta (honest bound)"
+                        .to_string(),
+                span: node.span,
+            });
+            meta_value(ctx.fresh_meta())
+        };
+        if matches!(node.kind.as_str(), "object" | "block") {
+            return self
+                .io_sig(lang, ast, idx, ctx)
+                .unwrap_or_else(|_| honest(ctx));
+        }
+        // Type-expression kinds synthesize as types first (an arrow
+        // payload is a *type*, not a closure value); everything else
+        // evaluates as a term first.
+        let type_first = matches!(
+            node.kind.as_str(),
+            "function"
+                | "dim_arrow"
+                | "graded_arrow"
+                | "pi"
+                | "sigma"
+                | "forall"
+                | "exists"
+                | "family"
+                | "type-annot"
+                | "mode_ascribe"
+        );
+        if type_first {
+            if let Ok(t) = self.dep_synth_type(lang, ast, idx, ctx) {
+                return t;
+            }
+        }
+        if let Ok(v) = self.eval_ann_node(lang, ast, idx, ctx) {
+            return v;
+        }
+        if !type_first && let Ok(t) = self.dep_synth_type(lang, ast, idx, ctx) {
+            return t;
+        }
+        honest(ctx)
+    }
+
+    /// `e @ μ` / the term-position reading of `mode_ascribe`
+    /// (PL-0004 E1): synthesize the subject under the ascribed ambient
+    /// mode and record the elaborated mode set on the node. In *type*
+    /// position `dep_synth_type`'s `mode_ascribe` arm handles the node
+    /// before this judgment is reached.
+    pub(crate) fn synth_mode_ascribe_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
+            LangError::engine(format!("synth_mode_ascribe: node {idx} out of bounds"))
+        })?;
+        let kids = children_of(node)
+            .ok_or_else(|| LangError::engine("synth_mode_ascribe: no children".to_string()))?;
+        if kids.len() < 2 {
+            return Err(LangError::engine(
+                "synth_mode_ascribe: needs [type, mode] children".to_string(),
+            ));
+        }
+        let subj_idx = role_child_ref(lang, node, "type")
+            .or_else(|| child_at(ast, node, 0))
+            .ok_or_else(|| {
+                LangError::engine("synth_mode_ascribe: missing type child".to_string())
+            })?;
+        let mode_idx = role_child_ref(lang, node, "mode")
+            .or_else(|| child_at(ast, node, 1))
+            .ok_or_else(|| {
+                LangError::engine("synth_mode_ascribe: missing mode child".to_string())
+            })?;
+        // Elaborate the mode first (annotation discipline — diagnostics
+        // fire even when the subject fails), then judge the subject
+        // under the ascribed ambient mode.
+        let mu = self.elaborate_mode_set(lang, ast, mode_idx.index(), ctx)?;
+        let prev = ctx.ambient_mode.replace(mu.clone());
+        let res = self.synth_node(lang, ast, AstRef::new(subj_idx.index()), ctx);
+        ctx.ambient_mode = prev;
+        let ty = res?;
+        ctx.node_modes.insert(idx, mu);
+        Ok(ty)
+    }
+
     /// `A ~[G]~> B` — a graded arrow is a 1-cell with a grade annotation
     /// (graded-arrows.md §4 P1): the emitted former is
     /// `Hom(1, src, tgt, mode)` — the mode descriptor rides the
@@ -11875,8 +12284,21 @@ impl NbeTypecheckEngine {
             }
             let ann = match self
                 .dep_synth_type(lang, ast, ann_ref.index(), ctx)
-                .or_else(|_| crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry))
-            {
+                .or_else(|dep_err| {
+                    // `mode_ascribe` is `dep_synth_type`'s own node —
+                    // its errors (duplicate algebra heads, malformed
+                    // mode sets) are authoritative; the
+                    // `interpret_type_expr`/term fallbacks cannot read
+                    // the node and would mask the real diagnostic.
+                    if self
+                        .mode_ascribe_mode_child(lang, ast, ann_ref.index())
+                        .is_some()
+                    {
+                        Err(dep_err)
+                    } else {
+                        crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)
+                    }
+                }) {
                 // A term-valued annotation (e.g. `call` on a results-bound
                 // name — `inc(4)` lowers to `App{var inc, [4]}`) reduces
                 // against the bound-value env before classification.
@@ -11938,6 +12360,18 @@ impl NbeTypecheckEngine {
             };
             ctx.restore(binder_mark);
             ctx.results = binder_results;
+            // PL-0004 E1: `x : T @ μ := v` — the annotation's ambient
+            // mode scopes over the *value* judgement (`Γ ⊢ v : T @ μ`).
+            // `dep_synth_type` above populated `node_modes` when the
+            // annotation was a `mode_ascribe`; restore on exit so the
+            // mode never leaks past the binding. (Error paths abort the
+            // whole check, so an early `?` leaking `ambient_mode` is
+            // unreachable in a successful run.)
+            // `mode_ascription_at` unwraps `paren`s and reads the
+            // cached elaboration `dep_synth_type` recorded — `None`
+            // for ordinary annotations (pure ambient, unchanged).
+            let mode_scope = self.mode_ascription_at(lang, ast, ann_ref.index(), ctx)?;
+            let prev_mode = mode_scope.map(|m| ctx.ambient_mode.replace(m));
             // An explicit `x : type.unknown = v` annotation opts the
             // binding into the dynamic lane. It typechecks (top accepts
             // everything), but the silence is worth a warning — unlike
@@ -12017,6 +12451,11 @@ impl NbeTypecheckEngine {
             } else {
                 let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
                 self.dep_unify(&value_type, &ann, ctx)?;
+            }
+            // PL-0004 E1: the ascribed ambient mode's scope ends with
+            // the value judgement.
+            if let Some(p) = prev_mode {
+                ctx.ambient_mode = p;
             }
             ann
         } else {

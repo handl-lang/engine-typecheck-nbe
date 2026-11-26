@@ -24,7 +24,7 @@
 //! `DescendantOf(type.number)`/`DescendantOf(type.float)`; unresolved
 //! metas default to the constraint anchor (`default_unsolved`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use handl_value::nbe::{self, ArrowVal, Lvl, MetaConstraint, MetaId, MetaStore, Spine, Val};
@@ -235,6 +235,15 @@ pub struct Checker {
     /// `Val` domain — the `Checker` has no diagnostic channel, so the
     /// `TypecheckContext` drains these into `diagnostics`.
     pub mode_warnings: Vec<String>,
+    /// Mode-algebra heads declared by `X := new Algebra(…) {…}` in the
+    /// checked module (PL-0004 E1): the `new` declaration registers
+    /// the family/instance entry, and this set lets `@ [X(p), …]`
+    /// mode ascriptions resolve `X` as a *declared* algebra even though
+    /// its `compose`/`unit`/`order` live in the instance table the
+    /// `Val` domain cannot evaluate. Resolution is name-level only —
+    /// composing through such a head still takes the honest bound
+    /// until the algebra bridge lands (E2+).
+    pub algebra_heads: HashSet<String>,
 }
 
 /// The verdict of a mode subsumption check `actual ≤ expected`
