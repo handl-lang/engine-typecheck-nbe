@@ -379,7 +379,7 @@ fn cub_face_of_val(v: &Value) -> Option<CubFace> {
                 }),
                 "fnot" => args
                     .and_then(|a| a.first())
-                    .and_then(|a0| cub_face_of_val(a0))
+                    .and_then(cub_face_of_val)
                     .map(|a| CubFace::Not(Box::new(a))),
                 "f_or" | "f_and" => {
                     let (Some(a0), Some(a1)) =
@@ -408,8 +408,8 @@ fn cub_face_of_val(v: &Value) -> Option<CubFace> {
                 Some(if b { CubFace::Tt } else { CubFace::Ff })
             } else {
                 match num_val(v) {
-                    Some(n) if n == 1.0 => Some(CubFace::Tt),
-                    Some(n) if n == 0.0 => Some(CubFace::Ff),
+                    Some(1.0) => Some(CubFace::Tt),
+                    Some(0.0) => Some(CubFace::Ff),
                     _ => None,
                 }
             }
@@ -3778,8 +3778,17 @@ impl NbeTypecheckEngine {
                 // judgment mints — `ua(e)`'s type-position spelling.
                 "univalence" => {
                     let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
-                    let e_ref = Self::cub_child(lang, ast, node, "equiv", 0);
-                    if kids_len < 1 || e_ref.is_none() {
+                    let e_idx = Self::cub_child(lang, ast, node, "equiv", 0)
+                        .map(|r| r.index())
+                        .filter(|_| kids_len >= 1);
+                    if let Some(e_idx) = e_idx {
+                        let v = self.synth_univalence_core(lang, ast, e_idx, node.span, ctx)?;
+                        Ok(if tag_of(&v) == Some("type.unknown") {
+                            self.cub_open_meta(ctx)
+                        } else {
+                            v
+                        })
+                    } else {
                         self.cub_diag(
                             ctx,
                             "error",
@@ -3787,19 +3796,6 @@ impl NbeTypecheckEngine {
                             node.span,
                         );
                         Ok(self.cub_open_meta(ctx))
-                    } else {
-                        let v = self.synth_univalence_core(
-                            lang,
-                            ast,
-                            e_ref.unwrap().index(),
-                            node.span,
-                            ctx,
-                        )?;
-                        Ok(if tag_of(&v) == Some("type.unknown") {
-                            self.cub_open_meta(ctx)
-                        } else {
-                            v
-                        })
                     }
                 }
                 // `fibrant A` in annotation position: the fibrancy
@@ -4007,9 +4003,6 @@ impl NbeTypecheckEngine {
                     if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
                         let t = self.node_to_index_term(lang, ast, node, ctx);
                         Ok(eval_index(&t, ctx))
-                    } else if node.kind == "transport" {
-                        let mut m = Map::new();
-                        Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
                     } else {
                         let mut m = Map::new();
                         Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
@@ -5073,7 +5066,7 @@ impl NbeTypecheckEngine {
     /// algebra [`eval_index`] and [`solve_index`] compute over.
     fn node_to_index_term(
         &self,
-        lang: &Language,
+        _lang: &Language,
         ast: &Ast,
         node: &AstNode,
         ctx: &mut TypecheckContext,
@@ -5087,7 +5080,7 @@ impl NbeTypecheckEngine {
                         .first()
                         .and_then(Value::as_u64)
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                        .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                         .unwrap_or(Value::Null);
                     return un_term(&node.kind, o);
                 }
@@ -5095,13 +5088,13 @@ impl NbeTypecheckEngine {
                     .first()
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null);
                 let r = kids
                     .get(1)
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null);
                 return bin_term(&node.kind, l, r);
             }
@@ -5118,7 +5111,7 @@ impl NbeTypecheckEngine {
                 ),
                 "paren" => child_at(ast, node, 0)
                     .and_then(|i| ast.get(i))
-                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null),
                 "value" | "lit" => node.payload.clone(),
                 // `f(i⃗)`/`f<i⃗>` as an index term — an opaque `App` on the
@@ -5137,7 +5130,7 @@ impl NbeTypecheckEngine {
                         .skip(1)
                         .filter_map(Value::as_u64)
                         .filter_map(|i| ast.get(AstRef::new(i as usize)))
-                        .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                        .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                         .collect();
                     app_term(var_term(&callee), args)
                 }
@@ -5772,6 +5765,7 @@ impl NbeTypecheckEngine {
     /// ctor (the index term `eval_index` then projects, e.g.
     /// `App{Succ, m} ↦ m + 1`). Each child carries the fresh vars it
     /// introduced with their own index sorts for deeper splits.
+    #[allow(clippy::type_complexity)]
     fn split_branches(
         &self,
         lang: &Language,
@@ -5851,7 +5845,7 @@ impl NbeTypecheckEngine {
         &self,
         lang: &Language,
         ast: &Ast,
-        node: &AstNode,
+        _node: &AstNode,
         family: &str,
         s_args: &[Value],
         ctors: &[String],
@@ -5921,7 +5915,7 @@ impl NbeTypecheckEngine {
             self.cover_split_tree(
                 lang,
                 ast,
-                node,
+                _node,
                 family,
                 s_args,
                 ctors,
@@ -6707,6 +6701,7 @@ impl NbeTypecheckEngine {
     ///
     /// `name` is the `assign` target — the constraint head, which a
     /// `new`-node-local judgment cannot see.
+    #[allow(clippy::too_many_arguments)]
     fn synth_new_constraint_decl(
         &self,
         lang: &Language,
@@ -7130,11 +7125,9 @@ impl NbeTypecheckEngine {
                     // structural `unify` reading (param + payload fields;
                     // `body_closure` is skipped there as before).
                     match (a.get("path"), b.get("path")) {
-                        (Some(_), None) | (None, Some(_)) => {
-                            return Err(LangError::engine(
-                                "typecheck: cannot unify — path type vs plain Pi".to_string(),
-                            ));
-                        }
+                        (Some(_), None) | (None, Some(_)) => Err(LangError::engine(
+                            "typecheck: cannot unify — path type vs plain Pi".to_string(),
+                        )),
                         (Some(pa), Some(pb)) => {
                             for key in ["x", "y"] {
                                 let (ok, _) = unify_index(
@@ -7475,10 +7468,10 @@ impl NbeTypecheckEngine {
                         Ok(t) => t,
                         Err(e) => return Some(Err(e)),
                     };
-                    return Some(match self.dep_unify(&ty, expected, ctx) {
+                    Some(match self.dep_unify(&ty, expected, ctx) {
                         Ok(()) => Ok(ty),
                         Err(e) => Err(e),
-                    });
+                    })
                 }
                 _ => None,
             }
@@ -7819,7 +7812,7 @@ impl NbeTypecheckEngine {
             return Ok(cb.clone());
         }
         if let Some(fam) = bc.get("apply_type") {
-            return self.dep_closure_apply_term(lang, ast, fam, &term, ctx);
+            return self.dep_closure_apply_term(lang, ast, fam, term, ctx);
         }
         let var_name = bc
             .get("var_name")
@@ -9981,6 +9974,7 @@ impl NbeTypecheckEngine {
     /// should synthesize as an interval `type.pi`. Mints
     /// `type.glue{family, face, section}` with the face stored as the
     /// model's `face{op, args}` record.
+    #[allow(clippy::too_many_arguments)]
     fn dep_synth_glue_type(
         &self,
         lang: &Language,
@@ -10514,8 +10508,8 @@ impl NbeTypecheckEngine {
                 // Call-head mode: evaluate each argument child; the
                 // first is the payload, all of them rebuild `raw`.
                 let mut arg_vals = Vec::new();
-                for i in args_role..kids.len() {
-                    let Some(ci) = kids[i].as_u64() else {
+                for k in kids.iter().skip(args_role) {
+                    let Some(ci) = k.as_u64() else {
                         arg_vals.push(Value::Null);
                         continue;
                     };
@@ -10808,8 +10802,8 @@ impl NbeTypecheckEngine {
                 // Call-head mode: each argument elaborates as a mode
                 // payload; the first is `arg`, all rebuild `raw`.
                 let mut arg_vals = Vec::new();
-                for i in args_role..kids.len() {
-                    let Some(ci) = kids[i].as_u64() else {
+                for k in kids.iter().skip(args_role) {
+                    let Some(ci) = k.as_u64() else {
                         arg_vals.push(Value::Null);
                         continue;
                     };
@@ -11295,9 +11289,7 @@ impl NbeTypecheckEngine {
             let els = mu.get("modes")?.as_array()?;
             let mut out = Vec::new();
             for el in els {
-                let Some(h) = el.get("head").and_then(Value::as_str) else {
-                    return None;
-                };
+                let h = el.get("head").and_then(Value::as_str)?;
                 out.push((h.to_string(), el.get("arg").cloned().unwrap_or(Value::Null)));
             }
             Some(out)
@@ -12816,6 +12808,7 @@ impl NbeTypecheckEngine {
     /// class of binding). Returns `(name, [(binder, sort_node?)])`
     /// where each arg is a `var` (unsorted) or
     /// `type-annot(var, sort)`; `None` for any other subject shape.
+    #[allow(clippy::type_complexity)]
     fn implicit_binder_head(
         &self,
         lang: &Language,
@@ -13981,7 +13974,7 @@ impl NbeTypecheckEngine {
         f: &Value,
         args: &[Value],
         ctx: &mut TypecheckContext,
-        fuel: u32,
+        _fuel: u32,
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
@@ -14020,8 +14013,8 @@ impl NbeTypecheckEngine {
                 Some("CompVal") => {
                     let l = f.get("l").cloned().unwrap_or(Value::Null);
                     let r = f.get("r").cloned().unwrap_or(Value::Null);
-                    let inner = self.apply_ann_val(lang, ast, &l, args, ctx, fuel - 1)?;
-                    self.apply_ann_val(lang, ast, &r, &[inner], ctx, fuel - 1)
+                    let inner = self.apply_ann_val(lang, ast, &l, args, ctx, _fuel - 1)?;
+                    self.apply_ann_val(lang, ast, &r, &[inner], ctx, _fuel - 1)
                 }
                 _ => Ok(app_term(f.clone(), args.to_vec())),
             }

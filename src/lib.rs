@@ -7076,7 +7076,7 @@ fn interpret_type_expr(
                 .get("name")
                 .and_then(|v| v.as_str())
                 .or_else(|| field_node.payload.get("value").and_then(|v| v.as_str()))
-                .or_else(|| field_node.payload.as_str().map(|s| s))
+                .or_else(|| field_node.payload.as_str())
                 .ok_or_else(|| {
                     LangError::engine_node(
                         "interpret_type_expr: field node has no name/value string",
