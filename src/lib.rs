@@ -3058,6 +3058,17 @@ impl NbeTypecheckEngine {
                             .and_then(|n| n.as_str())
                             .unwrap_or("");
                         if let Some(bound) = ctx.lookup(&format!("{fname}.{field_name}")).cloned() {
+                            // A `type.ctor_sig` binding (`F.c`, the
+                            // qualified ctor spelling) instantiates its
+                            // telescope on read — the same convention the
+                            // `lookup` judgment applies to bare ctor
+                            // names — so `Maybe.just` types as the ctor
+                            // arrow `Nat ~> Maybe`, not the raw spec.
+                            if bound.get("__tag__").and_then(Value::as_str)
+                                == Some("type.ctor_sig")
+                            {
+                                return self.instantiate_ctor_full(lang, ast, &bound, ctx);
+                            }
                             return Ok(bound);
                         }
                         return Err(LangError::engine(format!(

@@ -2428,9 +2428,42 @@ struct CoverRun {
     bound_hit: bool,
 }
 
+/// The dotted name a pattern head denotes: a `var`'s own name, or the
+/// qualified `F.c` path a `field-access` chain spells (`Maybe.just`,
+/// `j.Json.JStr`). `None` for any other head shape.
+fn qualified_head_name(ast: &Ast, node: &AstNode) -> Option<String> {
+    match node.kind.as_str() {
+        "var" => node_name(node),
+        "field-access" | "field_access" => {
+            let kids = children_of(node)?;
+            let target_idx = kids.first()?.as_u64()? as usize;
+            let target = ast.get(AstRef::new(target_idx))?;
+            let prefix = qualified_head_name(ast, target)?;
+            // The `field` payload carries the leaf name (the grammar's
+            // `payload_extract`); the field-role child `var` is the
+            // fallback.
+            let leaf = node
+                .payload
+                .get("field")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    kids.get(1)
+                        .and_then(Value::as_u64)
+                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                        .and_then(|n| (n.kind == "var").then(|| node_name(n))?)
+                })?;
+            Some(format!("{prefix}.{leaf}"))
+        }
+        _ => None,
+    }
+}
+
 /// The `var` head of a match arm pattern and its bound field names —
-/// `var`/`call` pattern shapes only; `None` head for `_` and
-/// non-ctor-shaped patterns.
+/// `var`/`call`/qualified `field-access` pattern shapes; `None` head
+/// for `_` and non-ctor-shaped patterns. A qualified `F.c` head comes
+/// back as the dotted path (`Maybe.just`); the caller resolves it
+/// against the `F.c`/`c` `type.ctor_sig` bindings.
 fn match_pattern_head(ast: &Ast, pattern: &AstNode) -> (Option<String>, Vec<String>) {
     match pattern.kind.as_str() {
         "var" => {
@@ -2441,13 +2474,17 @@ fn match_pattern_head(ast: &Ast, pattern: &AstNode) -> (Option<String>, Vec<Stri
                 (Some(n), vec![])
             }
         }
+        // Qualified nullary ctor pattern — `Maybe.nothing:` is a
+        // `field-access` node, not a `call`; it names the ctor with no
+        // binders (the `F.c` spelling of the bare `Nothing:` var form).
+        "field-access" | "field_access" => (qualified_head_name(ast, pattern), vec![]),
         "call" => {
             let pk = children_of(pattern).cloned().unwrap_or_default();
             let cname = pk
                 .first()
                 .and_then(Value::as_u64)
                 .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .and_then(|n| if n.kind == "var" { node_name(n) } else { None });
+                .and_then(|n| qualified_head_name(ast, n));
             let names: Vec<String> = pk
                 .iter()
                 .skip(1)
@@ -5278,7 +5315,14 @@ impl NbeTypecheckEngine {
                 "result": c.result,
                 "bare": c.bare,
             });
-            ctx.extend(c.name.clone(), sig);
+            ctx.extend(c.name.clone(), sig.clone());
+            // `Family.ctor` — the qualified spelling (`Maybe.just`)
+            // resolves through the same `type.ctor_sig` binding under
+            // the `"<F>.<c>"` key, mirroring `F.rec`/`F.spec`. The bare
+            // binding stays for the not-yet-migrated fleet.
+            if !name.is_empty() {
+                ctx.extend(format!("{name}.{}", c.name), sig);
+            }
         }
         // PL-0003 I1/I2 — `inductive.spec`: the declaration's spec as an
         // owned data value (type-exprs are owned node records, not AST
@@ -5312,6 +5356,10 @@ impl NbeTypecheckEngine {
         for c in &ctors {
             if !c.name.is_empty() {
                 ctx.ctor_family.insert(c.name.clone(), name.clone());
+                if !name.is_empty() {
+                    ctx.ctor_family
+                        .insert(format!("{name}.{}", c.name), name.clone());
+                }
             }
         }
         // `F.rec` — the family's dependent eliminator (ADR-0152). The
@@ -8020,6 +8068,29 @@ impl NbeTypecheckEngine {
 
             // Resolve the pattern to (ctor_name, arg var names).
             let (cons_name, arg_names) = match_pattern_head(ast, pattern);
+            // Qualified `F.c` heads come back dotted (`Maybe.just`,
+            // `j.Json.JStr`). They are ctor patterns only when the
+            // `F.c` scope binding `synth_data` registers (or the bare
+            // `c` fallback) is a `type.ctor_sig`; anything else keeps
+            // the pre-qualified `Other`/value-pattern classification —
+            // a `Rec.field` pattern is not a constructor.
+            let cons_name = cons_name.and_then(|n| {
+                if !n.contains('.') {
+                    return Some(n);
+                }
+                let leaf = n.rsplit('.').next().unwrap_or(n.as_str());
+                let is_ctor_sig = |key: &str| {
+                    ctx.lookup(key)
+                        .is_some_and(|v| tag_of(v) == Some("type.ctor_sig"))
+                };
+                (is_ctor_sig(&n) || is_ctor_sig(leaf)).then_some(n)
+            });
+            // The ctor's bare leaf name — spec/coverage lookups key on
+            // it (`family_ctors`/`inductive.spec` spell ctors bare even
+            // when the pattern spells them `F.c`).
+            let ctor_leaf = cons_name
+                .as_deref()
+                .map(|n| n.rsplit('.').next().unwrap_or(n).to_string());
             // WS-C: classify the arm for the coverage pass — `absurd`
             // covers nothing; a `var`/`call` head naming a ctor of this
             // family covers that ctor; any other binding shape catches
@@ -8029,19 +8100,27 @@ impl NbeTypecheckEngine {
             } else {
                 match &cons_name {
                     Some(n) => {
+                        let leaf = ctor_leaf.as_deref().unwrap_or(n.as_str());
                         let family = scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("");
                         // PL-0003 I2: a ctor the family's `inductive.spec`
                         // declares counts as this family's own even when
                         // the gamma `type.ctor_sig` binding is absent.
-                        let is_own_ctor = spec_declares_ctor(ctx, family, n)
+                        let is_own_ctor = spec_declares_ctor(ctx, family, leaf)
                             || ctx
                                 .lookup(n)
                                 .filter(|v| tag_of(v) == Some("type.ctor_sig"))
                                 .and_then(|s| s.get("family").and_then(Value::as_str))
+                                .is_some_and(|f| f == family)
+                            || ctx
+                                .lookup(leaf)
+                                .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+                                .and_then(|s| s.get("family").and_then(Value::as_str))
                                 .is_some_and(|f| f == family);
                         if is_own_ctor {
-                            ArmCover::Ctor(n.clone())
-                        } else if ctx.ctor_family.contains_key(n.as_str()) {
+                            ArmCover::Ctor(leaf.to_string())
+                        } else if ctx.ctor_family.contains_key(n.as_str())
+                            || ctx.ctor_family.contains_key(leaf)
+                        {
                             ArmCover::Other
                         } else {
                             ArmCover::Catchall
@@ -8067,22 +8146,31 @@ impl NbeTypecheckEngine {
             // (hand-built `data` payloads, imports, non-family scrutinees).
             let mut ctor_spec_backed = false;
             let ctor_inst: Option<Value> = match cons_name.as_deref() {
-                Some(n) => match scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("") {
-                    fam if !fam.is_empty() => match spec_ctor_sig(ctx, ast, fam, n)? {
+                Some(n) => {
+                    // Spec/coverage key on the bare leaf; the Γ lookup
+                    // tries the qualified `F.c` binding first, then the
+                    // bare `c` fallback.
+                    let leaf = ctor_leaf.as_deref().unwrap_or(n);
+                    let scrut_fam = scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("");
+                    let spec_sig = if !scrut_fam.is_empty() {
+                        spec_ctor_sig(ctx, ast, scrut_fam, leaf)?
+                    } else {
+                        None
+                    };
+                    match spec_sig {
                         Some(sig) => {
                             ctor_spec_backed = true;
                             Some(sig)
                         }
-                        None => ctx
-                            .lookup(n)
-                            .cloned()
-                            .filter(|v| tag_of(v) == Some("type.ctor_sig")),
-                    },
-                    _ => ctx
-                        .lookup(n)
-                        .cloned()
-                        .filter(|v| tag_of(v) == Some("type.ctor_sig")),
-                },
+                        None => [n, leaf]
+                            .into_iter()
+                            .find_map(|key| {
+                                ctx.lookup(key)
+                                    .cloned()
+                                    .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+                            }),
+                    }
+                }
                 None => None,
             };
             let mut ctor_result = Value::Null;
