@@ -6435,7 +6435,7 @@ impl NbeTypecheckEngine {
                 "synth_new: `new Inductive` expects a constructor record \
                  `{ C : F(i⃗), … }` whose codomains name the declared family \
                  `F` — well-formed `X := new Inductive { … }` declarations \
-                 lower to `data` at parse time"
+                 lower to the internal `data` node at parse time"
                     .to_string(),
                 node,
             ));
