@@ -122,12 +122,6 @@ pub enum FormerSig {
     /// `cell.id(k, x)` — the identity k-cell on `x` (`id_k`). Its type
     /// is `Hom(k, x, x)` — see [`Checker::infer_id`].
     Id,
-    /// `IO(sig)` — the typed-effect former (ADR-0153 §4): an `IO` type
-    /// is an effect object whose index is the op-signature record.
-    /// `IO` bare (arity 0) is `IO(⊤)` — the top signature, accepting
-    /// any. Subtyping is record-width on the sig index — see
-    /// [`Checker::subtype`].
-    Io,
 }
 
 /// Errors the `Val` checker reports.
@@ -245,10 +239,11 @@ pub struct Checker {
     /// until the algebra bridge lands (E2+).
     pub algebra_heads: HashSet<String>,
     /// Effect-declaration fields of `new Algebra` heads (PL-0004
-    /// G0/G1): `op` signatures and `requires` implications, populated
-    /// by `synth_new_decl`'s `Algebra` arm. Heads absent here (or
-    /// with `op: None`) keep the honest bound — `perform` mints the
-    /// legacy `IO{op:T}` codomain form.
+    /// G0/G1/G2): `op` signatures and `requires` implications,
+    /// populated by `synth_new_decl`'s `Algebra` arm. Heads absent
+    /// here (or with `op: None`) cannot drive `perform` — the op
+    /// name takes the honest bound (warn + fresh meta; the legacy
+    /// `IO{op:T}` codomain mint is retired).
     pub algebra_effects: HashMap<String, AlgebraEffectDecl>,
 }
 
@@ -311,9 +306,6 @@ impl Checker {
         c.declare_pi();
         c.declare_hom();
         c.declare_cell_formers();
-        // `IO(sig)` — the typed-effect former (ADR-0153 §4).
-        c.formers
-            .insert(type_sym("type.io").handle(), FormerSig::Io);
         c
     }
 
@@ -613,44 +605,11 @@ impl Checker {
         match (af.as_val(), bf.as_val()) {
             (Val::Universe(i), Val::Universe(j)) => i <= j,
             (Val::Nominal(x), Val::Nominal(y)) => x.has_ancestor(y),
-            // `IO(sa) <: IO(sb)` — signature subtyping: `sb` must name
-            // at least the ops `sa` does (record-width on the sig
-            // index, `sb <: sa`). An arity-0 expected (`IO` bare =
-            // `IO(⊤)`) accepts any signature; an arity-0 actual is ⊤
-            // itself and only satisfies ⊤.
-            (Val::Former { head: ha, args: aa }, Val::Former { head: hb, args: ab })
-                if ha.handle() == hb.handle() && ha.handle() == type_sym("type.io").handle() =>
-            {
-                match (aa.first(), ab.first()) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(sa), Some(sb)) => self.sig_width_subtype(sb, sa),
-                }
-            }
             // A bare nominal can inhabit a family application only if it
             // *is* that family's head with no indices — `Nat <: Nat()` —
             // covered by conv elsewhere; nominal-vs-former is not a
             // subtype step.
             _ => false,
-        }
-    }
-
-    /// Record-width subtyping on `IO` signature objects: `wider`
-    /// supplies every op `narrower` names, with convertible field
-    /// values (op signatures compare by `conv` — structural, per
-    /// ADR-0154 §3). Non-record sigs fall back to conversion.
-    fn sig_width_subtype(&mut self, wider: &Val, narrower: &Val) -> bool {
-        let w = self.metas.force_head_rc(wider);
-        let n = self.metas.force_head_rc(narrower);
-        match (w.as_val(), n.as_val()) {
-            (Val::Const(TaggedValue::Obj(wm)), Val::Const(TaggedValue::Obj(nm))) => {
-                nm.iter().all(|(k, v)| {
-                    wm.get(k).is_some_and(|wv| {
-                        self.conv(&Val::Const(wv.clone()), &Val::Const(v.clone()))
-                    })
-                })
-            }
-            _ => self.conv(w.as_val(), n.as_val()),
         }
     }
 
@@ -784,18 +743,6 @@ impl Checker {
                     });
                 };
                 self.infer_comp_axis(k, a, b)
-            }
-            FormerSig::Io => {
-                // `IO(sig) : Type(0)` — the sig index is an
-                // op-signature record; arity 0 is `IO(⊤)`.
-                if args.len() > 1 {
-                    return Err(TcError::Arity {
-                        former: head.name().to_string(),
-                        want: 1,
-                        got: args.len(),
-                    });
-                }
-                Ok(Val::Universe(0))
             }
             FormerSig::Id => match args {
                 [x] => self.infer_id(None, x),
@@ -1475,7 +1422,7 @@ impl Checker {
 
     /// The honest bound: a fresh meta stands for the unresolvable
     /// mode and a warning records the deferral (the `infer_hom`/
-    /// `handle_sig_check` convention).
+    /// `ambient_handle_modality` convention).
     pub(crate) fn mode_honest(&mut self, what: &str) -> Val {
         let m = self.fresh_meta(Val::Universe(0));
         self.mode_warnings.push(format!("mode compose: {what}"));

@@ -809,42 +809,12 @@ fn quote_domain_metas(v: &Value, map: &mut HashMap<u64, u64>, ctx: &mut Typechec
     }
 }
 
-/// Whether `v` is a `Former{type.io}` application — either `__former__`
-/// spelling (quote's `{"sym", "args"}` or the surface `{"indices"}`).
-/// Identity is the seeded-sym *handle* (`Sym::seeded("type.io")` spells
-/// its short display name `"io"`, never the full seed — the quoted
-/// `__sym__` payload carries `handle` for exactly this compare); the
-/// name check is a fallback for spellings that drop the handle.
-fn io_headed(v: &Value) -> bool {
-    fn sym_matches(s: &Value) -> bool {
-        let handle = s
-            .get("__sym__")
-            .and_then(|x| x.get("handle"))
-            .or_else(|| s.get("handle"))
-            .and_then(Value::as_u64);
-        if let Some(h) = handle {
-            // A spelled handle is authoritative — a different sym that
-            // happens to display as "io" must not false-positive.
-            return h == checker::type_sym("type.io").handle();
-        }
-        let name = s
-            .get("__sym__")
-            .and_then(|x| x.get("name"))
-            .or_else(|| s.get("name"))
-            .and_then(Value::as_str);
-        matches!(name, Some("type.io" | "io"))
-    }
-    v.get("__former__")
-        .map(|f| sym_matches(f) || f.get("sym").is_some_and(sym_matches))
-        .unwrap_or(false)
-}
-
 /// Whether `v` is `type.unknown` — the dynamic top — in any boundary
 /// spelling: the tagged `{"__tag__": "type.unknown"}` value, the
 /// `__sym__` reification `quote` emits for `Nominal{type.unknown}`, or
 /// a `__former__` application headed by the `type.unknown` sym. The
-/// handle compare is authoritative (mirroring `io_headed`); the name
-/// check is a fallback for spellings that drop the handle.
+/// handle compare is authoritative; the name check is a fallback for
+/// spellings that drop the handle.
 pub(crate) fn is_unknown_ty(v: &Value) -> bool {
     if tag_of(v) == Some("type.unknown") {
         return true;
@@ -2691,8 +2661,7 @@ fn render_split_path(path: &[(String, String)]) -> String {
 }
 
 /// The name a `Former{var, [n]}` value carries — the domain reification
-/// of `var_term(n)` (`domain_lift` of an index var). `IO(s)` sigs quoted
-/// into `Former{type.io}.args` carry `s` that way.
+/// of `var_term(n)` (`domain_lift` of an index var).
 fn former_var_name(v: &Value) -> Option<&str> {
     let f = v.get("__former__")?;
     let sym = f.get("sym")?;
@@ -2716,8 +2685,7 @@ fn subst_index(term: &Value, frm: &Value, to: &Value) -> Value {
         return to.clone();
     }
     // `var{n}` inside a domain-encoded former — the `Former{var,[n]}`
-    // spelling the `var_term` shape lifts/round-trips to (e.g. an
-    // `IO(s)` sig var inside `Former{type.io}.args`).
+    // spelling the `var_term` shape lifts/round-trips to.
     if tag_of(frm) == Some("var")
         && former_var_name(term) == frm.get("name").and_then(Value::as_str)
     {
@@ -3737,7 +3705,7 @@ impl NbeTypecheckEngine {
                     // The params child is a type expression — a `paren`-wrapped
                     // list takes its last child as the domain (the `A -> B`
                     // convention); any other node (`call` former
-                    // applications like `Vec(n, a)`/`IO(sig)`, `var`, …) IS
+                    // applications like `Vec(n, a)`, `var`, …) IS
                     // the domain.
                     let dom_idx = if let Some(p) = ast.get(params_idx) {
                         if p.kind == "paren" {
@@ -4192,30 +4160,27 @@ impl NbeTypecheckEngine {
             // so both spellings resolve — `Unit` stays canonical for the
             // statement/zero-arg peel, `Null` for explicit null domains.
             "Null" => "type.null",
-            // Bare `IO` = `IO(⊤)` — the arity-0 `Former{type.io}`
-            // (any signature) for backward compat (ADR-0153 §4).
-            // PL-0004 E1 deprecation, same as the applied form.
+            // `IO` — the retired typed-effect former (PL-0004 G2;
+            // design/effects-ambient-modes.md v2 §6): effects are
+            // ambient modes (`T @ [Algebra(…)]`), never a codomain
+            // former. The honest bound is a warning + an open type
+            // meta — the annotation accepts anything until the corpus
+            // spelling migrates.
             "IO" => {
                 ctx.diagnostics.push(TypecheckDiagnostic {
                     severity: "warning".to_string(),
-                    message: "`IO` is deprecated (PL-0004 effects-as-ambient-modes): effects are ambient modes — write the judgement `T @ [Effects(S)]` instead".to_string(),
+                    message: "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`".to_string(),
                     span: None,
                 });
-                return Ok(domain_quote(
-                    &Val::Former {
-                        head: checker::type_sym("type.io"),
-                        args: vec![],
-                    },
-                    ctx,
-                ));
+                return Ok(self.cub_open_meta(ctx));
             }
             "Type" | "Universe" | "Type0" => "type.universe",
             // The cubical interval sort (ADR-0208 P1): `I` is the type of
             // dimension variables and endpoints `i0`/`i1`.
             "I" | "Interval" => "type.interval",
-            // `Sig` — the `IO(sig)` signature-record sort (a row
-            // binder's declared sort in `f<s : Sig> : … IO(s)`): an
-            // op-name → signature record, i.e. the `Obj` nominal.
+            // `Sig` — the signature-record sort (a row binder's
+            // declared sort, e.g. `f<s : Sig> : …`): an op-name →
+            // signature record, i.e. the `Obj` nominal.
             "Sig" => "type.obj",
             "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
             _ => {
@@ -4475,66 +4440,20 @@ impl NbeTypecheckEngine {
                     Ok(self.cub_open_meta(ctx))
                 }
                 Some("IO") => {
-                    // `IO(sig)` — the typed-effect former (ADR-0153 §4):
-                    // canonical `Former{type.io}` data. The sig index is
-                    // an op-signature record — `{op: T, …}` entries
-                    // synthesize their value types; `IO()` is `IO(⊤)`.
-                    // PL-0004 E1 deprecation: the codomain former is
-                    // retired in the final state — effects are ambient
-                    // modes (`T @ [Effects(S)]`). Warn, don't reject:
-                    // the corpus migrates phase by phase (pl-0004 E1
-                    // blast-radius decision — diagnostic, not removal).
+                    // `IO(…)`/`IO<…>` — the retired typed-effect former
+                    // (PL-0004 G2; design/effects-ambient-modes.md v2
+                    // §6): effects are ambient modes (`T @ [Algebra(…)]`),
+                    // never a codomain former. The honest bound is a
+                    // warning + an open type meta — the annotation
+                    // accepts anything until the corpus spelling
+                    // migrates (the arguments are not synthesized: the
+                    // whole form is retired).
                     ctx.diagnostics.push(TypecheckDiagnostic {
                         severity: "warning".to_string(),
-                        message: "`IO(…)`/`IO<…>` is deprecated (PL-0004 effects-as-ambient-modes): effects are ambient modes — write the judgement `T @ [Effects(S)]` instead".to_string(),
+                        message: "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`".to_string(),
                         span: node.span,
                     });
-                    // The brace-free `IO<puts, fs>` / `IO<puts: T, fs>`
-                    // spelling — the `dimension` node's argument list,
-                    // unambiguous there: each arg is an expression, a
-                    // bare `var` declares an op with an unstated
-                    // request and `name : T` its payload — is the same
-                    // sig-record sugar, single op included
-                    // (`IO<puts>` ≡ `IO<{ puts }>`,
-                    // `IO<puts: T>` ≡ `IO<{ puts: T }>`). Call-form
-                    // `IO(s)`/`IO(sig)` is untouched — a bare variable
-                    // there is a sig-typed *index*, not an op list —
-                    // and the sugar fires only when EVERY argument is a
-                    // bare name or typed binder; anything else keeps
-                    // the single-sig-argument reading.
-                    let sig = if node.kind == "dimension"
-                        && !arg_indices.is_empty()
-                        && arg_indices.iter().all(|&i| {
-                            ast.get(AstRef::new(i)).is_some_and(|n| {
-                                n.kind == "var" || Self::typed_binder(lang, ast, i).is_some()
-                            })
-                        }) {
-                        let mut m = Map::new();
-                        for &i in &arg_indices {
-                            if let Some((k, ty_idx)) = Self::typed_binder(lang, ast, i) {
-                                m.insert(k, self.dep_synth_type(lang, ast, ty_idx, ctx)?);
-                            } else if let Some(n) = ast.get(AstRef::new(i))
-                                && let Some(k) = node_name(n)
-                            {
-                                let mut u = Map::new();
-                                m.insert(k, make_tag(ctx, "type.unknown", std::mem::take(&mut u)));
-                            }
-                        }
-                        Value::Object(m)
-                    } else {
-                        match arg_indices.first() {
-                            Some(&i) => self.io_sig(lang, ast, i, ctx)?,
-                            None => Value::Null,
-                        }
-                    };
-                    let vs = domain_lift(&sig, ctx);
-                    Ok(domain_quote(
-                        &Val::Former {
-                            head: checker::type_sym("type.io"),
-                            args: if sig == Value::Null { vec![] } else { vec![vs] },
-                        },
-                        ctx,
-                    ))
+                    Ok(self.cub_open_meta(ctx))
                 }
                 Some(name) => {
                     // A declared family's application: `Vec(i⃗)` →
@@ -4823,10 +4742,16 @@ impl NbeTypecheckEngine {
         })
     }
 
-    /// The sig argument of `IO(sig)` — an `object` literal becomes a
-    /// record of op-name → synthesized value type; anything else is an
-    /// index term / type expression.
-    fn io_sig(
+    /// A record payload (`{op: A ~> B, …}`) elaborated to an
+    /// op-name → synthesized-value-type map — the `object` literal's
+    /// entries, `block`-position `type-annot` children (object-literal
+    /// blocks, ADR-0079), and bare-name children (`{ puts }` declares
+    /// the op with an unstated `type.unknown` request) all read
+    /// entry-wise; anything else falls through to index/type
+    /// synthesis. Used for mode payloads (`@ [Algebra({…})]`) — the
+    /// `IO(sig)` sig-record reading it descends from is retired
+    /// (PL-0004 G2).
+    fn record_type_map(
         &self,
         lang: &Language,
         ast: &Ast,
@@ -4835,7 +4760,7 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         let node = ast
             .get(AstRef::new(idx))
-            .ok_or_else(|| LangError::engine("io: sig node out of bounds".to_string()))?;
+            .ok_or_else(|| LangError::engine("record payload node out of bounds".to_string()))?;
         if node.kind == "object" {
             let mut m = Map::new();
             if let Some(entries) = node.payload.get("entries").and_then(Value::as_array) {
@@ -4862,8 +4787,8 @@ impl NbeTypecheckEngine {
                     let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
                         continue;
                     };
-                    // `IO<{ puts }>` — a bare-name child declares the op
-                    // with an unstated request (`type.unknown`).
+                    // A bare-name child declares the op with an
+                    // unstated request (`type.unknown`).
                     if en.kind == "var" {
                         if let Some(k) = node_name(en) {
                             let mut u = Map::new();
@@ -6640,10 +6565,10 @@ impl NbeTypecheckEngine {
     /// the two effect fields elaborate here:
     ///
     /// - `op : A ~> B` synthesizes as a *type* (`dep_synth_type`) —
-    ///   the same reading `IO<{op: A ~> B}>` sig entries get, so
     ///   `perform` finds the `type.function{param, body}` shape it
-    ///   already consumes. An `op` that does not elaborate warns and
-    ///   leaves `None` (the head keeps the transition behavior).
+    ///   consumes as the op's domain/codomain. An `op` that does not
+    ///   elaborate warns and leaves `None` (the head keeps the
+    ///   honest-bound behavior).
     /// - `requires : [Head, …]` reads algebra head *names* off the
     ///   array literal — heads are declared names, not values, so no
     ///   type synthesis runs on them. Non-`var` elements warn and
@@ -6653,7 +6578,7 @@ impl NbeTypecheckEngine {
     /// `compose`/`order` — a compositional (graded-style) algebra
     /// whose mode elements compose payloads rather than set-union.
     ///
-    /// Dict shapes mirror `io_sig`: `object` nodes carry `entry`
+    /// Dict shapes mirror `record_type_map`: `object` nodes carry `entry`
     /// children (`key`/`value` roles); `block`-position literals
     /// parse as `type-annot` children (subject → field name, annot →
     /// value). Any other dict shape yields no fields.
@@ -7135,12 +7060,10 @@ impl NbeTypecheckEngine {
             // A solved meta stands for its solution: dereference it before
             // the meta-solve shortcut so a second constraint on a shared
             // meta checks against the *solution* — re-solving the cell
-            // would silently overwrite it. This is what rejects the IO
-            // widen: `x ~> x` synths `type.function{?m, ?m}` (param and
-            // body share the meta), so checking it against
-            // `IO(sa) ~> IO(sb)` solves `?m := IO(sa)` at the domain and
-            // leaves `dep_unify(IO(sa), IO(sb))` — signature subtyping
-            // through the IO arm below — at the codomain.
+            // would silently overwrite it. `x ~> x` synths
+            // `type.function{?m, ?m}` (param and body share the meta), so
+            // the domain constraint solves `?m` first and the codomain
+            // constraint then checks against that *solution*.
             let za;
             let zb;
             let a = if extract_meta_id(a).is_some() {
@@ -7165,9 +7088,9 @@ impl NbeTypecheckEngine {
             }
             // `type.unknown` is the dynamic top (see `unify`): consistent
             // with every type on either side, in both the tagged and the
-            // domain-encoded spellings. Checked here — before the tag match
-            // — because the `io_headed` signature-subtyping arm below would
-            // otherwise reject `IO` vs `unknown` before `self.unify`'s
+            // domain-encoded spellings. Checked here — before the tag
+            // match — so the mode-hom arm below cannot reject
+            // `unknown` vs a mode-carrying type before `self.unify`'s
             // accept could fire.
             if is_unknown_ty(a) || is_unknown_ty(b) {
                 return Ok(());
@@ -7371,8 +7294,7 @@ impl NbeTypecheckEngine {
                     // M3): graded-arrow cell types check by *directed*
                     // subsumption — the actual's mode must be `≤` the
                     // expected's under the governing `mode.algebra.*`
-                    // `order` field (`vsubtype` semantics, mirroring
-                    // the `io_headed` arm below). `unify`'s
+                    // `order` field (`vsubtype` semantics). `unify`'s
                     // domain-encoded path only reaches `conv`, which
                     // accepts either direction; routing through
                     // `subtype` is what makes "argument mode vs
@@ -7390,23 +7312,6 @@ impl NbeTypecheckEngine {
                         // by convention.
                         if beyond_checked_dim(&va) || beyond_checked_dim(&vb) {
                             ctx.vcheck.store_restore(mark);
-                            return Ok(());
-                        }
-                        ctx.vcheck.store_restore(mark);
-                        return Err(LangError::engine(format!(
-                            "typecheck: cannot unify — expected {}, got {}",
-                            display_type(b, ctx),
-                            display_type(a, ctx)
-                        )));
-                    }
-                    // `Former{type.io}` — signature subtyping (record-width
-                    // on the sig index): `IO(s) <: IO(s')` iff `s'` names
-                    // at least the ops of `s` — directed, unlike index conv.
-                    if io_headed(a) || io_headed(b) {
-                        let mark = ctx.vcheck.store_mark();
-                        let va = domain_lift(a, ctx);
-                        let vb = domain_lift(b, ctx);
-                        if ctx.vcheck.subtype(&va, &vb) {
                             return Ok(());
                         }
                         ctx.vcheck.store_restore(mark);
@@ -11061,9 +10966,10 @@ impl NbeTypecheckEngine {
         id
     }
 
-    /// A mode payload value: record literals (`{op: A ~> B}` — the
-    /// `Effects(S)` row shape) elaborate entry-wise through `io_sig`,
-    /// the same op-name → value-type reading `IO<{…}>` sigs use.
+    /// A mode payload value: record literals (`{op: A ~> B}` — e.g.
+    /// an `Effects(S)`-shaped payload during the G2 transition)
+    /// elaborate entry-wise through `record_type_map` — the
+    /// op-name → value-type reading mode payloads share.
     /// Every other payload evaluates as an annotation term first
     /// (`Cost(3)` → `3`, `Session(!T)` → the symbolic term), falling
     /// back to type synthesis for type-expression payloads and to a
@@ -11095,7 +11001,7 @@ impl NbeTypecheckEngine {
         };
         if matches!(node.kind.as_str(), "object" | "block") {
             return self
-                .io_sig(lang, ast, idx, ctx)
+                .record_type_map(lang, ast, idx, ctx)
                 .unwrap_or_else(|_| honest(ctx));
         }
         // PL-0004 E3 mode metavariable: a bare `var` payload that
@@ -11911,16 +11817,17 @@ impl NbeTypecheckEngine {
         is_perform && ctx.lookup_gamma("perform").is_none() && !ctx.results.contains_key("perform")
     }
 
-    /// `perform(op, arg)` — synthesize `IO{op: T}` (ADR-0153 §4). `op` is
+    /// `perform(op, arg)` — synthesize the op's result type
+    /// (ADR-0153 §4; PL-0004 G1/G2 granular-authoritative). `op` is
     /// a *named* op: a `var` reads as the op *name* (at runtime an
     /// unbound var evaluates to its name string; `puts` is deliberately
     /// never checked as a value), a string literal reads directly, and
-    /// `sym("name")`/`sym.seeded("name")` reads its seed. `T` is `arg`'s
-    /// synthesized type (`type.unit` when the arg is omitted). The
-    /// result is canonical `Former{type.io}` data — the same spelling
-    /// `dep_synth_call_type`'s `IO(sig)` arm emits — so `handle`'s
-    /// `handle_sig_check` and sig record-width subtyping read it
-    /// unchanged.
+    /// `sym("name")`/`sym.seeded("name")` reads its seed. When `op`
+    /// names a declared effect algebra with an `op : A ~> B` field
+    /// and the head sits in the ambient mode set, `arg` checks
+    /// against `A` and the result is `B`; every other op name is the
+    /// honest bound — warn + a fresh type meta (G2 retired the
+    /// `IO{op:T}` codomain mint).
     fn synth_perform(
         &self,
         lang: &Language,
@@ -11983,6 +11890,9 @@ impl NbeTypecheckEngine {
                     .to_string(),
             ));
         };
+        // The argument is synthesized up front (its own
+        // checks/diagnostics run); the granular `op`-field arms consume
+        // its type, the honest bound below discards it.
         let arg_ty = match kids.get(2).and_then(Value::as_u64) {
             Some(i) => self.synth_node(lang, ast, AstRef::new(i as usize), ctx)?,
             None => {
@@ -11990,16 +11900,17 @@ impl NbeTypecheckEngine {
                 make_tag(ctx, "type.unit", std::mem::take(&mut m))
             }
         };
-        // PL-0004 G1: ambient `perform` is *granular-authoritative*
+        // PL-0004 G1/G2: ambient `perform` is *granular-authoritative*
         // (design/effects-ambient-modes.md v2 §3): `perform(Head, arg)`
         // where `Head` is a declared effect algebra whose `op : A ~> B`
         // signature is on record resolves domain/codomain from `op`,
         // and `Head` MUST sit in the ambient mode set — absent is a
-        // hard rejection ("effect head X is not permitted"), no `IO`
-        // mint fallback. An op name with no declared `op` field keeps
-        // the honest bound: warn + the legacy `IO{op:T}` codomain mint
-        // (the `IO<sig>` path G2 retires; un-annotated code is
-        // unaffected — no ambient mode, no warning).
+        // hard rejection ("effect head X is not permitted"). G2 retires
+        // the legacy `IO{op:T}` codomain mint: an op name with no
+        // declared `op` field cannot be checked against the mode set,
+        // so the honest bound is warn + a fresh type meta — it
+        // unifies with whatever the context expects and mints no `IO`
+        // data (with or without an ambient mode).
         if let Some(mu) = ctx.ambient_mode.clone() {
             if let Some(op_sig) = ctx
                 .vcheck
@@ -12044,39 +11955,33 @@ impl NbeTypecheckEngine {
                 return Ok(entry);
             }
             // No declared `op` for this name — it cannot be a member
-            // of the granular mode set; the legacy `IO` mint stays
-            // the honest bound (G2 removes it with the corpus
+            // of the granular mode set; fall through to the honest
+            // bound below (G2 removed the `IO` mint with the corpus
             // migration).
-            ctx.diagnostics.push(TypecheckDiagnostic {
-                severity: "warning".to_string(),
-                message: format!(
-                    "perform: op `{op_name}` is not a declared effect algebra — minting `IO{{…}}` (honest bound)"
-                ),
-                span: op_node.span,
-            });
         }
-        let mut sig = Map::new();
-        sig.insert(op_name, arg_ty);
-        let vs = domain_lift(&Value::Object(sig), ctx);
-        Ok(domain_quote(
-            &Val::Former {
-                head: checker::type_sym("type.io"),
-                args: vec![vs],
-            },
-            ctx,
-        ))
+        // The honest bound (PL-0004 G2): the op is undeclared, so its
+        // request/codomain types are unknowable — warn and return a
+        // fresh type meta (unifies with the expected type; no `IO`
+        // codomain data is minted). The argument was still
+        // synthesized above, so errors inside it surface normally.
+        ctx.diagnostics.push(TypecheckDiagnostic {
+            severity: "warning".to_string(),
+            message: format!(
+                "perform: op `{op_name}` is not a declared effect algebra — bound to a fresh meta (honest bound)"
+            ),
+            span: op_node.span,
+        });
+        Ok(meta_value(ctx.fresh_meta()))
     }
 
     /// `check_call` — the directed `call` check (the `type.call` `check`
     /// scheme, lifted to a judgment so `perform` can intercept). For a
     /// `perform(op, arg)` call the generic scheme cannot see that `op`
     /// is a *name* — checking it as a value reports an unbound `puts` —
-    /// so the call is synthesized (`synth_call`'s `synth_perform` branch
-    /// mints `IO{op: T}`) and unified against the expected type — record
-    /// -width sig subtyping included (`IO{puts: Str}` accepts an
-    /// `IO{puts, fs}` expectation). Every other call reproduces the
-    /// former scheme verbatim: synth the callee, check the first
-    /// argument against its `param`, yield `body`.
+    /// so the call is synthesized (`synth_call`'s `synth_perform` branch)
+    /// and unified against the expected type. Every other call
+    /// reproduces the former scheme verbatim: synth the callee, check
+    /// the first argument against its `param`, yield `body`.
     pub(crate) fn check_call_judgment(
         &self,
         lang: &Language,
@@ -12200,12 +12105,13 @@ impl NbeTypecheckEngine {
             .as_u64()
             .ok_or_else(|| LangError::engine("call: callee index not a u64".to_string()))?
             as usize;
-        // `perform` — the `IO<sig>` op-emission builtin (ADR-0153 §4):
-        // `perform(op, arg)` synthesizes `IO{op: T}` — `op` is a *named*
-        // op (a name operand, not a checked value) and `T` the arg's
-        // type. The name-keyed callee dispatch mirrors
-        // `dep_synth_call_type`'s `IO`/`Pi`/`Family` table — the scheme
-        // vocabulary cannot compute a sig record from an op name.
+        // `perform` — the op-emission builtin (ADR-0153 §4; PL-0004
+        // G1/G2 granular): `perform(op, arg)` resolves the op's
+        // `A ~> B` signature from its declared effect algebra — `op`
+        // is a *named* op (a name operand, not a checked value).
+        // The name-keyed callee dispatch mirrors
+        // `dep_synth_call_type`'s `Pi`/`Family` table — the scheme
+        // vocabulary cannot compute an op signature from an op name.
         if self.is_perform_call(ast, node, ctx) {
             return self.synth_perform(lang, ast, node, kids, ctx);
         }
@@ -12541,38 +12447,23 @@ impl NbeTypecheckEngine {
         }
     }
 
-    /// `synth_handle` — `handle <body> with <h>` typed-effect handler
-    /// typing (phase-2 WS-F; ADR-0153 §4 "effects are objects in the
-    /// codomain").
+    /// `synth_handle` — `handle <body> with <h>` ambient-mode handler
+    /// typing (PL-0004 G2; design/effects-ambient-modes.md v2 §3): the
+    /// body type passes through unchanged — the `IO(S)` codomain
+    /// rewrite (`handle_sig_check`/`effects_residual_row`) is retired
+    /// with the `type.io` former — and [`Self::ambient_handle_modality`]
+    /// owns the mode residual `μ → μ′` recorded on the node.
     ///
-    /// The body's `IO(S)` former has its op set checked against `h`'s
-    /// declared impls, and the result re-wraps as `IO(S')` mirroring the
-    /// runtime's interpret-in-place semantics ([`exec-tree-walk`]
-    /// `interpret_io_former`): each covered entry's declared type is
-    /// replaced by the impl's declared *return* type (the op is
-    /// interpreted, its result is data); each uncovered entry keeps its
-    /// declared signature (the op stays `IO` data for an outer handler
-    /// or user destructuring). The residual sig is therefore
-    /// `S'` = `(S \ S_h) ∪ {op: ret_ty}` — the spec's
-    /// `IO(S \ S_h) × results` shape.
-    ///
-    /// Coverage rules:
-    /// - `h`'s op names are its record fields (`type.record{fields}`).
-    ///   A covered impl `h_k : dom ~> ret` must accept the op's declared
-    ///   sig entry — `S[k] <: dom` — and `ret` is the result type.
-    /// - An impl `h` declares for an op `S` never names → diagnostic
-    ///   (spurious — the impl can never fire).
-    /// - `S` non-empty with `h` covering none of it → diagnostic (the
-    ///   `handle` is a guaranteed no-op — almost certainly a bug).
-    /// - `h` op-untyped (meta / `type.Obj` / `type.unknown`) or `S`
-    ///   symbolic (a sig meta/var — row-polymorphic `IO(s)`) → the
-    ///   check is undecidable → pass through unchanged (honest bound).
-    /// - `body`'s type is `A ~> IO(S)` (a `type.function` whose codomain
-    ///   is an `IO` former) — the deep-handler case (`handle f with h`
-    ///   binds the handled arrow, runtime `attach_carried_handler`):
-    ///   the codomain's sig is checked the same way, producing
-    ///   `A ~> IO(S')`. A `type.pi` codomain (a closure) can't rewrite
-    ///   statically → passthrough.
+    /// The ops the handled computation performs are journaled by
+    /// `perform` while the target synthesizes (`eff_mark..`), split
+    /// from the handler impl's own performs (`impl_eff_mark..` =
+    /// `μ_handler`, design §4.2); the target's own judgement mode
+    /// (`>>>`-composed, ascribed, or binding-carried —
+    /// [`mode_of_node`]) joins them as the handled set. Coverage
+    /// (spurious impls / guaranteed no-op / impl-domain rejection) and
+    /// the requires-closed residual `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler`
+    /// are computed element-wise over mode *heads* — the same three
+    /// diagnostic classes the retired `IO(S)` path emitted.
     pub(crate) fn synth_handle_judgment(
         &self,
         lang: &Language,
@@ -12608,11 +12499,10 @@ impl NbeTypecheckEngine {
         if let Some(acc_idx) = role_child_ref(lang, node, "acc") {
             let _t_acc = self.synth_node(lang, ast, acc_idx, ctx)?;
         }
-        let ty = self.handle_result_type(&t_body, &t_impl, ctx)?;
-        // PL-0004 E2/G1 ambient modality `μ → μ′` — runs *alongside*
-        // the `IO(S)` codomain rewrite above (the `IO<sig>` path stays
-        // until G2's corpus migration; the ambient spelling records
-        // its residual on `node_modes` instead).
+        // PL-0004 G2: the body's type passes through unchanged — the
+        // `IO(S)` codomain rewrite is retired with the `type.io`
+        // former; the ambient modality `μ → μ′` below owns the mode
+        // residual (the `@ [..]` spelling records it on `node_modes`).
         self.ambient_handle_modality(
             target_mode,
             &used_effects,
@@ -12621,7 +12511,7 @@ impl NbeTypecheckEngine {
             handle_idx,
             ctx,
         )?;
-        Ok(ty)
+        Ok(t_body)
     }
 
     /// The ambient-mode half of `handle` (PL-0004 G1; design/effects-
@@ -12632,8 +12522,8 @@ impl NbeTypecheckEngine {
     /// the ops literally `perform`ed while synthesizing the target;
     /// the handler impl's own performs (`handler_mark..` of the
     /// journal) are `μ_handler`. Coverage and the residual
-    /// `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler` run element-wise — the same
-    /// three diagnostic classes the `IO(S)` path emits:
+    /// `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler` run element-wise — the three
+    /// diagnostic classes `handle` emits:
     ///
     /// - Spurious impls — `h` declares ops the handled set never
     ///   names → error.
@@ -12733,15 +12623,14 @@ impl NbeTypecheckEngine {
         }
         let Some(fields) = self.handler_op_fields(t_impl, ctx) else {
             // `type.Obj` / meta / unknown handler — op set unknowable;
-            // passthrough (honest bound), same as the `IO` path.
+            // passthrough (honest bound).
             return Ok(());
         };
-        // Coverage — the same three diagnostic classes `handle_sig_check`
-        // emits, keyed on op names. Vacuous when the handled
-        // computation names no granular ops (an `IO`-sig body under an
-        // unrelated ambient head, a pure target): the `IO(S)` codomain
-        // path owns that coverage — the ambient modality stays the
-        // honest bound and only unions `μ_handler` into the residual.
+        // Coverage, keyed on op names — vacuous when the handled
+        // computation names no granular ops (a pure target, or a body
+        // whose effects never reach the mode set): the modality stays
+        // the honest bound and only unions `μ_handler` into the
+        // residual.
         let op_names: Vec<&String> = ops.iter().map(|(n, _)| n).collect();
         if !ops.is_empty() {
             let spurious: Vec<&String> = fields.keys().filter(|k| !op_names.contains(k)).collect();
@@ -12954,176 +12843,6 @@ impl NbeTypecheckEngine {
             })
     }
 
-    /// The residual sig `(S ∖ S_h) ∪ {op ↦ ret}` of the `IO(S)`
-    /// codomain path ([`handle_sig_check`] — the ambient-mode
-    /// modality retired this row encoding in G1 and runs
-    /// element-wise in [`ambient_handle_modality`]): covered
-    /// entries take the impl's declared return type, uncovered
-    /// survive verbatim. `IO` sig entries are request *payload*
-    /// types, so the impl domain must accept the entry itself
-    /// (what `perform`/`dispatch_op` feeds it).
-    ///
-    /// Coverage rules (the same three diagnostic classes the
-    /// granular path emits):
-    /// - Spurious impls — `h` declares ops `S` never names → error.
-    /// - `S` non-empty with `h` covering none of it → error (the
-    ///   `handle` is a guaranteed no-op).
-    /// - A covered impl `h_k : dom ~> ret` whose domain rejects the
-    ///   op's declared signature → error.
-    fn effects_residual_row(
-        &self,
-        sig_obj: &Map<String, Value>,
-        fields: &Map<String, Value>,
-        ctx: &mut TypecheckContext,
-    ) -> Result<Map<String, Value>, LangError> {
-        // Spurious impls — `h` declares ops the body can never perform.
-        let spurious: Vec<&String> = fields
-            .keys()
-            .filter(|k| !sig_obj.contains_key(*k))
-            .collect();
-        if !spurious.is_empty() {
-            return Err(LangError::engine(format!(
-                "typecheck: handle: handler declares impls for ops the body's sig never names: {}",
-                spurious
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-        let covered: Vec<&String> = sig_obj.keys().filter(|k| fields.contains_key(*k)).collect();
-        if !sig_obj.is_empty() && covered.is_empty() {
-            return Err(LangError::engine(format!(
-                "typecheck: handle: handler covers none of the body's declared ops ({}) — the handle is a guaranteed no-op",
-                sig_obj.keys().cloned().collect::<Vec<_>>().join(", ")
-            )));
-        }
-        let mut out_sig = Map::new();
-        for (k, req) in sig_obj.iter() {
-            match fields.get(k) {
-                Some(it) => {
-                    // Covered — interpret in place: the entry's declared
-                    // type becomes the impl's declared return type.
-                    let it = self.zonk(it, ctx);
-                    // The request the impl domain must accept: the
-                    // sig entry itself (the request payload type —
-                    // `dispatch_op` feeds the sig entry's value to
-                    // the impl).
-                    let req_check = req.clone();
-                    let ret = if tag_of(&it) == Some("type.function") {
-                        let dom = it.get("param").cloned().unwrap_or(Value::Null);
-                        // `IO<{ puts }>`-style unstated requests: skip
-                        // the domain check, and an unsolved return
-                        // meta defaults to the request (a shared
-                        // `?m` inside the sig object can't solve in
-                        // `conv` — Const compares structurally).
-                        if tag_of(&req_check) == Some("type.unknown") {
-                            let body = it.get("body").cloned().unwrap_or(Value::Null);
-                            if let Some(id) = extract_meta_id(&body) {
-                                ctx.solve_meta(id, req_check.clone());
-                            }
-                            self.zonk(&body, ctx)
-                        } else {
-                            self.check_subtype(&req_check, &dom, ctx).map_err(|_| {
-                                LangError::engine(format!(
-                                    "typecheck: handle: impl '{k}' domain does not accept the op's declared signature"
-                                ))
-                            })?;
-                            it.get("body").cloned().unwrap_or(Value::Null)
-                        }
-                    } else {
-                        // A non-arrow impl produces its declared type.
-                        it
-                    };
-                    out_sig.insert(k.clone(), ret);
-                }
-                None => {
-                    // Uncovered — the op request stays (still `IO` data
-                    // / an ambient `A ~> B` entry for an outer handler).
-                    out_sig.insert(k.clone(), req.clone());
-                }
-            }
-        }
-        Ok(out_sig)
-    }
-
-    /// The `IO(S')` result of `handle` given the body's and handler's
-    /// types — see [`Self::synth_handle_judgment`] for the coverage
-    /// rules.
-    fn handle_result_type(
-        &self,
-        t_body: &Value,
-        t_impl: &Value,
-        ctx: &mut TypecheckContext,
-    ) -> Result<Value, LangError> {
-        let tb = self.zonk(t_body, ctx);
-        if io_headed(&tb) {
-            return self.handle_sig_check(&tb, t_impl, ctx);
-        }
-        if tag_of(&tb) == Some("type.function") {
-            let body = self.zonk(&tb.get("body").cloned().unwrap_or(Value::Null), ctx);
-            if io_headed(&body) {
-                let residual = self.handle_sig_check(&body, t_impl, ctx)?;
-                let mut out = tb.as_object().cloned().unwrap_or_default();
-                out.insert("body".to_string(), residual);
-                return Ok(Value::Object(out));
-            }
-        }
-        Ok(tb)
-    }
-
-    /// Compute `IO(S')` for an `IO(S)`-headed value and a handler type —
-    /// the coverage check itself.
-    fn handle_sig_check(
-        &self,
-        io_val: &Value,
-        t_impl: &Value,
-        ctx: &mut TypecheckContext,
-    ) -> Result<Value, LangError> {
-        // The sig record — `{"__former__": {…, "args": [sig]}}` (the
-        // `dep_synth_type`/`quote` spelling) or the runtime-style
-        // `{"indices": [sig]}` mint (`type.IO` in lib-type).
-        let sig = io_val
-            .get("__former__")
-            .and_then(|f| f.get("args"))
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .or_else(|| {
-                io_val
-                    .get("indices")
-                    .and_then(|a| a.as_array())
-                    .and_then(|a| a.first())
-            })
-            .cloned()
-            .unwrap_or(Value::Null);
-        let sig = self.zonk(&sig, ctx);
-        let Some(sig_obj) = sig.as_object() else {
-            // `IO(⊤)` (arity-0, any sig) or a symbolic sig (a row
-            // meta/var `IO(s)` — coverage is undecidable at this use;
-            // solving happens at the arrow's call site).
-            return Ok(io_val.clone());
-        };
-        // The handler's declared op set — `type.record{fields}`;
-        // non-record handlers pass through (honest bound).
-        let Some(fields) = self.handler_op_fields(t_impl, ctx) else {
-            return Ok(io_val.clone());
-        };
-        let out_sig = self.effects_residual_row(sig_obj, &fields, ctx)?;
-        // Re-wrap in the body's own spelling.
-        let mut out = io_val.as_object().cloned().unwrap_or_default();
-        if let Some(f) = out.get_mut("__former__").and_then(Value::as_object_mut) {
-            if let Some(args) = f.get_mut("args").and_then(Value::as_array_mut)
-                && let Some(slot) = args.first_mut()
-            {
-                *slot = Value::Object(out_sig);
-            }
-        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut)
-            && let Some(slot) = indices.first_mut()
-        {
-            *slot = Value::Object(out_sig);
-        }
-        Ok(Value::Object(out))
-    }
 }
 
 impl NbeTypecheckEngine {

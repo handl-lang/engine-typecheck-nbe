@@ -2205,10 +2205,12 @@ impl NbeTypecheckEngine {
                     self.synth_export_judgment(lang, ast, node, ctx)
                 }
                 "synth_handle" => {
-                    // `handle <body> with <h>` (phase-2 WS-F): check `h`'s
-                    // declared impls against the body's `IO(S)` op set and
-                    // re-wrap the residual — covered entries take the impl's
-                    // declared return, uncovered stay `IO` ops.
+                    // `handle <body> with <h>` (PL-0004 G2): the body
+                    // type passes through unchanged while the ambient
+                    // modality computes the mode residual `μ → μ′`
+                    // over mode elements (coverage, `op ↦ ret`
+                    // re-keying, `μ_handler` union) — the `IO(S)`
+                    // codomain rewrite is retired with `type.io`.
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_handle: node out of bounds".to_string())
                     })?;
