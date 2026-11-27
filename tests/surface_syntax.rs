@@ -1,5 +1,6 @@
 //! Surface-syntax upgrade coverage (typed-binder Π arrows, dependent
-//! pairs, `~>[n]` dimension arrows, brace-free `IO<ops>` sigs).
+//! pairs, `~>[n]` dimension arrows, brace-free `IO<ops>` sigs — retired
+//! former, PL-0004 G2).
 //!
 //! Harness mirrors `dependent_structure.rs`: parse statements under a
 //! synthetic `block` root and run the NBE engine.
@@ -107,6 +108,13 @@ fn has_error(result: &hnl_tool_typecheck::TypecheckResult) -> bool {
     result.diagnostics.iter().any(|d| d.severity == "error")
 }
 
+fn has_warning_containing(result: &hnl_tool_typecheck::TypecheckResult, needle: &str) -> bool {
+    result
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == "warning" && d.message.contains(needle))
+}
+
 /// `(x : A) ~> B` in type position mints the same `type.pi` `Pi(A, x ~>
 /// B)` produces — single and multiple typed binders (right-nested Π),
 /// with the binder visible in the body.
@@ -181,11 +189,112 @@ fn dim_arrow_bare_spelling() {
     );
 }
 
-/// `IO<puts, fs>` — the brace-free sig record: bare names declare ops
-/// (`type.unknown` payload), `name : T` declares the payload type.
-/// Widening/coverage rules are identical to `IO<{ … }>`.
+/// `A ~[G]~> B` payload-kind flip (graded-arrows.md §9): a non-numeric
+/// payload mints `graded_arrow`, which `synth_graded_arrow` elaborates
+/// to `Arrow{…, dim: 1}` — the grade stays off the dimension channel.
+/// The bare `~>[n]` spelling keeps `dim_arrow` for every payload.
 #[test]
-fn io_bare_sig_record() {
+fn graded_arrow_payload_flip() {
+    let lang = canonical_lang();
+    // Parse-level: `~[N]~>` with a named payload mints `graded_arrow`.
+    let ast = parse_one(&lang, "dedupe<N> := (g >>> g) ~[N]~> g");
+    assert!(
+        ast.nodes().iter().any(|n| n.kind == "graded_arrow"),
+        "named ~[N]~> payload must mint graded_arrow"
+    );
+    assert!(
+        !ast.nodes().iter().any(|n| n.kind == "dim_arrow"),
+        "named ~[N]~> payload must not mint dim_arrow"
+    );
+    // Type-level: the same source typechecks through `synth_graded_arrow`.
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "graded arrow should check, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// pl-0002 M2: a call-head grade payload (`~[Cost(3)]~>`) mints a
+/// `type.mode` descriptor `{head, arg, raw}` riding the optional 4th
+/// `type.hom` index — `Cost(3)` selects `mode.algebra.Cost`, `3` is
+/// the payload, and `raw` is the self-describing `Cost(3)` app.
+#[test]
+fn graded_arrow_mode_descriptor() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            "Algebra<c : Type> := { mkAlgebra : (compose : c ~> c ~> c, unit : c, order : c ~> c ~> Bool) ~> Algebra }",
+            "Cost := new Algebra(Nat) { compose: (a, b) ~> a + b, unit: 0 }",
+            "dedupe := (g >>> g) ~[Cost(3)]~> g",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "graded arrow with a call-head mode should check, got {:?}",
+        diags_of(&result)
+    );
+    let found = result.node_types.values().any(|t| {
+        let s = serde_json::to_string(t).unwrap_or_default();
+        s.contains("\"name\":\"mode\"") && s.contains("Cost")
+    });
+    assert!(
+        found,
+        "expected a type.mode descriptor carrying head `Cost` in node_types"
+    );
+}
+
+/// PL-0004 E0: `Effects` is the canonical effect-row algebra head —
+/// `~[Effects(S)]~>` mints a `type.mode` descriptor selecting
+/// `mode.algebra.Effects` (the `globals.yaml` instance M2/M3 read).
+/// The grade payload `S` evaluates through the same annotation
+/// evaluator call-head modes use; record-row payloads elaborate in
+/// E1 (`@ [Effects(S)]`), so E0 covers the descriptor + registry
+/// path, not inline row literals.
+#[test]
+fn graded_arrow_effects_mode_descriptor() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            // `Effects` must be a bound name for the grade child to
+            // synthesize — the `new Algebra(…)` declaration kit will
+            // carry. (The `new` instance table and the
+            // `mode.algebra.*` globals registry are still disjoint —
+            // the M2/M3 bridge gap; the descriptor head is what
+            // selects `mode.algebra.Effects` here.)
+            "Algebra<c : Type> := { mkAlgebra : (compose : c ~> c ~> c, unit : c, order : c ~> c ~> Bool) ~> Algebra }",
+            "Effects := new Algebra(Nat) { compose: (a, b) ~> a, unit: 0, order: (a, b) ~> true }",
+            "S := 0",
+            "dedupe := (g >>> g) ~[Effects(S)]~> g",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "graded arrow with an Effects-headed mode should check, got {:?}",
+        diags_of(&result)
+    );
+    let found = result.node_types.values().any(|t| {
+        let s = serde_json::to_string(t).unwrap_or_default();
+        s.contains("\"name\":\"mode\"") && s.contains("Effects")
+    });
+    assert!(
+        found,
+        "expected a type.mode descriptor carrying head `Effects` in node_types"
+    );
+}
+
+/// `IO<puts, fs>` — the brace-free sig record still *parses* (bare
+/// names declare ops, `name : T` declares the payload type), but the
+/// `type.io` former is retired (PL-0004 G2): every `IO<…>` site warns
+/// and binds an open meta — effects are ambient modes
+/// (`T @ [Algebra(…)]`). The `handle`-coverage spelling it fed is gone
+/// with `handle_sig_check`.
+#[test]
+fn io_bare_sig_record_retired() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
@@ -193,18 +302,18 @@ fn io_bare_sig_record() {
             "export printLn : Str ~> IO<puts> := s ~> printLn(s)",
             "export readFile : Str ~> IO<fs> := p ~> readFile(p)",
             "export both : Str ~> IO<puts, fs> := s ~> both(s)",
-            "puts_handler : (Str ~> Unit) ~> Unit := req ~> req(\"handled\")",
-            "fs_handler : (Str ~> Str) ~> Str := req ~> req(\"contents\")",
-            "handled_partial : Str ~> IO<puts: Unit, fs> := handle both with {puts: puts_handler}",
-            "handled_full : Str ~> IO<puts: Unit, fs: Str> := handle both with {puts: puts_handler, fs: fs_handler}",
-            "widen_ok : Str ~> IO<puts, fs> := s ~> printLn(s)",
             "braced : Str ~> IO<{ puts, fs }> := s ~> both(s)",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "IO<puts, fs> should check like IO<{{ puts, fs }}>, got {:?}",
+        "IO<puts, fs> still checks via the retired-former honest bound, got {:?}",
+        diags_of(&result)
+    );
+    assert!(
+        has_warning_containing(&result, "`IO` is retired"),
+        "expected the retired-former warning, got {:?}",
         diags_of(&result)
     );
 }

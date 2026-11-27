@@ -1356,9 +1356,7 @@ impl NbeTypecheckEngine {
                                 ctx.registry
                                     .construct("type.interval", &Value::Null)
                                     .ok_or_else(|| {
-                                        LangError::engine(
-                                            "lookup: construct type.interval failed",
-                                        )
+                                        LangError::engine("lookup: construct type.interval failed")
                                     })
                             }
                         }
@@ -2158,6 +2156,33 @@ impl NbeTypecheckEngine {
                     // `type.ctor_sig` — with checker-owned strict positivity.
                     self.synth_data_judgment(lang, ast, node_ref, ctx)
                 }
+                "check_inductive_spec" => {
+                    // PL-0003 I2: strict positivity over an
+                    // `inductive.spec` *value* — `incoming` (Seq-threaded,
+                    // e.g. after a `result "F.spec"` op) or args[0]'s
+                    // scheme value. Returns `type.unit`; a negative
+                    // occurrence is a hard error — the same verdict
+                    // `synth_data`'s declaration-time check gives, now
+                    // re-checkable on computed specs.
+                    let spec = if args.is_empty() {
+                        incoming.clone().unwrap_or(Value::Null)
+                    } else {
+                        self.eval_type_scheme_td(
+                            lang,
+                            ast,
+                            node_ref,
+                            args[0],
+                            ctx,
+                            incoming.clone(),
+                        )?
+                    };
+                    dependent::check_inductive_spec(&spec)?;
+                    ctx.registry
+                        .construct("type.unit", &Value::Null)
+                        .ok_or_else(|| {
+                            LangError::engine("check_inductive_spec: construct type.unit failed")
+                        })
+                }
                 "synth_instance" => {
                     // `instance <C(i⃗)> := <dict>` (phase-3 WS-A): elaborate
                     // the constraint former application, enforce coherence,
@@ -2167,6 +2192,17 @@ impl NbeTypecheckEngine {
                         LangError::engine("synth_instance: node out of bounds".to_string())
                     })?;
                     self.synth_instance_judgment(lang, ast, node, ctx)
+                }
+                "synth_new" => {
+                    // `new T(args) { members }` outside an `assign` value
+                    // (graded-arrows.md §3): the `X := new …` form is
+                    // handled inside `synth_assign` (the family head is
+                    // the assign target); a bare `new` synths its
+                    // children, warns, and degrades to `type.unknown`.
+                    let node = ast.get(node_ref).ok_or_else(|| {
+                        LangError::engine("synth_new: node out of bounds".to_string())
+                    })?;
+                    self.synth_new_judgment(lang, ast, node, ctx)
                 }
                 "synth_call" => {
                     // Curried application: ctor/function/pi chains, dependent
@@ -2207,14 +2243,16 @@ impl NbeTypecheckEngine {
                     self.synth_export_judgment(lang, ast, node, ctx)
                 }
                 "synth_handle" => {
-                    // `handle <body> with <h>` (phase-2 WS-F): check `h`'s
-                    // declared impls against the body's `IO(S)` op set and
-                    // re-wrap the residual — covered entries take the impl's
-                    // declared return, uncovered stay `IO` ops.
+                    // `handle <body> with <h>` (PL-0004 G2): the body
+                    // type passes through unchanged while the ambient
+                    // modality computes the mode residual `μ → μ′`
+                    // over mode elements (coverage, `op ↦ ret`
+                    // re-keying, `μ_handler` union) — the `IO(S)`
+                    // codomain rewrite is retired with `type.io`.
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_handle: node out of bounds".to_string())
                     })?;
-                    self.synth_handle_judgment(lang, ast, node, ctx)
+                    self.synth_handle_judgment(lang, ast, node, node_ref.index(), ctx)
                 }
                 "synth_dim_arrow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
@@ -2227,6 +2265,12 @@ impl NbeTypecheckEngine {
                         LangError::engine("synth_graded_arrow: node out of bounds".to_string())
                     })?;
                     self.synth_graded_arrow_judgment(lang, ast, node, ctx)
+                }
+                "synth_mode_ascribe" => {
+                    // PL-0004 E1: `e @ μ` in term position — synth the
+                    // subject under the ascribed ambient mode and record
+                    // the mode set on the node (`Γ ⊢ t : A @ μ`).
+                    self.synth_mode_ascribe_judgment(lang, ast, node_ref.index(), ctx)
                 }
                 "synth_transport" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
@@ -2307,7 +2351,7 @@ impl NbeTypecheckEngine {
                     let node = ast.get(node_ref).ok_or_else(|| {
                         LangError::engine("synth_flow: node out of bounds".to_string())
                     })?;
-                    self.synth_flow_judgment(lang, ast, node, ctx)
+                    self.synth_flow_judgment(lang, ast, node, node_ref.index(), ctx)
                 }
                 "synth_axis_flow" => {
                     let node = ast.get(node_ref).ok_or_else(|| {
@@ -2632,7 +2676,29 @@ impl NbeTypecheckEngine {
                             node,
                         )
                     })? as usize;
-                    let expr_type = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx)?;
+                    // PL-0004 E1: `expr : T @ μ` — a `mode_ascribe`
+                    // annotation carries the judgement's ambient mode.
+                    // Elaborate it *before* judging the subject so the
+                    // subject checks under `μ` (`None` = pure — the
+                    // un-annotated default). `dep_synth_type` below
+                    // hits the same `mode_ascribe` arm; the mode-set
+                    // cache keeps elaboration single.
+                    let mode_scope = self.mode_ascription_at(lang, ast, type_idx, ctx)?;
+                    let prev_mode = mode_scope.clone().map(|m| ctx.ambient_mode.replace(m));
+                    let expr_res = self.synth_node(lang, ast, AstRef::new(expr_idx), ctx);
+                    if let Some(p) = prev_mode {
+                        ctx.ambient_mode = p;
+                    }
+                    let expr_type = expr_res?;
+                    // PL-0004 E2/G1: effect widening — the subject's
+                    // own ambient mode must be ≤ the ascribed μ (set
+                    // inclusion over mode heads). Terms with no
+                    // recorded mode pass.
+                    if let Some(mu_a) = &mode_scope
+                        && let Some(mu_v) = self.mode_of_node(ast, expr_idx, ctx)
+                    {
+                        self.check_mode_subsumption(&mu_v, mu_a, ctx)?;
+                    }
                     let type_node = ast.get(AstRef::new(type_idx)).ok_or_else(|| {
                         LangError::engine(format!(
                             "synth_type_annot: type node {} out of bounds",
@@ -2997,6 +3063,79 @@ impl NbeTypecheckEngine {
                         return Err(LangError::engine(format!(
                             "record_field_type: family '{fname}' has no scope binding '{field_name}'"
                         )));
+                    }
+                    // `type.family_app` — a `new Constraint` head applied
+                    // to its index args (`ev : Eq(a)`). The constraint's
+                    // dictionary *shape* (`"<head>.shape"`, recorded by
+                    // `synth_new_constraint_decl`) is a `type.record`
+                    // signature; projecting `ev.<field>` yields the
+                    // shape's field type with the declaration's
+                    // schematic vars substituted by the goal's index
+                    // args (`"<head>.shape.vars"` is the positional
+                    // key). A family_app with no recorded shape has no
+                    // dictionary surface — honest error.
+                    if container_type.get("__tag__").and_then(|t| t.as_str())
+                        == Some("type.family_app")
+                    {
+                        let head = container_type
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let goal_args = container_type
+                            .get("args")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let shape = ctx.lookup_result(&format!("{head}.shape")).cloned();
+                        let Some(shape) = shape else {
+                            return Err(LangError::engine(format!(
+                                "record_field_type: '{head}' has no constraint shape — `ev.{field_name}` needs a `new Constraint` declaration"
+                            )));
+                        };
+                        let shape_fields = shape
+                            .get("fields")
+                            .and_then(|f| f.as_object())
+                            .ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "record_field_type: constraint shape for '{head}' is not a record: {shape:?}"
+                                ))
+                            })?;
+                        let field_type = shape_fields.get(&field_name).ok_or_else(|| {
+                            LangError::engine(format!(
+                                "record_field_type: constraint '{head}' shape has no field '{field_name}'"
+                            ))
+                        })?;
+                        let vars: Vec<String> = ctx
+                            .lookup_result(&format!("{head}.shape.vars"))
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        return Ok(dependent::subst_shape_vars(field_type, &vars, &goal_args));
+                    }
+                    // `inductive.spec` — the spec value itself is the
+                    // container (PL-0003 I2): `synth_data` binds
+                    // `"<F>.spec"` in Γ, so `Nat.spec` resolves to the
+                    // spec record and `Nat.spec.ctors` / `.params` /
+                    // `.name` project its fields. The field *value*
+                    // rides the type channel — the same data-as-type
+                    // convention `results` values already use; spec
+                    // consumers (`check_inductive_spec`, I3's generic
+                    // eliminators) read the record, not a `type.*` tag.
+                    if container_type.get("__tag__").and_then(|t| t.as_str())
+                        == Some("inductive.spec")
+                    {
+                        return container_type
+                            .get(field_name.as_str())
+                            .cloned()
+                            .ok_or_else(|| {
+                                LangError::engine(format!(
+                                    "record_field_type: inductive.spec has no field '{field_name}'"
+                                ))
+                            });
                     }
                     let fields = container_type
                         .get("fields")
@@ -6255,12 +6394,31 @@ impl TypecheckEngine for NbeTypecheckEngine {
         // The root node is the LAST node in the arena (Pratt convention).
         let root_ref = AstRef::new(req.ast.len() - 1);
         let mut ctx = TypecheckContext::new(&self.registry_id, self.globals.clone());
+        // Mode algebras (pl-0002 M2): `mode.algebra.*` language globals
+        // seed the `Val`-domain registry `comp_axis_of` consults when
+        // graded-arrow modes compose.
+        ctx.vcheck.mode_algebras = lang
+            .globals
+            .iter()
+            .filter(|(k, _)| k.starts_with("mode.algebra."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let typ = self.synth_node(lang, &req.ast, root_ref, &mut ctx)?;
         // Final evidence-obligation drain (phase-3 WS-A): deferred
         // instance goals whose index metas solved through the
         // expected-type unify retry once more; still-open obligations
         // are honest errors, never a silently unsolved dictionary meta.
         self.retry_pending_instances(&mut ctx, true)?;
+        // Mode-compose honest bounds minted inside the `Val` domain
+        // (pl-0002 M2): the `Checker` has no diagnostic channel, so
+        // its warnings drain here as `warning` diagnostics.
+        for w in std::mem::take(&mut ctx.vcheck.mode_warnings) {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: w,
+                span: None,
+            });
+        }
         // Zonk pass over every *reported* type — `node_types` (the
         // LSP's hover), the module `typ`, and each `Sig_m` field
         // (phase-3 spec / `hnl lsp` v2). A node's type is recorded
@@ -6451,6 +6609,58 @@ struct TypecheckContext {
     /// metavariable-typed binding stays maximally permissive rather than
     /// failing the escape-hatch code the check now reaches.
     loose: usize,
+    /// Spec-elaboration side arena (PL-0003 I2): lazily initialized as a
+    /// clone of the source `Ast` the first time an `inductive.spec`
+    /// owned type-expr is materialized, then grown with the materialized
+    /// nodes. Spec node indices are therefore always ≥ the source
+    /// length — a source-arena lookup misses and `dep_synth_type`
+    /// falls back here, so `body_child_idx`/`rest[].annot` indices that
+    /// escape into elaborated `type.pi`/`type.sigma` closures still
+    /// resolve against the appended nodes.
+    spec_ast: Option<Ast>,
+    /// The ambient mode `μ` of the judgement currently being checked
+    /// (PL-0004 E1; `Γ ⊢ t : A @ μ`): `Some(mode_set)` while the
+    /// subject/value of a `T @ μ` ascription is judged, `None` = the
+    /// pure/empty mode — un-annotated code is unaffected. Mode sets
+    /// are the tagged `type.mode_set` values
+    /// [`NbeTypecheckEngine::elaborate_mode_set`] mints; consumers
+    /// (perform/handle modality, mode-polymorphic instantiation) are
+    /// E2/E3 — E1 plumbs the slot and records ascriptions only.
+    ambient_mode: Option<Value>,
+    /// Ascribed mode sets by `mode_ascribe` node index — the
+    /// judgement metadata `Γ ⊢ t : A @ μ` records (the mode is never
+    /// part of `A`).
+    node_modes: HashMap<usize, Value>,
+    /// Elaborated mode sets by *mode-expression* child index — lets a
+    /// `mode_ascribe` node's set elaborate once even when both the
+    /// annotation pre-scan (`synth_type_annot`) and `dep_synth_type`'s
+    /// `mode_ascribe` arm reach it (no duplicate diagnostics).
+    mode_set_cache: HashMap<usize, Value>,
+    /// Effects performed under the ambient mode, in synthesis order
+    /// (PL-0004 E2/G1): `(op head name, op signature `A ~> B`)`
+    /// appended by `synth_perform`'s granular arm — the judgement-mode
+    /// extension `perform` records so `handle` can compute the
+    /// residual `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler`. `synth_handle_judgment`
+    /// slices from marks bracketing the target's and impl's synthesis
+    /// and rewrites the slice to the residual, so nested handles
+    /// propagate exactly the unhandled ops outward.
+    performed_effects: Vec<(String, Value)>,
+    /// Elaboration-scoped mode metavariables (PL-0004 E3): `name →
+    /// tagged meta id` for unbound `var`s inside `@ μ` ascriptions.
+    /// Scoped to a single `elaborate_mode_set` call — repeated
+    /// occurrences of one name share the meta (they unify/substitute
+    /// during checking), while distinct ascriptions mint distinct
+    /// metas (no cross-binding generalization; the M3.5
+    /// annotation-required discipline).
+    mode_metas: HashMap<String, u64>,
+    /// Ambient modes of named bindings (PL-0004 E2): `(name, mode_set
+    /// or Null, gamma_len at bind)` — `mode_of_node` resolves a `var`
+    /// operand's judgement mode for `>>>` row composition, `handle`
+    /// coverage, and ascription subsumption. The `gamma_len` stamp
+    /// keeps entries honest under `mark`/`restore`: an entry is valid
+    /// only while `gamma.len() >= stamp` (its binding is still in
+    /// scope), so popped scopes never leak modes to later siblings.
+    binding_modes: Vec<(String, Value, usize)>,
 }
 
 /// A registered dictionary instance (phase-3 WS-A): the elaboration
@@ -6519,6 +6729,13 @@ impl TypecheckContext {
             instance_count: 0,
             scheme_td: HashMap::new(),
             loose: 0,
+            spec_ast: None,
+            ambient_mode: None,
+            node_modes: HashMap::new(),
+            mode_set_cache: HashMap::new(),
+            performed_effects: Vec::new(),
+            mode_metas: HashMap::new(),
+            binding_modes: Vec::new(),
         }
     }
 
@@ -6607,6 +6824,30 @@ impl TypecheckContext {
     /// Look up a binding by index in Γ (0 = outermost).
     fn lookup_index(&self, idx: usize) -> Option<&Value> {
         self.gamma.get(idx).map(|(_, v)| v)
+    }
+
+    /// Record a named binding's ambient mode (PL-0004 E2). Call *after*
+    /// [`extend`](Self::extend) so the `gamma_len` stamp marks the
+    /// binding's scope: the entry stays valid while
+    /// `gamma.len() >= stamp` and is ignored once `restore` pops past
+    /// it. `None` pushes the `Null` marker — an un-annotated binding
+    /// shadows an outer mode-carrying binding of the same name rather
+    /// than inheriting its mode.
+    fn bind_mode(&mut self, name: String, mode: Option<Value>) {
+        self.binding_modes
+            .push((name, mode.unwrap_or(Value::Null), self.gamma.len()));
+    }
+
+    /// The ambient mode recorded for `name` by [`bind_mode`](Self::bind_mode)
+    /// — reverse scan (innermost first), skipping entries whose scope
+    /// stamp outlived a `restore`. `Value::Null` marks "bound without a
+    /// mode" (pure); callers treat it as no mode.
+    fn lookup_binding_mode(&self, name: &str) -> Option<&Value> {
+        self.binding_modes
+            .iter()
+            .rev()
+            .find(|(n, _, stamp)| n == name && *stamp <= self.gamma.len())
+            .map(|(_, m, _)| m)
     }
 
     /// The `TermData` form of a lang-owned rule `Term`, converting once
@@ -7251,7 +7492,7 @@ fn interpret_type_expr(
                 .get("name")
                 .and_then(|v| v.as_str())
                 .or_else(|| field_node.payload.get("value").and_then(|v| v.as_str()))
-                .or_else(|| field_node.payload.as_str().map(|s| s))
+                .or_else(|| field_node.payload.as_str())
                 .ok_or_else(|| {
                     LangError::engine_node(
                         "interpret_type_expr: field node has no name/value string",

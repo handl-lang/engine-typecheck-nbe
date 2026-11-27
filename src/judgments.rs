@@ -580,7 +580,7 @@ fn fold_scalar(kind: &str, l: &Val, r: Option<&Val>) -> Option<Val> {
             return Some(const_val(n));
         }
     }
-    if let (Some(a), Some(Some(b))) = (num(l), r.map(&num)) {
+    if let (Some(a), Some(Some(b))) = (num(l), r.map(num)) {
         let v = match kind {
             "binary.eq" => Some(const_val(a == b)),
             "binary.neq" => Some(const_val(a != b)),
@@ -595,7 +595,7 @@ fn fold_scalar(kind: &str, l: &Val, r: Option<&Val>) -> Option<Val> {
             return v;
         }
     }
-    if let (Some(a), Some(Some(b))) = (bool(l), r.map(&bool)) {
+    if let (Some(a), Some(Some(b))) = (bool(l), r.map(bool)) {
         let v = match kind {
             "binary.and" => Some(a && b),
             "binary.or" => Some(a || b),

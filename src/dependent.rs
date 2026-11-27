@@ -10,9 +10,9 @@
 //! - `type.family_app{name, args}` — a saturated family application;
 //!   `args` are *index terms*.
 //! - `type.ctor_sig{ctor, family, params, args, result, bare}` — a
-//!   constructor signature spec; [`instantiate_ctor`] re-elaborates it
-//!   per use into a `type.function` chain ending in `family_app` (fresh
-//!   index metavariable per parameter).
+//!   constructor signature spec; [`instantiate_ctor_full`] re-elaborates
+//!   it per use into a `type.function` chain ending in `family_app`
+//!   (fresh index metavariable per parameter).
 //! - Index terms — `Value` numbers, `{"__meta__": id}` metas,
 //!   `{"__tag__": "var", "name": n}` rigid variables, `{"__tag__": "Bin",
 //!   "op": kind, "l", "r"}` and `{"__tag__": "Un", "op", "operand"}`
@@ -80,10 +80,7 @@ fn insert_module_sig_field(
         inner.insert("fields".to_string(), Value::Object(Map::new()));
         *entry = make_tag(ctx, "type.record", inner);
     }
-    if let Some(inner_fields) = entry
-        .get_mut("fields")
-        .and_then(Value::as_object_mut)
-    {
+    if let Some(inner_fields) = entry.get_mut("fields").and_then(Value::as_object_mut) {
         insert_module_sig_field(inner_fields, rest, ty, ctx);
     }
 }
@@ -382,7 +379,7 @@ fn cub_face_of_val(v: &Value) -> Option<CubFace> {
                 }),
                 "fnot" => args
                     .and_then(|a| a.first())
-                    .and_then(|a0| cub_face_of_val(a0))
+                    .and_then(cub_face_of_val)
                     .map(|a| CubFace::Not(Box::new(a))),
                 "f_or" | "f_and" => {
                     let (Some(a0), Some(a1)) =
@@ -411,8 +408,8 @@ fn cub_face_of_val(v: &Value) -> Option<CubFace> {
                 Some(if b { CubFace::Tt } else { CubFace::Ff })
             } else {
                 match num_val(v) {
-                    Some(n) if n == 1.0 => Some(CubFace::Tt),
-                    Some(n) if n == 0.0 => Some(CubFace::Ff),
+                    Some(1.0) => Some(CubFace::Tt),
+                    Some(0.0) => Some(CubFace::Ff),
                     _ => None,
                 }
             }
@@ -685,6 +682,42 @@ pub(crate) fn is_domain_encoded(v: &Value) -> bool {
     }
 }
 
+/// Whether a boundary `__former__` JSON reifies a `type.hom`
+/// application carrying the mode index (≥4 args — pl-0002 M2). Both
+/// spellings are recognized: quote's `{"__former__": {"sym": S,
+/// "args": […]}}` and the surface `{"__former__": S, "indices": […]}`.
+fn json_mode_hom(v: &Value) -> bool {
+    let Some(f) = v.get("__former__") else {
+        return false;
+    };
+    let hom = checker::type_sym("type.hom").handle();
+    let head_is_hom = |s: &Value| -> bool {
+        let inner = s.get("__sym__").unwrap_or(s);
+        if let Some(h) = inner.get("handle").and_then(Value::as_u64) {
+            return h == hom;
+        }
+        matches!(
+            inner.get("name").and_then(Value::as_str),
+            Some("type.hom" | "hom")
+        )
+    };
+    if let Some(obj) = f.as_object() {
+        if let Some(s) = obj.get("sym") {
+            let args = obj.get("args").or_else(|| obj.get("indices"));
+            return head_is_hom(s) && args.and_then(Value::as_array).is_some_and(|a| a.len() >= 4);
+        }
+        // `{"__former__": <sym>}` — the sym payload itself; indices
+        // are siblings on the parent object.
+        if head_is_hom(f) {
+            return v
+                .get("indices")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.len() >= 4);
+        }
+    }
+    false
+}
+
 /// Rewrite tagged `{"__meta__": n}` leaves into `{"__neutral__":
 /// {"head":"meta","id": m}}` carrying *fresh* domain metas — the two
 /// meta stores never alias: a tagged meta crossing the domain bridge
@@ -702,11 +735,19 @@ pub(crate) fn remap_tagged_metas(
         return serde_json::json!({"__neutral__": {"head": "meta", "id": m, "spine": []}});
     }
     match v {
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| (k.clone(), remap_tagged_metas(x, map, ctx)))
-                .collect(),
-        ),
+        Value::Object(o) => {
+            // A mode-carrying `Hom` reified through `domain_quote`
+            // (pl-0002 M2) latches the conv mode-strip — the lift
+            // side of the round trip.
+            if !ctx.vcheck.mode_homs && json_mode_hom(v) {
+                ctx.vcheck.mode_homs = true;
+            }
+            Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), remap_tagged_metas(x, map, ctx)))
+                    .collect(),
+            )
+        }
         Value::Array(xs) => {
             Value::Array(xs.iter().map(|x| remap_tagged_metas(x, map, ctx)).collect())
         }
@@ -733,42 +774,47 @@ pub(crate) fn domain_quote(v: &Val, ctx: &TypecheckContext) -> Value {
     ))
 }
 
-/// Whether `v` is a `Former{type.io}` application — either `__former__`
-/// spelling (quote's `{"sym", "args"}` or the surface `{"indices"}`).
-/// Identity is the seeded-sym *handle* (`Sym::seeded("type.io")` spells
-/// its short display name `"io"`, never the full seed — the quoted
-/// `__sym__` payload carries `handle` for exactly this compare); the
-/// name check is a fallback for spellings that drop the handle.
-fn io_headed(v: &Value) -> bool {
-    fn sym_matches(s: &Value) -> bool {
-        let handle = s
-            .get("__sym__")
-            .and_then(|x| x.get("handle"))
-            .or_else(|| s.get("handle"))
-            .and_then(Value::as_u64);
-        if let Some(h) = handle {
-            // A spelled handle is authoritative — a different sym that
-            // happens to display as "io" must not false-positive.
-            return h == checker::type_sym("type.io").handle();
-        }
-        let name = s
-            .get("__sym__")
-            .and_then(|x| x.get("name"))
-            .or_else(|| s.get("name"))
-            .and_then(Value::as_str);
-        matches!(name, Some("type.io" | "io"))
+/// Quote-side counterpart of [`remap_tagged_metas`] (PL-0004 E3):
+/// `domain_quote` spells unsolved domain metas
+/// `{"__neutral__": {"head": "meta", "id": n}}` — the tagged meta
+/// store cannot address domain ids, so each distinct domain meta
+/// re-mints as a fresh `__meta__` (memoized: shared metas stay
+/// shared). Everything else passes through unchanged — the
+/// `__former__`/`__sym__` spellings are already boundary JSON.
+fn quote_domain_metas(v: &Value, map: &mut HashMap<u64, u64>, ctx: &mut TypecheckContext) -> Value {
+    let is_domain_meta = v.as_object().is_some_and(|o| o.len() == 1)
+        && v.get("__neutral__")
+            .and_then(|n| n.get("head"))
+            .and_then(Value::as_str)
+            == Some("meta");
+    if is_domain_meta
+        && let Some(id) = v
+            .get("__neutral__")
+            .and_then(|n| n.get("id"))
+            .and_then(Value::as_u64)
+    {
+        let mid = *map.entry(id).or_insert_with(|| ctx.fresh_meta());
+        return meta_value(mid);
     }
-    v.get("__former__")
-        .map(|f| sym_matches(f) || f.get("sym").is_some_and(sym_matches))
-        .unwrap_or(false)
+    match v {
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), quote_domain_metas(x, map, ctx)))
+                .collect(),
+        ),
+        Value::Array(xs) => {
+            Value::Array(xs.iter().map(|x| quote_domain_metas(x, map, ctx)).collect())
+        }
+        _ => v.clone(),
+    }
 }
 
 /// Whether `v` is `type.unknown` — the dynamic top — in any boundary
 /// spelling: the tagged `{"__tag__": "type.unknown"}` value, the
 /// `__sym__` reification `quote` emits for `Nominal{type.unknown}`, or
 /// a `__former__` application headed by the `type.unknown` sym. The
-/// handle compare is authoritative (mirroring `io_headed`); the name
-/// check is a fallback for spellings that drop the handle.
+/// handle compare is authoritative; the name check is a fallback for
+/// spellings that drop the handle.
 pub(crate) fn is_unknown_ty(v: &Value) -> bool {
     if tag_of(v) == Some("type.unknown") {
         return true;
@@ -809,10 +855,21 @@ fn nullary_domain(param: &Value) -> bool {
 /// The canonical `Former{type.hom}` application `Hom(d, a, b)` emitted
 /// as boundary JSON (the `__former__` encoding).
 fn hom_former(d: Val, a: Val, b: Val, ctx: &TypecheckContext) -> Value {
+    hom_former_mode(d, a, b, None, ctx)
+}
+
+/// `hom_former` with the optional mode index (pl-0002 M2): `Some(m)`
+/// emits the 4-index `Hom(d, a, b, m)` carrying the mode descriptor —
+/// graded arrows only; dims never produce one.
+fn hom_former_mode(d: Val, a: Val, b: Val, mode: Option<Val>, ctx: &TypecheckContext) -> Value {
+    let mut args = vec![d, a, b];
+    if let Some(m) = mode {
+        args.push(m);
+    }
     domain_quote(
         &Val::Former {
             head: checker::type_sym("type.hom"),
-            args: vec![d, a, b],
+            args,
         },
         ctx,
     )
@@ -832,7 +889,7 @@ fn dim_meta(ctx: &mut TypecheckContext) -> Val {
 fn hom_dim_lit(v: &Val) -> Option<u64> {
     if let Val::Former { head, args } = v
         && head.handle() == checker::type_sym("type.hom").handle()
-        && args.len() == 3
+        && args.len() >= 3
         && let Val::Const(TaggedValue::Int(m)) = &args[0]
     {
         return u64::try_from(*m).ok();
@@ -884,6 +941,51 @@ fn closure_param_names(lang: &Language, ast: &Ast, pnode: &AstNode) -> Option<Ve
         .ok()
         .or_else(|| lang.param_bound_names(ast, pnode).ok())
         .filter(|names| !names.is_empty())
+}
+
+/// The `new` declaration's schema head — the `type` child's callee
+/// name (`Inductive`/`Algebra`/`Constraint`, the registry kinds of
+/// design/instance-unified-registry.md §2) plus the argument node
+/// indices. `paren` layers unwrap; `call`/`index_app`/`dimension`
+/// share the `[callee, args…]` layout; a bare `var` is the
+/// parameterless form (`new T { … }`). Returns `None` for a `type`
+/// child that is not a name-headed application.
+fn new_decl_schema(lang: &Language, ast: &Ast, type_idx: usize) -> Option<(String, Vec<usize>)> {
+    let mut node = ast.get(AstRef::new(type_idx))?;
+    while node.kind == "paren" {
+        let i = children_of(node)?.first()?.as_u64()? as usize;
+        node = ast.get(AstRef::new(i))?;
+    }
+    if node.kind == "var" {
+        return node_name(node).map(|n| (n, Vec::new()));
+    }
+    if !matches!(node.kind.as_str(), "call" | "index_app" | "dimension") {
+        return None;
+    }
+    let kids = children_of(node)?;
+    let callee_role = lang
+        .child_role_index(&node.kind, "callee")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let args_role = lang
+        .child_role_index(&node.kind, "args")
+        .ok()
+        .flatten()
+        .unwrap_or(callee_role + 1);
+    let mut callee = ast.get(AstRef::new(kids.get(callee_role)?.as_u64()? as usize))?;
+    while callee.kind == "paren" {
+        let i = children_of(callee)?.first()?.as_u64()? as usize;
+        callee = ast.get(AstRef::new(i))?;
+    }
+    let name = node_name(callee)?;
+    let args = kids
+        .iter()
+        .skip(args_role)
+        .filter_map(Value::as_u64)
+        .map(|v| v as usize)
+        .collect();
+    Some((name, args))
 }
 
 /// Whether `name` is a builtin type-position identifier — the name table
@@ -1460,7 +1562,7 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
 //
 // The rewrite is *decidable, not a rewrite rule*: it runs inside
 // `eval_index`, so every consumer (`unify_index`, `dep_unify`, match
-// refinement, `closed_num`, `eval_ann_term`) sees normal forms before
+// refinement, `eval_ann_term`) sees normal forms before
 // meta-solving. Distribution is bounded (`POLY_*` caps) — a product too
 // large to expand keeps the factored `canon_bin` shape instead of
 // blowing up; that case is not silent, it just stays unnormalized.
@@ -1740,11 +1842,6 @@ fn ring_normalize(v: &Value) -> Option<Value> {
 /// normal form when the term is in the bounded fragment.
 fn ring_canon(v: Value) -> Value {
     ring_normalize(&v).unwrap_or(v)
-}
-
-/// The closed numeric value of a term, if it evaluates to a numeral.
-fn closed_num(v: &Value, ctx: &TypecheckContext) -> Option<f64> {
-    num_val(&eval_index(v, ctx))
 }
 
 /// Whether the `{"__meta__": id}` term `needle` occurs anywhere in `v`
@@ -2571,8 +2668,7 @@ fn render_split_path(path: &[(String, String)]) -> String {
 }
 
 /// The name a `Former{var, [n]}` value carries — the domain reification
-/// of `var_term(n)` (`domain_lift` of an index var). `IO(s)` sigs quoted
-/// into `Former{type.io}.args` carry `s` that way.
+/// of `var_term(n)` (`domain_lift` of an index var).
 fn former_var_name(v: &Value) -> Option<&str> {
     let f = v.get("__former__")?;
     let sym = f.get("sym")?;
@@ -2596,8 +2692,7 @@ fn subst_index(term: &Value, frm: &Value, to: &Value) -> Value {
         return to.clone();
     }
     // `var{n}` inside a domain-encoded former — the `Former{var,[n]}`
-    // spelling the `var_term` shape lifts/round-trips to (e.g. an
-    // `IO(s)` sig var inside `Former{type.io}.args`).
+    // spelling the `var_term` shape lifts/round-trips to.
     if tag_of(frm) == Some("var")
         && former_var_name(term) == frm.get("name").and_then(Value::as_str)
     {
@@ -2864,10 +2959,347 @@ fn collect_ctor_leaf(
     }
 }
 
-/// Strict positivity over the ctor-arg AST (checker-owned, ADR-0152 §4):
-/// the defined former must not occur in a *domain* position. `occurs` is
-/// any occurrence; a `call(->, dom, cod)`/`function` node's domain child
-/// is the negative position.
+/// Owned type-expr node for `inductive.spec` values (PL-0003 I1): the
+/// serialized `{kind, span, payload}` [`AstNode`] shape with
+/// `payload["children"]` / `payload["body"]` arena references replaced
+/// by recursively owned node records — self-contained data that does
+/// not depend on the source arena. Mirror of the model's
+/// `owned_node_`/`owned_payload_`; field names must stay identical for
+/// parity.
+fn owned_node_at(ast: &Ast, idx: usize) -> Value {
+    match ast.get(AstRef::new(idx)) {
+        Some(node) => owned_node_value(ast, node),
+        None => Value::Null,
+    }
+}
+
+fn owned_node_value(ast: &Ast, node: &AstNode) -> Value {
+    let mut m = Map::new();
+    m.insert("kind".to_string(), Value::String(node.kind.clone()));
+    m.insert(
+        "span".to_string(),
+        node.span
+            .map(|sp| serde_json::json!({ "start": sp.start, "end": sp.end }))
+            .unwrap_or(Value::Null),
+    );
+    m.insert("payload".to_string(), owned_payload(ast, &node.payload));
+    Value::Object(m)
+}
+
+/// The arena index a `children` entry refers to — plain `u64`, or the
+/// head of a `[idx, …]` pair (the shape `ast_node` tolerates).
+fn child_index_of(v: &Value) -> Option<usize> {
+    v.as_u64()
+        .or_else(|| v.as_array()?.first()?.as_u64())
+        .map(|i| i as usize)
+}
+
+fn owned_payload(ast: &Ast, payload: &Value) -> Value {
+    let Value::Object(map) = payload else {
+        return payload.clone();
+    };
+    let mut out = map.clone();
+    if let Some(Value::Array(items)) = out.get("children").cloned() {
+        let owned: Vec<Value> = items
+            .iter()
+            .map(|c| match child_index_of(c) {
+                Some(i) => owned_node_at(ast, i),
+                None => c.clone(),
+            })
+            .collect();
+        out.insert("children".to_string(), Value::Array(owned));
+    }
+    if let Some(body) = out.get("body").and_then(Value::as_u64) {
+        out.insert("body".to_string(), owned_node_at(ast, body as usize));
+    }
+    Value::Object(out)
+}
+
+/// Build the `inductive.spec` record for a `data` declaration
+/// (PL-0003 I1): `{name, params, ctors}` with `params` a list of
+/// `{name, sort, nat}` (`sort` the owned annotation node or `null`) and
+/// `ctors` a list of `{name, args, result, bare}` — `args` entries are
+/// `{name, type}` (`type` the owned domain node or `null`), `result`
+/// the owned result-index node or `null`. Field names mirror the
+/// model's `inductive_spec_` exactly. The spec describes the
+/// *declaration*; `type.family`/`type.family_app`/`type.ctor_sig`
+/// application machinery is untouched.
+fn inductive_spec_value(
+    ctx: &TypecheckContext,
+    ast: &Ast,
+    name: &str,
+    params: &[DepParam],
+    ctors: &[DepCtor],
+) -> Value {
+    let p_specs: Vec<Value> = params
+        .iter()
+        .map(|p| {
+            let mut m = Map::new();
+            m.insert("name".to_string(), Value::String(p.name.clone()));
+            m.insert(
+                "sort".to_string(),
+                p.node.map(|i| owned_node_at(ast, i)).unwrap_or(Value::Null),
+            );
+            m.insert("nat".to_string(), Value::Bool(p.nat));
+            Value::Object(m)
+        })
+        .collect();
+    let c_specs: Vec<Value> = ctors
+        .iter()
+        .map(|c| {
+            let args: Vec<Value> = c
+                .args
+                .iter()
+                .map(|(n, t)| {
+                    let mut m = Map::new();
+                    m.insert("name".to_string(), Value::String(n.clone()));
+                    m.insert(
+                        "type".to_string(),
+                        t.map(|i| owned_node_at(ast, i)).unwrap_or(Value::Null),
+                    );
+                    Value::Object(m)
+                })
+                .collect();
+            let mut m = Map::new();
+            m.insert("name".to_string(), Value::String(c.name.clone()));
+            m.insert("args".to_string(), Value::Array(args));
+            m.insert(
+                "result".to_string(),
+                c.result
+                    .map(|i| owned_node_at(ast, i))
+                    .unwrap_or(Value::Null),
+            );
+            m.insert("bare".to_string(), Value::Bool(c.bare));
+            Value::Object(m)
+        })
+        .collect();
+    let mut fields = Map::new();
+    fields.insert("name".to_string(), Value::String(name.to_string()));
+    fields.insert("params".to_string(), Value::Array(p_specs));
+    fields.insert("ctors".to_string(), Value::Array(c_specs));
+    make_tag(ctx, "inductive.spec", fields)
+}
+
+/// Whether `v` is an owned node record produced by [`owned_node_value`]
+/// (`{kind, span, payload}`) rather than a scalar payload entry.
+/// `inductive.spec` children/body slots hold these records; every other
+/// payload value passes through untouched.
+fn is_owned_node_value(v: &Value) -> bool {
+    v.as_object()
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        .is_some()
+}
+
+/// Materialize one owned `inductive.spec` type-expr node into
+/// `ctx.spec_ast` (PL-0003 I2), returning its fresh arena index. The
+/// side arena is initialized lazily as a *clone of the source arena*
+/// so spec indices can never collide with source indices — they are
+/// always ≥ `ast.len()`, which is what lets `dep_synth_type`'s
+/// out-of-bounds fallback find them after elaboration. Children are
+/// materialized first (post-order); `payload["children"]` entries and
+/// `payload["body"]` that are owned node records become arena indices,
+/// everything else passes through verbatim — the same two keys
+/// [`owned_payload`] recursed into.
+fn spec_node_index(
+    ctx: &mut TypecheckContext,
+    ast: &Ast,
+    owned: &Value,
+) -> Result<usize, LangError> {
+    let Some(obj) = owned.as_object() else {
+        return Err(LangError::engine(
+            "inductive.spec: type-expr is not an owned node record".to_string(),
+        ));
+    };
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LangError::engine("inductive.spec: owned node missing kind".to_string()))?
+        .to_string();
+    let span = obj.get("span").and_then(|sp| {
+        let start = sp.get("start").and_then(Value::as_u64)? as usize;
+        let end = sp.get("end").and_then(Value::as_u64)? as usize;
+        Some(handl_language::Span { start, end })
+    });
+    // Scalar payloads (`var` name strings, `value`/`lit` literals) pass
+    // through verbatim — only object payloads can carry `children`/`body`
+    // arena references to rewrite.
+    let raw_payload = obj.get("payload").cloned().unwrap_or(Value::Null);
+    let mut payload = match &raw_payload {
+        Value::Object(p) => p.clone(),
+        _ => Map::new(),
+    };
+    let payload_is_obj = matches!(raw_payload, Value::Object(_));
+    if payload_is_obj && let Some(Value::Array(items)) = payload.get("children").cloned() {
+        let mut idxs = Vec::with_capacity(items.len());
+        for c in &items {
+            if is_owned_node_value(c) {
+                idxs.push(Value::from(spec_node_index(ctx, ast, c)? as u64));
+            } else {
+                idxs.push(c.clone());
+            }
+        }
+        payload.insert("children".to_string(), Value::Array(idxs));
+    }
+    let mut body_idx = Value::Null;
+    let mut body_done = false;
+    if payload_is_obj
+        && let Some(raw) = payload.get("body")
+        && is_owned_node_value(raw)
+    {
+        body_idx = Value::from(spec_node_index(ctx, ast, raw)? as u64);
+        body_done = true;
+    }
+    if ctx.spec_ast.is_none() {
+        ctx.spec_ast = Some(ast.clone());
+    }
+    if body_done {
+        payload.insert("body".to_string(), body_idx);
+    }
+    let node = AstNode {
+        kind,
+        span,
+        payload: if payload_is_obj {
+            Value::Object(payload)
+        } else {
+            raw_payload
+        },
+    };
+    let arena = ctx
+        .spec_ast
+        .as_mut()
+        .ok_or_else(|| LangError::engine("inductive.spec: spec arena missing".to_string()))?;
+    Ok(arena.push(node).index())
+}
+
+/// `true` when `results["<family>.spec"]` is an `inductive.spec`
+/// declaring `ctor` — the pure membership half of spec-driven ctor
+/// resolution (no arena materialization). Used for match-arm coverage
+/// classification where only membership matters.
+fn spec_declares_ctor(ctx: &TypecheckContext, family: &str, ctor: &str) -> bool {
+    if family.is_empty() {
+        return false;
+    }
+    ctx.results
+        .get(&format!("{family}.spec"))
+        .filter(|s| tag_of(s) == Some("inductive.spec"))
+        .and_then(|s| s.get("ctors").and_then(Value::as_array))
+        .is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some(ctor))
+        })
+}
+
+/// Rebuild the `type.ctor_sig` for `ctor` of `family` from the family's
+/// `inductive.spec` results value (PL-0003 I2). The spec's owned
+/// type-expr nodes are materialized into `ctx.spec_ast` and the
+/// returned sig's `node` fields index *that* arena — callers must
+/// instantiate it against `ctx.spec_ast`, not the source `ast` (see
+/// `synth_match_with_motive`). The record shape mirrors the gamma
+/// `type.ctor_sig` `synth_data` binds (`params`/`args` carry `node`
+/// arena indices, `result` an index or `null`, plus `bare`).
+/// `Ok(None)` when no usable spec or ctor is present — the caller then
+/// falls back to the gamma `type.ctor_sig` binding.
+fn spec_ctor_sig(
+    ctx: &mut TypecheckContext,
+    ast: &Ast,
+    family: &str,
+    ctor: &str,
+) -> Result<Option<Value>, LangError> {
+    if family.is_empty() {
+        return Ok(None);
+    }
+    let Some(spec) = ctx.results.get(&format!("{family}.spec")).cloned() else {
+        return Ok(None);
+    };
+    if tag_of(&spec) != Some("inductive.spec") {
+        return Ok(None);
+    }
+    let Some(c) = spec.get("ctors").and_then(Value::as_array).and_then(|cs| {
+        cs.iter()
+            .find(|c| c.get("name").and_then(Value::as_str) == Some(ctor))
+            .cloned()
+    }) else {
+        return Ok(None);
+    };
+    // Owned type-expr → spec-arena index; `null`/non-node stays `null`
+    // (the `type.unknown` domain convention `instantiate_ctor_full`
+    // already handles).
+    let mut params = Vec::new();
+    for p in spec
+        .get("params")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let node = match p.get("sort") {
+            Some(v) if is_owned_node_value(v) => Value::from(spec_node_index(ctx, ast, v)? as u64),
+            _ => Value::Null,
+        };
+        params.push(serde_json::json!({
+            "name": p.get("name").and_then(Value::as_str).unwrap_or(""),
+            "node": node,
+            "nat": p.get("nat").and_then(Value::as_bool).unwrap_or(false),
+        }));
+    }
+    let mut args = Vec::new();
+    for a in c
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let node = match a.get("type") {
+            Some(v) if is_owned_node_value(v) => Value::from(spec_node_index(ctx, ast, v)? as u64),
+            _ => Value::Null,
+        };
+        args.push(serde_json::json!({
+            "name": a.get("name").and_then(Value::as_str).unwrap_or(""),
+            "node": node,
+        }));
+    }
+    let result = match c.get("result") {
+        Some(v) if is_owned_node_value(v) => Value::from(spec_node_index(ctx, ast, v)? as u64),
+        _ => Value::Null,
+    };
+    let spec_name = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(family)
+        .to_string();
+    let sig = serde_json::json!({
+        "__tag__": "type.ctor_sig",
+        "__registry__": ctx.registry.registry_id(),
+        "ctor": true,
+        "family": spec_name,
+        "params": params,
+        "args": args,
+        "result": result,
+        "bare": c.get("bare").and_then(Value::as_bool).unwrap_or(false),
+    });
+    Ok(Some(sig))
+}
+
+// ---------------------------------------------------------------------------
+// Strict positivity (PL-0003 I2)
+// ---------------------------------------------------------------------------
+//
+// Strict positivity is the `check_inductive_spec` judgment over the
+// spec's *owned* type-expr node records (`{kind, span, payload}` with
+// `payload.children`/`payload.body` holding nested owned records —
+// the [`owned_payload`] shape) instead of source AST nodes. The walks
+// below carry the full syntactic rule the retired AST positivity walk
+// (ADR-0152 §4) implemented: the defined former must not occur in a
+// *domain* position — a `call(->, dom, cod)`/`function` node's domain
+// child is the negative position. Only the container differs, which is
+// what lets the judgment re-check *computed* specs that never had a
+// source `data` node. [`occurs_name`] itself stays — `dep_synth_type`'s
+// sigma-dependence check uses the same any-occurrence walk over AST.
+
+/// Any-occurrence walk over AST type-exprs (checker-owned, ADR-0152 §4):
+/// does `node` mention `name` (a `var` leaf) anywhere? Used by the
+/// sigma-dependence check in `dep_synth_type`; positivity itself now
+/// runs on spec values via [`owned_occurs_name`].
 fn occurs_name(ast: &Ast, node: &AstNode, name: &str) -> bool {
     if node.kind == "var" {
         return node.payload.as_str() == Some(name);
@@ -2887,65 +3319,140 @@ fn occurs_name(ast: &Ast, node: &AstNode, name: &str) -> bool {
     false
 }
 
-fn positivity_ok(ast: &Ast, node: &AstNode, name: &str) -> bool {
-    match node.kind.as_str() {
+/// `payload.children` of an owned spec node — the nested owned records
+/// (twin of [`children_of`] for the value representation).
+fn owned_children_of(v: &Value) -> Option<&Vec<Value>> {
+    v.as_object()?.get("payload")?.get("children")?.as_array()
+}
+
+/// `payload.body` of an owned spec node, when present.
+fn owned_body_of(v: &Value) -> Option<&Value> {
+    v.as_object()?.get("payload")?.get("body")
+}
+
+/// Value-level `occurs`: does the owned type-expr `v` mention `name`
+/// (a `var` leaf whose payload is the name) anywhere? `children` are
+/// walked first, then `body` — the same order the retired AST walk
+/// used.
+fn owned_occurs_name(v: &Value, name: &str) -> bool {
+    if !is_owned_node_value(v) {
+        return false;
+    }
+    if v.get("kind").and_then(Value::as_str) == Some("var") {
+        return v.get("payload").and_then(Value::as_str) == Some(name);
+    }
+    if let Some(kids) = owned_children_of(v)
+        && kids.iter().any(|c| owned_occurs_name(c, name))
+    {
+        return true;
+    }
+    if let Some(b) = owned_body_of(v) {
+        return owned_occurs_name(b, name);
+    }
+    false
+}
+
+/// Value-level positivity: the owned type-expr `v` must not mention
+/// `name` in a domain (negative) position — `function` params and
+/// `->`/`~>` call domains are negative; every other child position is
+/// positive.
+fn owned_positivity_ok(v: &Value, name: &str) -> bool {
+    if !is_owned_node_value(v) {
+        // Scalar payload entries and non-node children carry no
+        // occurrence — the same "absent child" reading the AST walk
+        // gives an out-of-bounds index.
+        return true;
+    }
+    let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+    let kids = owned_children_of(v);
+    match kind {
         "function" => {
             // params child is the domain — the former must not occur.
-            let kids = children_of(node).cloned().unwrap_or_default();
-            let dom = kids.first().and_then(Value::as_u64);
-            let cod = kids.get(1).and_then(Value::as_u64);
-            let dom_bad = dom
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .is_some_and(|n| occurs_name(ast, n, name));
+            let dom_bad = kids
+                .and_then(|k| k.first())
+                .is_some_and(|n| owned_occurs_name(n, name));
             if dom_bad {
                 return false;
             }
-            cod.and_then(|i| ast.get(AstRef::new(i as usize)))
-                .is_none_or(|n| positivity_ok(ast, n, name))
+            kids.and_then(|k| k.get(1))
+                .is_none_or(|n| owned_positivity_ok(n, name))
         }
         "call" => {
-            let kids = children_of(node).cloned().unwrap_or_default();
-            let callee_is_arrow = kids
-                .first()
-                .and_then(Value::as_u64)
-                .and_then(|i| ast.get(AstRef::new(i as usize)))
-                .is_some_and(|n| {
-                    n.kind == "var"
-                        && (n.payload.as_str() == Some("->") || n.payload.as_str() == Some("~>"))
-                });
-            if callee_is_arrow && kids.len() >= 3 {
+            let callee_is_arrow = kids.and_then(|k| k.first()).is_some_and(|n| {
+                is_owned_node_value(n)
+                    && n.get("kind").and_then(Value::as_str) == Some("var")
+                    && matches!(
+                        n.get("payload").and_then(Value::as_str),
+                        Some("->") | Some("~>")
+                    )
+            });
+            if callee_is_arrow && kids.is_some_and(|k| k.len() >= 3) {
                 let dom_bad = kids
-                    .get(1)
-                    .and_then(Value::as_u64)
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .is_some_and(|n| occurs_name(ast, n, name));
+                    .and_then(|k| k.get(1))
+                    .is_some_and(|n| owned_occurs_name(n, name));
                 if dom_bad {
                     return false;
                 }
                 return kids
-                    .get(2)
-                    .and_then(Value::as_u64)
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .is_none_or(|n| positivity_ok(ast, n, name));
+                    .and_then(|k| k.get(2))
+                    .is_none_or(|n| owned_positivity_ok(n, name));
             }
             // Other applications: args are positive positions.
-            kids.iter().all(|c| {
-                c.as_u64()
-                    .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .is_none_or(|n| positivity_ok(ast, n, name))
-            })
+            kids.is_none_or(|k| k.iter().all(|c| owned_positivity_ok(c, name)))
         }
-        _ => {
-            if let Some(kids) = children_of(node) {
-                return kids.iter().all(|c| {
-                    c.as_u64()
-                        .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .is_none_or(|n| positivity_ok(ast, n, name))
-                });
+        _ => kids.is_none_or(|k| k.iter().all(|c| owned_positivity_ok(c, name))),
+    }
+}
+
+/// `check_inductive_spec` — strict positivity over an `inductive.spec`
+/// *value* (PL-0003 I2): every ctor arg domain (`ctors[].args[].type`)
+/// must be positive in the spec's `name`. This is the declaration-time
+/// check `synth_data_judgment` runs on the spec it binds, and the
+/// re-checkable judgment computed specs go through — the desugar
+/// native's `check_strict_positivity` keeps its early-error mirror on
+/// source. `Err` names the offending constructor, matching the
+/// `synth_data` positivity diagnostic's shape. `pub(crate)` so the
+/// `check_inductive_spec` judgment op can re-check computed specs.
+pub(crate) fn check_inductive_spec(spec: &Value) -> Result<(), LangError> {
+    if tag_of(spec) != Some("inductive.spec") {
+        return Err(LangError::engine(
+            "check_inductive_spec: expected an inductive.spec value".to_string(),
+        ));
+    }
+    let family = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    for c in spec
+        .get("ctors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let cname = c
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        for a in c
+            .get("args")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let Some(t) = a.get("type") else {
+                continue;
+            };
+            if is_owned_node_value(t) && !owned_positivity_ok(t, &family) {
+                return Err(LangError::engine(format!(
+                    "check_inductive_spec: strict positivity violated: constructor \
+                     '{cname}' mentions '{family}' in a negative position"
+                )));
             }
-            true
         }
     }
+    Ok(())
 }
 
 impl NbeTypecheckEngine {
@@ -2966,9 +3473,32 @@ impl NbeTypecheckEngine {
         crate::stats::dep_synth_type(idx);
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
-            let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
-                LangError::engine(format!("dep_synth_type: node {} out of bounds", idx))
-            })?;
+            // PL-0003 I2: indices minted by `inductive.spec` materialization
+            // live in `ctx.spec_ast` — a clone of the source arena plus the
+            // appended owned type-expr nodes — so they always exceed the
+            // source length. A miss on `ast` is therefore the spec arena's
+            // hit, never a silent wrong-node read; anything still missing
+            // is the same out-of-bounds error as before.
+            let spec_node;
+            let node = match ast.get(AstRef::new(idx)) {
+                Some(n) => n,
+                None => {
+                    spec_node = ctx
+                        .spec_ast
+                        .as_ref()
+                        .and_then(|a| a.get(AstRef::new(idx)))
+                        .cloned();
+                    match spec_node.as_ref() {
+                        Some(n) => n,
+                        None => {
+                            return Err(LangError::engine(format!(
+                                "dep_synth_type: node {} out of bounds",
+                                idx
+                            )));
+                        }
+                    }
+                }
+            };
             match node.kind.as_str() {
                 "paren" => {
                     let kids = children_of(node)
@@ -3008,13 +3538,10 @@ impl NbeTypecheckEngine {
                                     })
                             });
                             if dependent {
-                                let param =
-                                    self.dep_synth_type(lang, ast, bs[0].1, ctx)?;
+                                let param = self.dep_synth_type(lang, ast, bs[0].1, ctx)?;
                                 let rest: Vec<Value> = bs[1..]
                                     .iter()
-                                    .map(|(n, a)| {
-                                        serde_json::json!({"name": n, "annot": a})
-                                    })
+                                    .map(|(n, a)| serde_json::json!({"name": n, "annot": a}))
                                     .collect();
                                 let last_annot = bs.last().map(|(_, a)| *a).unwrap_or(0);
                                 let mut m = Map::new();
@@ -3060,6 +3587,29 @@ impl NbeTypecheckEngine {
                             LangError::engine("dep_synth_type: type-annot missing annot")
                         })?;
                     self.dep_synth_type(lang, ast, annot.index(), ctx)
+                }
+                "mode_ascribe" => {
+                    // `T @ μ` in type position (PL-0004 E1): the `type`
+                    // child synthesizes unchanged — the mode is
+                    // judgement metadata (`Γ ⊢ t : A @ μ` keeps `A`
+                    // and `μ` separate), never part of the type. The
+                    // elaborated mode set is recorded on the node for
+                    // `synth_type_annot`/`synth_assign` to scope the
+                    // ambient mode over the judged subject/value.
+                    let ty_idx = role_child_ref(lang, node, "type")
+                        .or_else(|| child_at(ast, node, 0))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: mode_ascribe missing type child")
+                        })?;
+                    let mode_idx = role_child_ref(lang, node, "mode")
+                        .or_else(|| child_at(ast, node, 1))
+                        .ok_or_else(|| {
+                            LangError::engine("dep_synth_type: mode_ascribe missing mode child")
+                        })?;
+                    let ty = self.dep_synth_type(lang, ast, ty_idx.index(), ctx)?;
+                    let mu = self.elaborate_mode_set(lang, ast, mode_idx.index(), ctx)?;
+                    ctx.node_modes.insert(idx, mu);
+                    Ok(ty)
                 }
                 "value" | "lit" => Ok(node.payload.clone()),
                 "var" => self.dep_synth_var_type(lang, ast, node, ctx),
@@ -3162,7 +3712,7 @@ impl NbeTypecheckEngine {
                     // The params child is a type expression — a `paren`-wrapped
                     // list takes its last child as the domain (the `A -> B`
                     // convention); any other node (`call` former
-                    // applications like `Vec(n, a)`/`IO(sig)`, `var`, …) IS
+                    // applications like `Vec(n, a)`, `var`, …) IS
                     // the domain.
                     let dom_idx = if let Some(p) = ast.get(params_idx) {
                         if p.kind == "paren" {
@@ -3240,8 +3790,17 @@ impl NbeTypecheckEngine {
                 // judgment mints — `ua(e)`'s type-position spelling.
                 "univalence" => {
                     let kids_len = children_of(node).map(|c| c.len()).unwrap_or(0);
-                    let e_ref = Self::cub_child(lang, ast, node, "equiv", 0);
-                    if kids_len < 1 || e_ref.is_none() {
+                    let e_idx = Self::cub_child(lang, ast, node, "equiv", 0)
+                        .map(|r| r.index())
+                        .filter(|_| kids_len >= 1);
+                    if let Some(e_idx) = e_idx {
+                        let v = self.synth_univalence_core(lang, ast, e_idx, node.span, ctx)?;
+                        Ok(if tag_of(&v) == Some("type.unknown") {
+                            self.cub_open_meta(ctx)
+                        } else {
+                            v
+                        })
+                    } else {
                         self.cub_diag(
                             ctx,
                             "error",
@@ -3249,19 +3808,6 @@ impl NbeTypecheckEngine {
                             node.span,
                         );
                         Ok(self.cub_open_meta(ctx))
-                    } else {
-                        let v = self.synth_univalence_core(
-                            lang,
-                            ast,
-                            e_ref.unwrap().index(),
-                            node.span,
-                            ctx,
-                        )?;
-                        Ok(if tag_of(&v) == Some("type.unknown") {
-                            self.cub_open_meta(ctx)
-                        } else {
-                            v
-                        })
                     }
                 }
                 // `fibrant A` in annotation position: the fibrancy
@@ -3439,34 +3985,26 @@ impl NbeTypecheckEngine {
                             "dep_synth_type: graded_arrow missing operands",
                         ));
                     }
-                    let src_idx = kids[0]
-                        .as_u64()
-                        .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: graded_arrow src index")
-                        })?
-                        as usize;
-                    let grade_idx = kids[1]
-                        .as_u64()
-                        .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: graded_arrow grade index")
-                        })?
-                        as usize;
-                    let tgt_idx = kids[2]
-                        .as_u64()
-                        .ok_or_else(|| {
-                            LangError::engine("dep_synth_type: graded_arrow tgt index")
-                        })?
-                        as usize;
+                    let src_idx = kids[0].as_u64().ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow src index")
+                    })? as usize;
+                    let grade_idx = kids[1].as_u64().ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow grade index")
+                    })? as usize;
+                    let tgt_idx = kids[2].as_u64().ok_or_else(|| {
+                        LangError::engine("dep_synth_type: graded_arrow tgt index")
+                    })? as usize;
                     let src = self.dep_synth_type(lang, ast, src_idx, ctx)?;
                     // Well-formedness: the grade expression must
-                    // elaborate; its type is discarded (grades are a
-                    // separate axis — no `type.hom` slot carries it).
+                    // elaborate; the mode descriptor (pl-0002 M2)
+                    // rides the optional 4th `type.hom` index.
                     let _grade = self.dep_synth_type(lang, ast, grade_idx, ctx)?;
                     let tgt = self.dep_synth_type(lang, ast, tgt_idx, ctx)?;
+                    let mode = self.mode_descriptor(lang, ast, grade_idx, ctx)?;
                     let dim_v = Val::Const(TaggedValue::Int(1));
                     let va = domain_lift(&src, ctx);
                     let vb = domain_lift(&tgt, ctx);
-                    Ok(hom_former(dim_v, va, vb, ctx))
+                    Ok(hom_former_mode(dim_v, va, vb, Some(mode), ctx))
                 }
                 "absurd" | "if" | "match" | "object" | "index" => {
                     // Non-type positions in annotations — leave them open.
@@ -3477,9 +4015,6 @@ impl NbeTypecheckEngine {
                     if node.kind.starts_with("binary.") || node.kind.starts_with("unary.") {
                         let t = self.node_to_index_term(lang, ast, node, ctx);
                         Ok(eval_index(&t, ctx))
-                    } else if node.kind == "transport" {
-                        let mut m = Map::new();
-                        Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
                     } else {
                         let mut m = Map::new();
                         Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
@@ -3625,24 +4160,29 @@ impl NbeTypecheckEngine {
             // so both spellings resolve — `Unit` stays canonical for the
             // statement/zero-arg peel, `Null` for explicit null domains.
             "Null" => "type.null",
-            // Bare `IO` = `IO(⊤)` — the arity-0 `Former{type.io}`
-            // (any signature) for backward compat (ADR-0153 §4).
+            // `IO` — the retired typed-effect former (PL-0004 G2;
+            // design/effects-ambient-modes.md v2 §6): effects are
+            // ambient modes (`T @ [Algebra(…)]`), never a codomain
+            // former. The honest bound is a warning + an open type
+            // meta — the annotation accepts anything until the corpus
+            // spelling migrates.
             "IO" => {
-                return Ok(domain_quote(
-                    &Val::Former {
-                        head: checker::type_sym("type.io"),
-                        args: vec![],
-                    },
-                    ctx,
-                ));
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message:
+                        "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`"
+                            .to_string(),
+                    span: None,
+                });
+                return Ok(self.cub_open_meta(ctx));
             }
             "Type" | "Universe" | "Type0" => "type.universe",
             // The cubical interval sort (ADR-0208 P1): `I` is the type of
             // dimension variables and endpoints `i0`/`i1`.
             "I" | "Interval" => "type.interval",
-            // `Sig` — the `IO(sig)` signature-record sort (a row
-            // binder's declared sort in `f<s : Sig> : … IO(s)`): an
-            // op-name → signature record, i.e. the `Obj` nominal.
+            // `Sig` — the signature-record sort (a row binder's
+            // declared sort, e.g. `f<s : Sig> : …`): an op-name →
+            // signature record, i.e. the `Obj` nominal.
             "Sig" => "type.obj",
             "List" | "Family" | "Pi" | "Sigma" | "Forall" => "type.constructor",
             _ => {
@@ -3902,59 +4442,22 @@ impl NbeTypecheckEngine {
                     Ok(self.cub_open_meta(ctx))
                 }
                 Some("IO") => {
-                    // `IO(sig)` — the typed-effect former (ADR-0153 §4):
-                    // canonical `Former{type.io}` data. The sig index is
-                    // an op-signature record — `{op: T, …}` entries
-                    // synthesize their value types; `IO()` is `IO(⊤)`.
-                    // The brace-free `IO<puts, fs>` / `IO<puts: T, fs>`
-                    // spelling — the `dimension` node's argument list,
-                    // unambiguous there: each arg is an expression, a
-                    // bare `var` declares an op with an unstated
-                    // request and `name : T` its payload — is the same
-                    // sig-record sugar, single op included
-                    // (`IO<puts>` ≡ `IO<{ puts }>`,
-                    // `IO<puts: T>` ≡ `IO<{ puts: T }>`). Call-form
-                    // `IO(s)`/`IO(sig)` is untouched — a bare variable
-                    // there is a sig-typed *index*, not an op list —
-                    // and the sugar fires only when EVERY argument is a
-                    // bare name or typed binder; anything else keeps
-                    // the single-sig-argument reading.
-                    let sig = if node.kind == "dimension"
-                        && !arg_indices.is_empty()
-                        && arg_indices.iter().all(|&i| {
-                            ast.get(AstRef::new(i)).is_some_and(|n| {
-                                n.kind == "var" || Self::typed_binder(lang, ast, i).is_some()
-                            })
-                        }) {
-                        let mut m = Map::new();
-                        for &i in &arg_indices {
-                            if let Some((k, ty_idx)) = Self::typed_binder(lang, ast, i) {
-                                m.insert(k, self.dep_synth_type(lang, ast, ty_idx, ctx)?);
-                            } else if let Some(n) = ast.get(AstRef::new(i))
-                                && let Some(k) = node_name(n)
-                            {
-                                let mut u = Map::new();
-                                m.insert(
-                                    k,
-                                    make_tag(ctx, "type.unknown", std::mem::take(&mut u)),
-                                );
-                            }
-                        }
-                        Value::Object(m)
-                    } else {
-                        match arg_indices.first() {
-                            Some(&i) => self.io_sig(lang, ast, i, ctx)?,
-                            None => Value::Null,
-                        }
-                    };
-                    let vs = domain_lift(&sig, ctx);
-                    Ok(domain_quote(
-                        &Val::Former {
-                            head: checker::type_sym("type.io"),
-                            args: if sig == Value::Null { vec![] } else { vec![vs] },
-                        },
-                        ctx,
-                    ))
+                    // `IO(…)`/`IO<…>` — the retired typed-effect former
+                    // (PL-0004 G2; design/effects-ambient-modes.md v2
+                    // §6): effects are ambient modes (`T @ [Algebra(…)]`),
+                    // never a codomain former. The honest bound is a
+                    // warning + an open type meta — the annotation
+                    // accepts anything until the corpus spelling
+                    // migrates (the arguments are not synthesized: the
+                    // whole form is retired).
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message:
+                            "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`"
+                                .to_string(),
+                        span: node.span,
+                    });
+                    Ok(self.cub_open_meta(ctx))
                 }
                 Some(name) => {
                     // A declared family's application: `Vec(i⃗)` →
@@ -4243,10 +4746,16 @@ impl NbeTypecheckEngine {
         })
     }
 
-    /// The sig argument of `IO(sig)` — an `object` literal becomes a
-    /// record of op-name → synthesized value type; anything else is an
-    /// index term / type expression.
-    fn io_sig(
+    /// A record payload (`{op: A ~> B, …}`) elaborated to an
+    /// op-name → synthesized-value-type map — the `object` literal's
+    /// entries, `block`-position `type-annot` children (object-literal
+    /// blocks, ADR-0079), and bare-name children (`{ puts }` declares
+    /// the op with an unstated `type.unknown` request) all read
+    /// entry-wise; anything else falls through to index/type
+    /// synthesis. Used for mode payloads (`@ [Algebra({…})]`) — the
+    /// `IO(sig)` sig-record reading it descends from is retired
+    /// (PL-0004 G2).
+    fn record_type_map(
         &self,
         lang: &Language,
         ast: &Ast,
@@ -4255,7 +4764,7 @@ impl NbeTypecheckEngine {
     ) -> Result<Value, LangError> {
         let node = ast
             .get(AstRef::new(idx))
-            .ok_or_else(|| LangError::engine("io: sig node out of bounds".to_string()))?;
+            .ok_or_else(|| LangError::engine("record payload node out of bounds".to_string()))?;
         if node.kind == "object" {
             let mut m = Map::new();
             if let Some(entries) = node.payload.get("entries").and_then(Value::as_array) {
@@ -4282,8 +4791,8 @@ impl NbeTypecheckEngine {
                     let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
                         continue;
                     };
-                    // `IO<{ puts }>` — a bare-name child declares the op
-                    // with an unstated request (`type.unknown`).
+                    // A bare-name child declares the op with an
+                    // unstated request (`type.unknown`).
                     if en.kind == "var" {
                         if let Some(k) = node_name(en) {
                             let mut u = Map::new();
@@ -4392,11 +4901,7 @@ impl NbeTypecheckEngine {
     /// for anything else (untyped `var`, computed subject, non-annot).
     /// Shared by the dependent-pair `paren` arm and the typed-param
     /// `function` arm of [`Self::dep_synth_type`].
-    fn typed_binder(
-        lang: &Language,
-        ast: &Ast,
-        idx: usize,
-    ) -> Option<(String, usize)> {
+    fn typed_binder(lang: &Language, ast: &Ast, idx: usize) -> Option<(String, usize)> {
         let n = ast.get(AstRef::new(idx))?;
         if n.kind != "type-annot" && role_child_ref(lang, n, "annot").is_none() {
             return None;
@@ -4448,12 +4953,9 @@ impl NbeTypecheckEngine {
             .and_then(Value::as_str)
             .unwrap_or("x")
             .to_string();
-        let hannot = head
-            .get("annot")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                LangError::engine("dep_closure_chain: rest entry missing annot idx".to_string())
-            })? as usize;
+        let hannot = head.get("annot").and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine("dep_closure_chain: rest entry missing annot idx".to_string())
+        })? as usize;
         let param = self.dep_synth_type(lang, ast, hannot, ctx)?;
         let chain = bc.get("chain").and_then(Value::as_str).unwrap_or("sigma");
         if chain == "pi" {
@@ -4579,7 +5081,7 @@ impl NbeTypecheckEngine {
     /// algebra [`eval_index`] and [`solve_index`] compute over.
     fn node_to_index_term(
         &self,
-        lang: &Language,
+        _lang: &Language,
         ast: &Ast,
         node: &AstNode,
         ctx: &mut TypecheckContext,
@@ -4593,7 +5095,7 @@ impl NbeTypecheckEngine {
                         .first()
                         .and_then(Value::as_u64)
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                        .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                         .unwrap_or(Value::Null);
                     return un_term(&node.kind, o);
                 }
@@ -4601,13 +5103,13 @@ impl NbeTypecheckEngine {
                     .first()
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null);
                 let r = kids
                     .get(1)
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null);
                 return bin_term(&node.kind, l, r);
             }
@@ -4624,7 +5126,7 @@ impl NbeTypecheckEngine {
                 ),
                 "paren" => child_at(ast, node, 0)
                     .and_then(|i| ast.get(i))
-                    .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                    .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null),
                 "value" | "lit" => node.payload.clone(),
                 // `f(i⃗)`/`f<i⃗>` as an index term — an opaque `App` on the
@@ -4643,7 +5145,7 @@ impl NbeTypecheckEngine {
                         .skip(1)
                         .filter_map(Value::as_u64)
                         .filter_map(|i| ast.get(AstRef::new(i as usize)))
-                        .map(|n| self.node_to_index_term(lang, ast, n, ctx))
+                        .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                         .collect();
                     app_term(var_term(&callee), args)
                 }
@@ -4653,7 +5155,7 @@ impl NbeTypecheckEngine {
     }
 
     // -----------------------------------------------------------------------
-    // `synth_data` / `instantiate_ctor`
+    // `synth_data` / `instantiate_ctor_full`
     // -----------------------------------------------------------------------
 
     /// The `synth_data` judgment: bind `F : type.family{name, base}` (one
@@ -4705,6 +5207,21 @@ impl NbeTypecheckEngine {
                     ctx.ctor_family.insert(c.clone(), name.clone());
                 }
                 ctx.family_ctors.insert(name.clone(), names);
+                // PL-0003 I1 — `inductive.spec` alongside the family
+                // bindings. Hand-built payloads carry no param/ctor AST
+                // detail, so the spec records the name with empty
+                // telescopes (what the model produces for a childless
+                // `data` node).
+                let mut fields = Map::new();
+                fields.insert("name".to_string(), Value::String(name.clone()));
+                fields.insert("params".to_string(), Value::Array(vec![]));
+                fields.insert("ctors".to_string(), Value::Array(vec![]));
+                let spec = make_tag(ctx, "inductive.spec", fields);
+                // PL-0003 I2: same `F.spec` Γ/results bindings as the
+                // AST path — the spec is empty here but the projection
+                // surface is identical.
+                ctx.extend(format!("{name}.spec"), spec.clone());
+                ctx.bind_result(format!("{name}.spec"), spec);
             }
             let mut m = Map::new();
             return Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)));
@@ -4716,20 +5233,14 @@ impl NbeTypecheckEngine {
             ));
         };
         // Strict positivity — the checker owns it (it sees the sigs).
-        for c in &ctors {
-            for (_, ty_idx) in &c.args {
-                if let Some(ti) = ty_idx
-                    && let Some(n) = ast.get(AstRef::new(*ti))
-                    && !positivity_ok(ast, n, &name)
-                {
-                    return Err(LangError::engine(format!(
-                        "synth_data: strict positivity violated: constructor '{}' \
-                                 mentions '{name}' in a negative position",
-                        c.name
-                    )));
-                }
-            }
-        }
+        // PL-0003 I2: the check is the `check_inductive_spec` judgment
+        // over the spec *value* — built up front (pure data: owned
+        // type-expr records, no bindings yet) so a violation still
+        // fails before any Γ/`results` binding, the same fail-fast
+        // point the AST walk had. The same judgment re-checks computed
+        // specs at use sites.
+        let spec = inductive_spec_value(ctx, ast, &name, &params, &ctors);
+        check_inductive_spec(&spec)?;
         // `base` = the parameter sorts (`type.array` of them).
         let mut elems = Vec::with_capacity(params.len());
         for p in &params {
@@ -4748,7 +5259,7 @@ impl NbeTypecheckEngine {
             ctx.extend(name.clone(), make_tag(ctx, "type.family", m));
         }
         // Ctor signatures — the `type.ctor_sig` spec re-elaborated per
-        // use by `instantiate_ctor`.
+        // use by `instantiate_ctor_full`.
         for c in &ctors {
             if c.name.is_empty() {
                 continue;
@@ -4768,6 +5279,20 @@ impl NbeTypecheckEngine {
                 "bare": c.bare,
             });
             ctx.extend(c.name.clone(), sig);
+        }
+        // PL-0003 I1/I2 — `inductive.spec`: the declaration's spec as an
+        // owned data value (type-exprs are owned node records, not AST
+        // indices), bound in `results` under `"<name>.spec"` alongside
+        // the `type.family`/`type.ctor_sig` bindings AND in Γ under the
+        // same key so `Nat.spec` / `field_access(Nat, "spec")` resolve
+        // to the spec value itself (the `F.rec` scope-binding
+        // convention — `record_field_type`'s `type.family` arm reads Γ).
+        // `results` (not Γ) is the value channel for spec *consumers*
+        // (`spec_ctor_sig`, `check_inductive_spec`); the Γ entry is the
+        // user-facing projection.
+        if !name.is_empty() {
+            ctx.extend(format!("{name}.spec"), spec.clone());
+            ctx.bind_result(format!("{name}.spec"), spec);
         }
         // WS-C coverage census: the family's ctor list + the reverse
         // ctor → family table (index-level ctor disjointness reads it),
@@ -4987,7 +5512,7 @@ impl NbeTypecheckEngine {
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
     }
 
-    /// Instantiate a `type.ctor_sig` spec into a fresh `type.function`
+    /// Instantiate a `type.ctor_sig` spec into a `type.function`
     /// chain ending in `type.family_app` — one index metavariable per
     /// family parameter (bound in Γ *and* `results` under the internal
     /// `__fam_<name>` spelling, so `xs : Vec(n, a)` elaborates
@@ -4995,53 +5520,6 @@ impl NbeTypecheckEngine {
     /// same meta while a user's rigid `var{n}` stays untouched).
     /// Constructor argument names self-bind to `var{name}` terms so
     /// later domains may mention them.
-    pub(crate) fn instantiate_ctor(&self, spec: &Value, ctx: &mut TypecheckContext) -> Value {
-        let mark = ctx.mark();
-        let old_results = ctx.results.clone();
-        let params: Vec<Value> = spec
-            .get("params")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut metas = Vec::with_capacity(params.len());
-        for p in &params {
-            let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
-            let id = ctx.fresh_meta();
-            if p.get("nat").and_then(Value::as_bool).unwrap_or(false) {
-                ctx.nonneg_metas.insert(id);
-            }
-            let mv = meta_value(id);
-            if !pname.is_empty() {
-                // `__fam_<name>` — family param names are internal to
-                // the telescope, never a user's same-named rigid.
-                let bname = fam_binding_name(pname);
-                ctx.extend(bname.clone(), mv.clone());
-                ctx.bind_result(bname, mv.clone());
-            }
-            metas.push(mv);
-        }
-        let args: Vec<Value> = spec
-            .get("args")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for a in &args {
-            let aname = a.get("name").and_then(Value::as_str).unwrap_or("");
-            if !aname.is_empty() {
-                ctx.extend(aname.to_string(), var_term(aname));
-                ctx.bind_result(aname.to_string(), var_term(aname));
-            }
-        }
-        // This lang/ast-less path only mints the parameter metas and
-        // returns the spec — callers that have `lang`/`ast` use
-        // `instantiate_ctor_full` for the real elaboration.
-        let _ = (args, metas.clone());
-        ctx.restore(mark);
-        ctx.results = old_results;
-        spec.clone()
-    }
-
-    /// Full instantiation with AST access — the real `instantiate_ctor_`.
     pub(crate) fn instantiate_ctor_full(
         &self,
         lang: &Language,
@@ -5302,6 +5780,7 @@ impl NbeTypecheckEngine {
     /// ctor (the index term `eval_index` then projects, e.g.
     /// `App{Succ, m} ↦ m + 1`). Each child carries the fresh vars it
     /// introduced with their own index sorts for deeper splits.
+    #[allow(clippy::type_complexity)]
     fn split_branches(
         &self,
         lang: &Language,
@@ -5381,7 +5860,7 @@ impl NbeTypecheckEngine {
         &self,
         lang: &Language,
         ast: &Ast,
-        node: &AstNode,
+        _node: &AstNode,
         family: &str,
         s_args: &[Value],
         ctors: &[String],
@@ -5451,7 +5930,7 @@ impl NbeTypecheckEngine {
             self.cover_split_tree(
                 lang,
                 ast,
-                node,
+                _node,
                 family,
                 s_args,
                 ctors,
@@ -5738,12 +6217,49 @@ impl NbeTypecheckEngine {
             .iter()
             .map(|a| freeze_metas(a, inst_no, &mut arg_pos))
             .collect();
+        self.register_instance(
+            lang,
+            ast,
+            node,
+            ctx,
+            &head,
+            args,
+            &constraint,
+            dict_idx,
+            &[],
+        )
+    }
+
+    /// Shared tail of `synth_instance` and `synth_new_decl`: the
+    /// coherence scan, dictionary well-formedness synth, and
+    /// `(head, args) ↦ dict-name` registration in the context's
+    /// instance table. `args` is the (already rigid/frozen) index
+    /// shape; `constraint` is the `type.family_app{head, args}` the
+    /// dict binds at in Γ — its `type` link IS the declared former
+    /// application. `dict_skip` names `object`-dict entry keys whose
+    /// values are declaration metadata, not terms (PL-0004 G0:
+    /// `new Algebra`'s `op`/`requires` — `op` is a *type* signature
+    /// and `requires` a head-name list; term-synthesizing them
+    /// rejects type-level spellings like `Str ~> Unit`).
+    #[allow(clippy::too_many_arguments)]
+    fn register_instance(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+        head: &str,
+        args: Vec<Value>,
+        constraint: &Value,
+        dict_idx: usize,
+        dict_skip: &[&str],
+    ) -> Result<Value, LangError> {
         // Coherence — no two instances may declare unifiable index
         // shapes for one head (decision: error at declaration time,
         // not ordered first-match at search). The candidate list is
         // cloned out — `unify_index`/`store_restore` borrow `ctx`
         // mutably inside the scan.
-        if let Some(existing) = ctx.instances.get(&head).cloned() {
+        if let Some(existing) = ctx.instances.get(head).cloned() {
             for cand in &existing {
                 if cand.args.len() != args.len() {
                     continue;
@@ -5762,7 +6278,7 @@ impl NbeTypecheckEngine {
                     return Err(LangError::engine_node(
                         format!(
                             "synth_instance: overlapping instance for `{}` — an instance with a unifiable index shape is already declared",
-                            display_type(&constraint, ctx)
+                            display_type(constraint, ctx)
                         ),
                         node,
                     ));
@@ -5772,18 +6288,584 @@ impl NbeTypecheckEngine {
         // The dictionary is ordinary data — it must synth (a record,
         // a ctor application, an arrow). Its *declared* type is the
         // constraint: the instance assertion is that this value's
-        // `type` link is the former application.
-        self.synth_node(lang, ast, AstRef::new(dict_idx), ctx)?;
-        let inst_name = format!("$instance:{head}:{inst_no}");
+        // `type` link is the former application. `object` dicts synth
+        // entry-wise so declaration-metadata keys (`dict_skip`) stay
+        // out of term position; anything else synths whole.
+        self.synth_instance_dict(lang, ast, dict_idx, dict_skip, ctx)?;
+        let inst_name = format!("$instance:{head}:{}", ctx.instance_count);
         ctx.instance_count += 1;
         ctx.extend(inst_name.clone(), constraint.clone());
         ctx.bind_result(inst_name.clone(), var_term(&inst_name));
-        ctx.instances.entry(head).or_default().push(InstanceEntry {
-            name: inst_name,
-            args,
-        });
+        ctx.instances
+            .entry(head.to_string())
+            .or_default()
+            .push(InstanceEntry {
+                name: inst_name,
+                args,
+            });
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
+    }
+
+    /// Dictionary well-formedness synth for [`Self::register_instance`]:
+    /// `object` dicts iterate their `entry` children and synth each
+    /// value — skipping keys in `dict_skip` (declaration metadata that
+    /// is not term data; PL-0004 G0's `op`/`requires` on `new
+    /// Algebra`). Non-`object` dicts (ctor applications, arrows)
+    /// synth whole, unchanged.
+    fn synth_instance_dict(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        dict_idx: usize,
+        dict_skip: &[&str],
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let Some(node) = ast.get(AstRef::new(dict_idx)) else {
+            return Ok(());
+        };
+        if node.kind != "object" || dict_skip.is_empty() {
+            self.synth_node(lang, ast, AstRef::new(dict_idx), ctx)?;
+            return Ok(());
+        }
+        for k in children_of(node).cloned().unwrap_or_default() {
+            let Some(ci) = k.as_u64() else { continue };
+            let Some(en) = ast.get(AstRef::new(ci as usize)) else {
+                continue;
+            };
+            if en.kind != "entry" {
+                // Non-entry children (spread/rest) synth whole.
+                self.synth_node(lang, ast, AstRef::new(ci as usize), ctx)?;
+                continue;
+            }
+            let ek = children_of(en)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)));
+            let key = ek.and_then(|n| {
+                node_name(n).or_else(|| {
+                    n.payload
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            });
+            let v_idx = children_of(en)
+                .and_then(|c| c.get(1))
+                .and_then(Value::as_u64)
+                .map(|i| i as usize);
+            if let (Some(key), Some(vi)) = (key, v_idx) {
+                if dict_skip.contains(&key.as_str()) {
+                    continue;
+                }
+                self.synth_node(lang, ast, AstRef::new(vi), ctx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `X := new T(args) { members }` — the `new` declaration form
+    /// (graded-arrows.md §3 "Algebra declaration syntax", MTT
+    /// migration): one declaration, two jobs.
+    ///
+    /// 1. `X : type.family{name: X, base: [carrier]}` — `X(p)` in term
+    ///    position mints `type.family_app{X, [p]}` through the ordinary
+    ///    family-application reading (`Vec(2, Bool)` precedent): the
+    ///    self-describing call-head mode value `mode_compose` resolves
+    ///    an algebra for. `base` carries a single index whose sort is
+    ///    the carrier type — the first index argument of `T(args)`
+    ///    when it elaborates to a `type.family_app` (`Algebra(Nat)` →
+    ///    `Nat`), else a fresh meta (permissive fallback).
+    /// 2. `(X, [_]) ↦ dict` in the context's instance table — the same
+    ///    entry `instance X(_) := dict` registers (one rigid index
+    ///    var matching any `X`-headed mode payload), so dictionary
+    ///    search finds the algebra for `Cost`-headed modes. Coherence,
+    ///    dict well-formedness, and the Γ binding are
+    ///    [`Self::register_instance`]'s, shared with `synth_instance`.
+    ///
+    /// `T(args)` is elaborated as a type for well-formedness — it
+    /// names the algebra former. Checking the dict *against* `T(args)`
+    /// is deferred until M2's `Algebra` definition lands (documented
+    /// assumption); the dict currently gets the same
+    /// well-formedness-only treatment an `instance` dict does.
+    ///
+    /// `name` is the `assign` target — the family/instance head,
+    /// which a `new`-node-local judgment cannot see.
+    pub(crate) fn synth_new_decl_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        name: &str,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let kids = children_of(node).ok_or_else(|| {
+            LangError::engine_node(
+                "synth_new: new needs [type, dict] children".to_string(),
+                node,
+            )
+        })?;
+        let type_idx = kids.first().and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine_node("synth_new: missing type child".to_string(), node)
+        })? as usize;
+        let dict_idx = kids.get(1).and_then(Value::as_u64).ok_or_else(|| {
+            LangError::engine_node("synth_new: missing dict child".to_string(), node)
+        })? as usize;
+        // Schema dispatch (design/instance-unified-registry.md): the
+        // `type` child's head names the registry kind — `Constraint(…)`
+        // declares a constraint head (an evidence dictionary *shape*),
+        // every other head keeps the mode-family path below.
+        if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
+            && schema == "Constraint"
+        {
+            return self.synth_new_constraint_decl(lang, ast, node, name, type_idx, dict_idx, ctx);
+        }
+        // `Inductive` is not a `new` schema the checker expands here
+        // (PL-0003 I2): the parse layer lowers a well-formed
+        // `X := new Inductive { C : F(i⃗), … }` family record to the
+        // `data` node `synth_data` consumes, so a `new` node that
+        // still names `Inductive` is malformed — a field codomain that
+        // does not name the declared family, or schema arguments the
+        // inductive form does not take. Report honestly instead of
+        // minting a mode family named `X`.
+        if let Some((schema, _)) = new_decl_schema(lang, ast, type_idx)
+            && schema == "Inductive"
+        {
+            return Err(LangError::engine_node(
+                "synth_new: `new Inductive` expects a constructor record \
+                 `{ C : F(i⃗), … }` whose codomains name the declared family \
+                 `F` — well-formed `X := new Inductive { … }` declarations \
+                 lower to `data` at parse time"
+                    .to_string(),
+                node,
+            ));
+        }
+        // PL-0004 E1: `X := new Algebra(…)` heads resolve in `@ [X(p), …]`
+        // mode ascriptions — name-level resolution only; the algebra's
+        // `compose`/`unit`/`order` live in the instance table the `Val`
+        // domain cannot evaluate, so composing through the head still
+        // takes the honest bound until the bridge lands (E2+).
+        // G0 (effects-ambient-modes.md §2/§4): the dict's `op`/`requires`
+        // fields are effect-declaration data — `op` elaborates as the
+        // canonical `A ~> B` signature `perform` reads, `requires`
+        // declares algebra implication the mode-set elaboration closes
+        // under. Effect algebras declare no `compose`/`order`: their
+        // composition is set union, their subsumption set inclusion.
+        let is_algebra =
+            new_decl_schema(lang, ast, type_idx).is_some_and(|(schema, _)| schema == "Algebra");
+        if is_algebra {
+            ctx.vcheck.algebra_heads.insert(name.to_string());
+            let (op, requires, compositional) =
+                self.algebra_effect_fields(lang, ast, dict_idx, ctx)?;
+            ctx.vcheck.algebra_effects.insert(
+                name.to_string(),
+                checker::AlgebraEffectDecl {
+                    op,
+                    requires,
+                    compositional,
+                },
+            );
+        }
+        // `T(args)` — the algebra former application — must elaborate
+        // as a type (well-formedness; names the algebra `Algebra` is
+        // M2's to define). Its first index argument is the carrier
+        // sort for the mode family's payload index.
+        let alg = self.dep_synth_type(lang, ast, type_idx, ctx)?;
+        let carrier = match tag_of(&alg) {
+            Some("type.family_app") => alg
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first().cloned())
+                .unwrap_or_else(|| meta_value(ctx.fresh_meta())),
+            _ => meta_value(ctx.fresh_meta()),
+        };
+        // `X : type.family{name: X, base: [carrier]}` — bind before the
+        // instance registration so the constraint head resolves as a
+        // declared former (the `synth_instance` head check's shape).
+        let mut elems = Map::new();
+        elems.insert("elements".to_string(), Value::Array(vec![carrier]));
+        let base = make_tag(ctx, "type.array", elems);
+        let mut fm = Map::new();
+        fm.insert("name".to_string(), Value::String(name.to_string()));
+        fm.insert("base".to_string(), base);
+        let family = make_tag(ctx, "type.family", fm);
+        ctx.extend(name.to_string(), family);
+        // `(X, [_]) ↦ dict` — the rigid index var is the registered
+        // shape's hole: any `X(p)` mode unifies with it at lookup.
+        let rigid = var_term(&format!("__{name}_payload"));
+        let mut cm = Map::new();
+        cm.insert("name".to_string(), Value::String(name.to_string()));
+        cm.insert("args".to_string(), Value::Array(vec![rigid.clone()]));
+        let constraint = make_tag(ctx, "type.family_app", cm);
+        self.register_instance(
+            lang,
+            ast,
+            node,
+            ctx,
+            name,
+            vec![rigid],
+            &constraint,
+            dict_idx,
+            // `op`/`requires` are declaration metadata on `new
+            // Algebra` dicts — type signatures and head-name lists,
+            // not terms (PL-0004 G0); `algebra_effect_fields` already
+            // elaborated them.
+            if is_algebra {
+                &["op", "requires"][..]
+            } else {
+                &[][..]
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The `op`/`requires` fields of a `new Algebra` dict child
+    /// (PL-0004 G0; design/effects-ambient-modes.md §2/§4). The dict
+    /// record's other fields (`compose`/`unit`/`order`) are
+    /// instance-table data the `Val` domain cannot evaluate — only
+    /// the two effect fields elaborate here:
+    ///
+    /// - `op : A ~> B` synthesizes as a *type* (`dep_synth_type`) —
+    ///   `perform` finds the `type.function{param, body}` shape it
+    ///   consumes as the op's domain/codomain. An `op` that does not
+    ///   elaborate warns and leaves `None` (the head keeps the
+    ///   honest-bound behavior).
+    /// - `requires : [Head, …]` reads algebra head *names* off the
+    ///   array literal — heads are declared names, not values, so no
+    ///   type synthesis runs on them. Non-`var` elements warn and
+    ///   drop (honest bound).
+    ///
+    /// The third return component reports whether the dict declared
+    /// `compose`/`order` — a compositional (graded-style) algebra
+    /// whose mode elements compose payloads rather than set-union.
+    ///
+    /// Dict shapes mirror `record_type_map`: `object` nodes carry `entry`
+    /// children (`key`/`value` roles); `block`-position literals
+    /// parse as `type-annot` children (subject → field name, annot →
+    /// value). Any other dict shape yields no fields.
+    fn algebra_effect_fields(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        dict_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(Option<Value>, Vec<String>, bool), LangError> {
+        let Some(node) = ast.get(AstRef::new(dict_idx)) else {
+            return Ok((None, Vec::new(), false));
+        };
+        // `(field name, value node index)` pairs.
+        let mut fields: Vec<(String, usize)> = Vec::new();
+        if node.kind == "object" {
+            for k in children_of(node).cloned().unwrap_or_default() {
+                let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
+                    continue;
+                };
+                if en.kind != "entry" {
+                    continue;
+                }
+                let ek = children_of(en)
+                    .and_then(|c| c.first())
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)));
+                let key = ek.and_then(|n| {
+                    node_name(n).or_else(|| {
+                        n.payload
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                });
+                let v_idx = children_of(en)
+                    .and_then(|c| c.get(1))
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize);
+                if let (Some(key), Some(vi)) = (key, v_idx) {
+                    fields.push((key, vi));
+                }
+            }
+        } else if node.kind == "block" {
+            for k in children_of(node).cloned().unwrap_or_default() {
+                let Some(tn) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
+                    continue;
+                };
+                if tn.kind != "type-annot" {
+                    continue;
+                }
+                let tk = children_of(tn)
+                    .and_then(|c| c.first())
+                    .and_then(Value::as_u64)
+                    .and_then(|i| ast.get(AstRef::new(i as usize)))
+                    .and_then(|n| {
+                        node_name(n).or_else(|| {
+                            n.payload
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                    });
+                let v_idx = children_of(tn)
+                    .and_then(|c| c.get(1))
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize);
+                if let (Some(key), Some(vi)) = (tk, v_idx) {
+                    fields.push((key, vi));
+                }
+            }
+        }
+        // A declared `compose`/`order` makes the algebra compositional
+        // (graded-style payload composition); without them it is an
+        // effect algebra — set union / set inclusion (design §2).
+        let compositional = fields.iter().any(|(k, _)| k == "compose" || k == "order");
+        let mut op = None;
+        let mut requires = Vec::new();
+        for (key, vi) in fields {
+            match key.as_str() {
+                "op" => match self.dep_synth_type(lang, ast, vi, ctx) {
+                    Ok(t) => op = Some(t),
+                    Err(e) => ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "new Algebra: `op` signature does not elaborate ({e}) — the head keeps transition behavior (honest bound)"
+                        ),
+                        span: ast.get(AstRef::new(vi)).and_then(|n| n.span),
+                    }),
+                },
+                "requires" => {
+                    let mut vn = ast.get(AstRef::new(vi));
+                    while let Some(n) = vn {
+                        if n.kind != "paren" {
+                            break;
+                        }
+                        vn = children_of(n)
+                            .and_then(|c| c.first())
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)));
+                    }
+                    match vn {
+                        Some(n) if n.kind == "array" => {
+                            for k in children_of(n).cloned().unwrap_or_default() {
+                                let Some(mut el) =
+                                    k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize)))
+                                else {
+                                    continue;
+                                };
+                                while el.kind == "paren" {
+                                    match children_of(el)
+                                        .and_then(|c| c.first())
+                                        .and_then(Value::as_u64)
+                                        .and_then(|i| ast.get(AstRef::new(i as usize)))
+                                    {
+                                        Some(inner) => el = inner,
+                                        None => break,
+                                    }
+                                }
+                                match node_name(el) {
+                                    Some(h) if el.kind == "var" => requires.push(h),
+                                    _ => ctx.diagnostics.push(TypecheckDiagnostic {
+                                        severity: "warning".to_string(),
+                                        message:
+                                            "new Algebra: `requires` entries must name algebra heads — entry dropped (honest bound)"
+                                                .to_string(),
+                                        span: el.span,
+                                    }),
+                                }
+                            }
+                        }
+                        _ => ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message:
+                                "new Algebra: `requires` must be an array of algebra heads — field ignored (honest bound)"
+                                    .to_string(),
+                            span: vn.and_then(|n| n.span),
+                        }),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((op, requires, compositional))
+    }
+
+    /// `X := new Constraint(S…) { shape }` — the `Constraint` schema of
+    /// the unified `new` registry (design/instance-unified-registry.md
+    /// §2): one declaration machinery for `Inductive`/`Algebra`/
+    /// `Constraint`, with the schema head choosing what registers.
+    ///
+    /// 1. `X : type.family{name: X, base: [S₁,…,Sₙ]}` — the schema
+    ///    arguments are the constraint's *index sorts*: `new
+    ///    Constraint(Type)` declares the same head the record-spelling
+    ///    `X<a : Type>` inductive-family form produces, so `X(T)` in
+    ///    type position mints `type.family_app{X, [T]}` through the
+    ///    ordinary family-application reading.
+    /// 2. The dict child is the *evidence dictionary shape* — a
+    ///    signature record (`{ evidence : a ~> a ~> Bool }`), not a
+    ///    dictionary value. It is checked at instance sites (deferred —
+    ///    `instance X(T) := dict` currently gets the same
+    ///    well-formedness-only treatment every dict does); here it
+    ///    synthesizes for well-formedness under implicitly-generalized
+    ///    index vars and is recorded as `"<name>.shape"` in `results`
+    ///    for that future check.
+    ///
+    /// No `(head, args) ↦ dict` entry registers — the shape is not a
+    /// dictionary, and instances come from `instance` declarations
+    /// alone. `instance X(T) := dict` and `<…, ev : X(a)>` evidence
+    /// binders then flow through the unchanged `synth_instance` /
+    /// `resolve_instance` machinery: the head is a declared
+    /// `type.family`, coherence is declaration-time no-overlap, and
+    /// dictionary search discharges implicit former-app binders.
+    ///
+    /// `name` is the `assign` target — the constraint head, which a
+    /// `new`-node-local judgment cannot see.
+    #[allow(clippy::too_many_arguments)]
+    fn synth_new_constraint_decl(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        name: &str,
+        type_idx: usize,
+        dict_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        let Some((_schema, sort_idx)) = new_decl_schema(lang, ast, type_idx) else {
+            return Err(LangError::engine_node(
+                "synth_new: `new Constraint` needs a `Constraint(S…)` type child".to_string(),
+                node,
+            ));
+        };
+        // The schema arguments are index *sorts* — one `base` element
+        // each, elaborated exactly like a `data` family's parameter
+        // sorts (`Eq<a : Type>`'s `Type`).
+        let mut elems = Vec::with_capacity(sort_idx.len());
+        for i in sort_idx {
+            elems.push(self.dep_synth_type(lang, ast, i, ctx)?);
+        }
+        let mut base_m = Map::new();
+        base_m.insert("elements".to_string(), Value::Array(elems));
+        let base = make_tag(ctx, "type.array", base_m);
+        let mut fm = Map::new();
+        fm.insert("name".to_string(), Value::String(name.to_string()));
+        fm.insert("base".to_string(), base);
+        ctx.extend(name.to_string(), make_tag(ctx, "type.family", fm));
+        // The dictionary shape — a signature record. Unbound index
+        // vars implicitly generalize rigidly (the `synth_instance`
+        // convention) so schematic fields like `a ~> a ~> Bool`
+        // elaborate; the synthesized record is kept under
+        // `"<name>.shape"` for the deferred instance-site check.
+        let mut gen_vars = Vec::new();
+        collect_unbound_index_vars(ast, AstRef::new(dict_idx), ctx, &mut gen_vars);
+        // The schematic vars in first-appearance order — the positional
+        // key `record_field_type` substitutes against a `family_app`'s
+        // index args when projecting `ev.<field>` off the shape.
+        ctx.bind_result(
+            format!("{name}.shape.vars"),
+            Value::Array(gen_vars.iter().map(|n| Value::String(n.clone())).collect()),
+        );
+        let old_results = ctx.results.clone();
+        for n in &gen_vars {
+            ctx.bind_result(n.clone(), var_term(n));
+        }
+        let shape = self.synth_constraint_shape(lang, ast, dict_idx, ctx);
+        ctx.results = old_results;
+        match shape {
+            Ok(s) => {
+                ctx.bind_result(format!("{name}.shape"), s);
+            }
+            Err(e) => {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "synth_new: constraint `{name}` dictionary shape failed to synthesize: {e}"
+                    ),
+                    span: node.span,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Elaborate a `new Constraint` dict child `{ field : T, … }` into
+    /// the `type.record` dictionary *shape*. Each field's type
+    /// expression goes through [`Self::dep_synth_type`] — the same
+    /// elaborator annotations use — so schematic vars (`a` in
+    /// `a ~> a ~> Bool`) resolve to the rigid `var{a}` leaves the
+    /// `"<name>.shape.vars"` positional substitution expects, and
+    /// builtin/family names resolve exactly as they do at `instance`
+    /// and binder sites. A non-`object` dict child falls back to
+    /// `synth_node` (well-formedness only — the shape then has no
+    /// `fields` to project).
+    fn synth_constraint_shape(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        dict_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let Some(node) = ast.get(AstRef::new(dict_idx)) else {
+            return Err(LangError::engine(format!(
+                "synth_new: constraint dict node {dict_idx} out of bounds"
+            )));
+        };
+        if node.kind != "object" {
+            return self.synth_node(lang, ast, AstRef::new(dict_idx), ctx);
+        }
+        let mut fields = Map::new();
+        for k in children_of(node).cloned().unwrap_or_default() {
+            let Some(en) = k.as_u64().and_then(|i| ast.get(AstRef::new(i as usize))) else {
+                continue;
+            };
+            if en.kind != "entry" {
+                continue;
+            }
+            let ek = children_of(en)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)));
+            let key = ek.and_then(node_name);
+            let v_idx = children_of(en)
+                .and_then(|c| c.get(1))
+                .and_then(Value::as_u64)
+                .map(|i| i as usize);
+            if let (Some(key), Some(vi)) = (key, v_idx) {
+                fields.insert(key, self.dep_synth_type(lang, ast, vi, ctx)?);
+            }
+        }
+        let mut m = Map::new();
+        m.insert("fields".to_string(), Value::Object(fields));
+        Ok(make_tag(ctx, "type.record", m))
+    }
+
+    /// `synth_new` — a `new` node reached *outside* an `assign` value
+    /// (there is no target name to bind the mode family under).
+    /// Synthesizes both children for well-formedness, warns, and
+    /// degrades to `type.unknown` — the honest-bound convention.
+    pub(crate) fn synth_new_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let kids = children_of(node);
+        if let Some(kids) = kids
+            && kids.len() >= 2
+        {
+            if let Some(t) = kids[0].as_u64() {
+                let _ = self.dep_synth_type(lang, ast, t as usize, ctx)?;
+            }
+            if let Some(d) = kids[1].as_u64() {
+                self.synth_node(lang, ast, AstRef::new(d as usize), ctx)?;
+            }
+        }
+        ctx.diagnostics.push(TypecheckDiagnostic {
+            severity: "warning".to_string(),
+            message:
+                "`new` is only meaningful as the value of `X := new T(args) { … }` — no declaration target to bind"
+                    .to_string(),
+            span: node.span,
+        });
+        let mut m = Map::new();
+        Ok(make_tag(ctx, "type.unknown", std::mem::take(&mut m)))
     }
 
     /// Dictionary search: the declared candidates for `head` tried in
@@ -5940,12 +7022,10 @@ impl NbeTypecheckEngine {
             // A solved meta stands for its solution: dereference it before
             // the meta-solve shortcut so a second constraint on a shared
             // meta checks against the *solution* — re-solving the cell
-            // would silently overwrite it. This is what rejects the IO
-            // widen: `x ~> x` synths `type.function{?m, ?m}` (param and
-            // body share the meta), so checking it against
-            // `IO(sa) ~> IO(sb)` solves `?m := IO(sa)` at the domain and
-            // leaves `dep_unify(IO(sa), IO(sb))` — signature subtyping
-            // through the IO arm below — at the codomain.
+            // would silently overwrite it. `x ~> x` synths
+            // `type.function{?m, ?m}` (param and body share the meta), so
+            // the domain constraint solves `?m` first and the codomain
+            // constraint then checks against that *solution*.
             let za;
             let zb;
             let a = if extract_meta_id(a).is_some() {
@@ -5970,9 +7050,9 @@ impl NbeTypecheckEngine {
             }
             // `type.unknown` is the dynamic top (see `unify`): consistent
             // with every type on either side, in both the tagged and the
-            // domain-encoded spellings. Checked here — before the tag match
-            // — because the `io_headed` signature-subtyping arm below would
-            // otherwise reject `IO` vs `unknown` before `self.unify`'s
+            // domain-encoded spellings. Checked here — before the tag
+            // match — so the mode-hom arm below cannot reject
+            // `unknown` vs a mode-carrying type before `self.unify`'s
             // accept could fire.
             if is_unknown_ty(a) || is_unknown_ty(b) {
                 return Ok(());
@@ -6060,11 +7140,9 @@ impl NbeTypecheckEngine {
                     // structural `unify` reading (param + payload fields;
                     // `body_closure` is skipped there as before).
                     match (a.get("path"), b.get("path")) {
-                        (Some(_), None) | (None, Some(_)) => {
-                            return Err(LangError::engine(
-                                "typecheck: cannot unify — path type vs plain Pi".to_string(),
-                            ));
-                        }
+                        (Some(_), None) | (None, Some(_)) => Err(LangError::engine(
+                            "typecheck: cannot unify — path type vs plain Pi".to_string(),
+                        )),
                         (Some(pa), Some(pb)) => {
                             for key in ["x", "y"] {
                                 let (ok, _) = unify_index(
@@ -6172,14 +7250,28 @@ impl NbeTypecheckEngine {
                     self.unify_equiv_record(equiv_t, record_t, ctx)
                 }
                 _ => {
-                    // `Former{type.io}` — signature subtyping (record-width
-                    // on the sig index): `IO(s) <: IO(s')` iff `s'` names
-                    // at least the ops of `s` — directed, unlike index conv.
-                    if io_headed(a) || io_headed(b) {
+                    // Mode-carrying `Hom(d, s, t, m)` types (pl-0002
+                    // M3): graded-arrow cell types check by *directed*
+                    // subsumption — the actual's mode must be `≤` the
+                    // expected's under the governing `mode.algebra.*`
+                    // `order` field (`vsubtype` semantics). `unify`'s
+                    // domain-encoded path only reaches `conv`, which
+                    // accepts either direction; routing through
+                    // `subtype` is what makes "argument mode vs
+                    // parameter mode" and "composition result vs
+                    // annotation" enforce.
+                    if json_mode_hom(a) || json_mode_hom(b) {
                         let mark = ctx.vcheck.store_mark();
                         let va = domain_lift(a, ctx);
                         let vb = domain_lift(b, ctx);
                         if ctx.vcheck.subtype(&va, &vb) {
+                            return Ok(());
+                        }
+                        // Same stuck escape `unify` keeps: a `Hom`
+                        // above the checked dimension is under-decided
+                        // by convention.
+                        if beyond_checked_dim(&va) || beyond_checked_dim(&vb) {
+                            ctx.vcheck.store_restore(mark);
                             return Ok(());
                         }
                         ctx.vcheck.store_restore(mark);
@@ -6399,10 +7491,10 @@ impl NbeTypecheckEngine {
                         Ok(t) => t,
                         Err(e) => return Some(Err(e)),
                     };
-                    return Some(match self.dep_unify(&ty, expected, ctx) {
+                    Some(match self.dep_unify(&ty, expected, ctx) {
                         Ok(()) => Ok(ty),
                         Err(e) => Err(e),
-                    });
+                    })
                 }
                 _ => None,
             }
@@ -6748,7 +7840,7 @@ impl NbeTypecheckEngine {
             return Ok(cb.clone());
         }
         if let Some(fam) = bc.get("apply_type") {
-            return self.dep_closure_apply_term(lang, ast, fam, &term, ctx);
+            return self.dep_closure_apply_term(lang, ast, fam, term, ctx);
         }
         let var_name = bc
             .get("var_name")
@@ -6758,7 +7850,10 @@ impl NbeTypecheckEngine {
         // `rest`-chain closures may carry no `body_child_idx` (sigma
         // chains terminate on the last binder's annotation), so the
         // index is only required on the non-chain path below.
-        let body_idx = bc.get("body_child_idx").and_then(Value::as_u64).map(|v| v as usize);
+        let body_idx = bc
+            .get("body_child_idx")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
         let bound = eval_index(term, ctx);
         // Occurs guard: `var_name` occurring inside its own binding
         // term (`Sigma(Nat, m ~> Vec(m, a))` applied at `var{m}+1` —
@@ -6789,9 +7884,8 @@ impl NbeTypecheckEngine {
         {
             self.dep_closure_chain(lang, ast, bc, rest, ctx)
         } else {
-            let body_idx = body_idx.ok_or_else(|| {
-                LangError::engine("dep_closure_apply: no body idx".to_string())
-            })?;
+            let body_idx = body_idx
+                .ok_or_else(|| LangError::engine("dep_closure_apply: no body idx".to_string()))?;
             self.dep_synth_type(lang, ast, body_idx, ctx)
         };
         match old {
@@ -6936,11 +8030,15 @@ impl NbeTypecheckEngine {
                 match &cons_name {
                     Some(n) => {
                         let family = scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("");
-                        let is_own_ctor = ctx
-                            .lookup(n)
-                            .filter(|v| tag_of(v) == Some("type.ctor_sig"))
-                            .and_then(|s| s.get("family").and_then(Value::as_str))
-                            .is_some_and(|f| f == family);
+                        // PL-0003 I2: a ctor the family's `inductive.spec`
+                        // declares counts as this family's own even when
+                        // the gamma `type.ctor_sig` binding is absent.
+                        let is_own_ctor = spec_declares_ctor(ctx, family, n)
+                            || ctx
+                                .lookup(n)
+                                .filter(|v| tag_of(v) == Some("type.ctor_sig"))
+                                .and_then(|s| s.get("family").and_then(Value::as_str))
+                                .is_some_and(|f| f == family);
                         if is_own_ctor {
                             ArmCover::Ctor(n.clone())
                         } else if ctx.ctor_family.contains_key(n.as_str()) {
@@ -6960,14 +8058,61 @@ impl NbeTypecheckEngine {
             });
 
             // Instantiate the ctor sig (if the pattern is a constructor).
-            let ctor_inst: Option<Value> = cons_name
-                .as_deref()
-                .and_then(|n| ctx.lookup(n).cloned())
-                .filter(|v| tag_of(v) == Some("type.ctor_sig"));
+            // PL-0003 I2: prefer the scrutinee family's `inductive.spec`
+            // value — its owned type-exprs re-elaborate to the same ctor
+            // sig the gamma `type.ctor_sig` binding carries (the spec is
+            // minted from the same declaration data), so the spec-driven
+            // path is exercised by every spec-declaring family; the gamma
+            // binding remains the fallback for families without a spec
+            // (hand-built `data` payloads, imports, non-family scrutinees).
+            let mut ctor_spec_backed = false;
+            let ctor_inst: Option<Value> = match cons_name.as_deref() {
+                Some(n) => match scrut.as_ref().map(|(f, _)| f.as_str()).unwrap_or("") {
+                    fam if !fam.is_empty() => match spec_ctor_sig(ctx, ast, fam, n)? {
+                        Some(sig) => {
+                            ctor_spec_backed = true;
+                            Some(sig)
+                        }
+                        None => ctx
+                            .lookup(n)
+                            .cloned()
+                            .filter(|v| tag_of(v) == Some("type.ctor_sig")),
+                    },
+                    _ => ctx
+                        .lookup(n)
+                        .cloned()
+                        .filter(|v| tag_of(v) == Some("type.ctor_sig")),
+                },
+                None => None,
+            };
             let mut ctor_result = Value::Null;
             let mut domains: Vec<(String, Value)> = Vec::new();
             if let Some(sig) = &ctor_inst {
-                let inst = self.instantiate_ctor_full(lang, ast, sig, ctx)?;
+                let inst = if ctor_spec_backed {
+                    // The sig's `node` fields index `ctx.spec_ast` — a
+                    // source-arena clone plus the materialized spec
+                    // nodes — so instantiate against that arena, then
+                    // restore it for later arms/lookups. A nested spec
+                    // materialization during instantiation would leave a
+                    // grown superset in `ctx.spec_ast`; keep it (indices
+                    // into the taken arena stay valid — same prefix).
+                    // `spec_ast` is `None` exactly when this sig
+                    // materialized no nodes (all-`null` type-exprs —
+                    // e.g. bare enum ctors), in which case no spec index
+                    // exists and the source arena is equivalent.
+                    match ctx.spec_ast.take() {
+                        Some(arena) => {
+                            let r = self.instantiate_ctor_full(lang, &arena, sig, ctx);
+                            if ctx.spec_ast.is_none() {
+                                ctx.spec_ast = Some(arena);
+                            }
+                            r?
+                        }
+                        None => self.instantiate_ctor_full(lang, ast, sig, ctx)?,
+                    }
+                } else {
+                    self.instantiate_ctor_full(lang, ast, sig, ctx)?
+                };
                 let (doms, res) = self.peel_ctor(&inst);
                 for (i, (_pname, dom)) in doms.into_iter().enumerate() {
                     domains.push((arg_names.get(i).cloned().unwrap_or_default(), dom));
@@ -8856,6 +10001,7 @@ impl NbeTypecheckEngine {
     /// should synthesize as an interval `type.pi`. Mints
     /// `type.glue{family, face, section}` with the face stored as the
     /// model's `face{op, args}` record.
+    #[allow(clippy::too_many_arguments)]
     fn dep_synth_glue_type(
         &self,
         lang: &Language,
@@ -9318,12 +10464,899 @@ impl NbeTypecheckEngine {
         Ok(hom_former(dim_v, va, vb, ctx))
     }
 
+    /// Describe a grade/mode child as a `type.mode` descriptor
+    /// (`{head, arg, raw}` — pl-0002 M2; the model's
+    /// `mode_descriptor_` port): `Cost(3)` — a `call` whose callee is
+    /// a `var` — yields head `Cost`, payload the evaluated `3`, and
+    /// `raw` the `Cost(3)` application (the self-describing
+    /// call-head form); anything else yields head `null` and the
+    /// evaluated mode value as `raw` (bare modes compose under
+    /// `mode.algebra.default`). Payload arguments evaluate through
+    /// `eval_ann_node` — the same fuel-bounded evaluator annotation
+    /// checks use. A child the evaluator cannot reduce degrades to
+    /// the honest meta + warning, never a silent drop.
+    fn mode_descriptor(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        node_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Val, LangError> {
+        let node = ast.get(AstRef::new(node_idx)).ok_or_else(|| {
+            LangError::engine(format!("mode_descriptor: node {node_idx} out of bounds"))
+        })?;
+        // Unwrap one `paren` layer (the model's `mode_descriptor_`).
+        let (g_idx, g) = if node.kind == "paren" {
+            match children_of(node)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+            {
+                Some(i) => match ast.get(AstRef::new(i as usize)) {
+                    Some(inner) => (i as usize, inner),
+                    None => (node_idx, node),
+                },
+                None => (node_idx, node),
+            }
+        } else {
+            (node_idx, node)
+        };
+        if g.kind == "call" {
+            let kids = children_of(g).cloned().unwrap_or_default();
+            let callee_role = lang
+                .child_role_index("call", "callee")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let args_role = lang
+                .child_role_index("call", "args")
+                .ok()
+                .flatten()
+                .unwrap_or(1);
+            let head = kids
+                .get(callee_role)
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                .map(|cn| {
+                    // Unwrap a parenthesized callee too.
+                    if cn.kind == "paren" {
+                        children_of(cn)
+                            .and_then(|c| c.first())
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .unwrap_or(cn)
+                    } else {
+                        cn
+                    }
+                })
+                .filter(|cn| cn.kind == "var")
+                .and_then(node_name)
+                .filter(|n| !n.is_empty());
+            if let Some(h) = head {
+                // Call-head mode: evaluate each argument child; the
+                // first is the payload, all of them rebuild `raw`.
+                let mut arg_vals = Vec::new();
+                for k in kids.iter().skip(args_role) {
+                    let Some(ci) = k.as_u64() else {
+                        arg_vals.push(Value::Null);
+                        continue;
+                    };
+                    match self.eval_ann_node(lang, ast, ci as usize, ctx) {
+                        Ok(v) => arg_vals.push(v),
+                        Err(_) => arg_vals.push(Value::Null),
+                    }
+                }
+                let payload = arg_vals.first().cloned().unwrap_or(Value::Null);
+                let raw_v = domain_lift(&app_term(var_term(&h), arg_vals), ctx);
+                let arg_v = domain_lift(&payload, ctx);
+                ctx.vcheck.mode_homs = true;
+                return Ok(ctx.vcheck.mode_desc(Some(&h), arg_v, raw_v));
+            }
+        }
+        // Bare mode: the whole child evaluates to the payload.
+        match self.eval_ann_node(lang, ast, g_idx, ctx) {
+            Ok(ev) => {
+                let raw_v = domain_lift(&ev, ctx);
+                ctx.vcheck.mode_homs = true;
+                Ok(ctx
+                    .vcheck
+                    .mode_desc(None, Val::Const(TaggedValue::Null), raw_v))
+            }
+            Err(_) => {
+                let m = ctx.vcheck.mode_honest("mode child does not evaluate");
+                ctx.vcheck.mode_homs = true;
+                Ok(ctx.vcheck.mode_desc(None, Val::Const(TaggedValue::Null), m))
+            }
+        }
+    }
+
+    // -- PL-0004 E1: `@ μ` ambient-mode ascription ---------------------
+    //
+    // `T @ μ` mints a `mode_ascribe` node (grammar.mode_ascribe.infix).
+    // The mode is judgement metadata — `Γ ⊢ t : A @ μ` keeps `A` and
+    // `μ` separate — so `dep_synth_type`'s `mode_ascribe` arm returns
+    // the `type` child's synthesis unchanged and records the
+    // elaborated mode set on the node. The helpers below turn the mode
+    // *expression* (`[Effects(S), Cost(3)]`, `m`, `Effects(S)`, `[]`)
+    // into the canonical tagged `type.mode_set` value.
+
+    /// The mode child index of a `mode_ascribe` node at `idx`,
+    /// unwrapping `paren` layers — `None` for any other kind.
+    fn mode_ascribe_mode_child(&self, lang: &Language, ast: &Ast, idx: usize) -> Option<usize> {
+        let mut node = ast.get(AstRef::new(idx))?;
+        while node.kind == "paren" {
+            let i = children_of(node)?.first()?.as_u64()? as usize;
+            node = ast.get(AstRef::new(i))?;
+        }
+        if node.kind != "mode_ascribe" {
+            return None;
+        }
+        role_child_ref(lang, node, "mode")
+            .or_else(|| child_at(ast, node, 1))
+            .map(|r| r.index())
+    }
+
+    /// The ambient mode a `type`-position node ascribes, if it is a
+    /// `mode_ascribe` (possibly under `paren`s): elaborates the mode
+    /// set and returns `Some(μ)`. `synth_type_annot` calls this *before*
+    /// judging the subject so `expr : T @ μ` checks `expr` under `μ`;
+    /// `dep_synth_type`'s own `mode_ascribe` arm populates
+    /// `ctx.node_modes` when the annotation elaborates.
+    pub(crate) fn mode_ascription_at(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Option<Value>, LangError> {
+        let Some(mode_idx) = self.mode_ascribe_mode_child(lang, ast, idx) else {
+            return Ok(None);
+        };
+        Ok(Some(self.elaborate_mode_set(lang, ast, mode_idx, ctx)?))
+    }
+
+    /// Elaborate a `@ μ` mode expression into the canonical
+    /// `{"__tag__": "type.mode_set", "modes": […]}` value (PL-0004 E1).
+    /// Each element mirrors the `type.mode` descriptor triple
+    /// `{head, arg, raw}`: `Algebra(payload)` call-heads carry the
+    /// algebra name + first evaluated payload arg + the
+    /// self-describing `App` form; bare modes carry `head`/`arg` null
+    /// and the evaluated mode value as `raw`.
+    ///
+    /// Set semantics (design/effects-ambient-modes.md §1): an `array`
+    /// operand is the bracketed set — order irrelevant, one element
+    /// per algebra head, duplicate heads *rejected*; any other operand
+    /// is a single mode element (`@ m`, `@ Effects(S)`).
+    ///
+    /// Head resolution: `mode.algebra.<head>` globals or heads declared
+    /// by `X := new Algebra(…)` (`Checker::algebra_heads`). An
+    /// unresolvable head passes with a warning — the mode-metavariable
+    /// honest bound (M3 posture), never a rejection. Cached per
+    /// mode-expression node so pre-scan and `dep_synth_type` elaborate
+    /// once.
+    pub(crate) fn elaborate_mode_set(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        mode_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        if let Some(mu) = ctx.mode_set_cache.get(&mode_idx) {
+            return Ok(mu.clone());
+        }
+        // PL-0004 E3: mode metavariables are scoped to one mode
+        // expression's elaboration — `@ m` on two different
+        // ascriptions denotes two *independent* metas (no
+        // cross-binding generalization; the M3.5 annotation-required
+        // discipline). Bound names (results/Γ/globals) never reach
+        // the meta path — they stay rigid var terms.
+        let saved = std::mem::take(&mut ctx.mode_metas);
+        let res = self.elaborate_mode_set_inner(lang, ast, mode_idx, ctx);
+        ctx.mode_metas = saved;
+        res
+    }
+
+    /// [`elaborate_mode_set`](Self::elaborate_mode_set) body — runs
+    /// with `ctx.mode_metas` freshly scoped for this mode expression.
+    fn elaborate_mode_set_inner(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        mode_idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(AstRef::new(mode_idx)).ok_or_else(|| {
+            LangError::engine(format!("mode_ascribe: mode node {mode_idx} out of bounds"))
+        })?;
+        // `[…]` is the set form; anything else is one mode element.
+        let element_idxs: Vec<usize> = if node.kind == "array" {
+            children_of(node)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|v| v as usize)
+                .collect()
+        } else {
+            vec![mode_idx]
+        };
+        let mut modes = Vec::with_capacity(element_idxs.len());
+        let mut heads = std::collections::HashSet::new();
+        for ei in element_idxs {
+            let enode = ast.get(AstRef::new(ei)).ok_or_else(|| {
+                LangError::engine(format!("mode_ascribe: element node {ei} out of bounds"))
+            })?;
+            let (head, element) = self.mode_element(lang, ast, ei, enode, ctx)?;
+            if let Some(h) = &head {
+                if !heads.insert(h.clone()) {
+                    return Err(LangError::engine_node(
+                        format!(
+                            "mode ascription: duplicate algebra head `{h}` — a mode set holds one element per algebra"
+                        ),
+                        enode,
+                    ));
+                }
+                let registered = ctx
+                    .vcheck
+                    .mode_algebras
+                    .contains_key(&format!("mode.algebra.{h}"))
+                    || ctx.vcheck.algebra_heads.contains(h);
+                if !registered {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "mode ascription: unknown algebra head `{h}` — passing (honest bound; declare it with `new Algebra` or register `mode.algebra.{h}`)"
+                        ),
+                        span: enode.span,
+                    });
+                }
+            }
+            modes.push(element);
+        }
+        // PL-0004 G0 `requires` closure (design/effects-ambient-modes.md
+        // §4.1): each element head's declared `requires` list unions
+        // into the set, transitively — `@ [ReadFile]` with
+        // `requires: [FsRead]` elaborates to `{ReadFile, FsRead}`.
+        // Required heads arrive as bare-head elements (no payload);
+        // unresolvable heads warn + pass (the honest bound — the
+        // capability is simply absent).
+        let mut queue: Vec<String> = heads.iter().cloned().collect();
+        while let Some(h) = queue.pop() {
+            let reqs = ctx
+                .vcheck
+                .algebra_effects
+                .get(&h)
+                .map(|d| d.requires.clone())
+                .unwrap_or_default();
+            for r in reqs {
+                if heads.contains(&r) {
+                    continue;
+                }
+                if !Self::mode_head_declared(ctx, &r) {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "mode ascription: `{h}` requires unknown algebra head `{r}` — passing (honest bound)"
+                        ),
+                        span: None,
+                    });
+                    continue;
+                }
+                heads.insert(r.clone());
+                let mut em = Map::new();
+                em.insert("head".to_string(), Value::String(r.clone()));
+                em.insert("arg".to_string(), Value::Null);
+                em.insert("raw".to_string(), var_term(&r));
+                modes.push(Value::Object(em));
+                queue.push(r);
+            }
+        }
+        let mut m = Map::new();
+        m.insert(
+            "__tag__".to_string(),
+            Value::String("type.mode_set".to_string()),
+        );
+        m.insert(
+            "__registry__".to_string(),
+            Value::String(ctx.registry.registry_id().to_string()),
+        );
+        m.insert("modes".to_string(), Value::Array(modes));
+        let set = Value::Object(m);
+        ctx.mode_set_cache.insert(mode_idx, set.clone());
+        Ok(set)
+    }
+
+    /// One `@ […]` element → `(head, element)` where `element` is the
+    /// `{head, arg, raw}` JSON triple. `Algebra(payload)` — a `call`
+    /// whose callee unwraps to a `var` — is a call-head mode;
+    /// anything else evaluates as a bare mode. A mode expression the
+    /// evaluator cannot reduce degrades to a fresh meta + warning —
+    /// the honest bound, never a silent drop (the `mode_descriptor`
+    /// convention).
+    fn mode_element(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        node: &AstNode,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(Option<String>, Value), LangError> {
+        // Unwrap one `paren` layer (the model's `mode_descriptor_`).
+        let (e_idx, e) = if node.kind == "paren" {
+            match children_of(node)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+            {
+                Some(i) => match ast.get(AstRef::new(i as usize)) {
+                    Some(inner) => (i as usize, inner),
+                    None => (idx, node),
+                },
+                None => (idx, node),
+            }
+        } else {
+            (idx, node)
+        };
+        if e.kind == "call" {
+            let kids = children_of(e).cloned().unwrap_or_default();
+            let callee_role = lang
+                .child_role_index("call", "callee")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let args_role = lang
+                .child_role_index("call", "args")
+                .ok()
+                .flatten()
+                .unwrap_or(1);
+            let head = kids
+                .get(callee_role)
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+                .map(|cn| {
+                    if cn.kind == "paren" {
+                        children_of(cn)
+                            .and_then(|c| c.first())
+                            .and_then(Value::as_u64)
+                            .and_then(|i| ast.get(AstRef::new(i as usize)))
+                            .unwrap_or(cn)
+                    } else {
+                        cn
+                    }
+                })
+                .filter(|cn| cn.kind == "var")
+                .and_then(node_name)
+                .filter(|n| !n.is_empty());
+            if let Some(h) = head {
+                // Call-head mode: each argument elaborates as a mode
+                // payload; the first is `arg`, all rebuild `raw`.
+                let mut arg_vals = Vec::new();
+                for k in kids.iter().skip(args_role) {
+                    let Some(ci) = k.as_u64() else {
+                        arg_vals.push(Value::Null);
+                        continue;
+                    };
+                    arg_vals.push(self.mode_payload_value(lang, ast, ci as usize, ctx));
+                }
+                let payload = arg_vals.first().cloned().unwrap_or(Value::Null);
+                let raw = app_term(var_term(&h), arg_vals);
+                let mut em = Map::new();
+                em.insert("head".to_string(), Value::String(h.clone()));
+                em.insert("arg".to_string(), payload);
+                em.insert("raw".to_string(), raw);
+                return Ok((Some(h), Value::Object(em)));
+            }
+        }
+        // PL-0004 G0: a bare `var` naming a declared algebra head is a
+        // *bare-head mode element* — `@ [ReadFile]` carries the head
+        // with no payload (design/effects-ambient-modes.md §2: effect
+        // heads are unit; the payload slot is for parameters like
+        // `Raise(Nat)`, which stay on the `call` path above). Head
+        // resolution is name-level, same as the registered check in
+        // `elaborate_mode_set_inner`.
+        let mut bv = e;
+        while bv.kind == "paren" {
+            match children_of(bv)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+            {
+                Some(inner) => bv = inner,
+                None => break,
+            }
+        }
+        if bv.kind == "var"
+            && let Some(h) = node_name(bv)
+            && Self::mode_head_declared(ctx, &h)
+        {
+            let mut em = Map::new();
+            em.insert("head".to_string(), Value::String(h.clone()));
+            em.insert("arg".to_string(), Value::Null);
+            em.insert("raw".to_string(), var_term(&h));
+            return Ok((Some(h), Value::Object(em)));
+        }
+        // Bare mode element — the whole child is the payload. An
+        // unevaluable mode is the honest bound (fresh meta + warning).
+        // PL-0004 E3: an unbound `var` payload already arrived as the
+        // elaboration-scoped mode metavariable (`mode_payload_value`
+        // minted it with the warning); this check is the defensive
+        // leftover for var-term raws that resolve nowhere.
+        let raw = self.mode_payload_value(lang, ast, e_idx, ctx);
+        if let Some(name) = raw
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|_| raw.get("__tag__").and_then(Value::as_str) == Some("var"))
+        {
+            if !Self::mode_name_resolvable(lang, ctx, name) {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "mode ascription: mode metavariable `{name}` does not resolve — passing (honest bound)"
+                    ),
+                    span: e.span,
+                });
+            }
+        }
+        let mut em = Map::new();
+        em.insert("head".to_string(), Value::Null);
+        em.insert("arg".to_string(), Value::Null);
+        em.insert("raw".to_string(), raw);
+        Ok((None, Value::Object(em)))
+    }
+
+    /// Whether `h` resolves as a mode-algebra head (PL-0004 G0) — a
+    /// `new Algebra` declaration ([`Checker::algebra_heads`], also
+    /// populated for effect decls in `algebra_effects`) or a
+    /// registered `mode.algebra.<h>` language global. Name-level,
+    /// mirroring the registered check in `elaborate_mode_set_inner`;
+    /// shared by bare-head elements and the `requires` closure.
+    fn mode_head_declared(ctx: &TypecheckContext, h: &str) -> bool {
+        ctx.vcheck.algebra_heads.contains(h)
+            || ctx.vcheck.algebra_effects.contains_key(h)
+            || ctx
+                .vcheck
+                .mode_algebras
+                .contains_key(&format!("mode.algebra.{h}"))
+    }
+
+    /// Whether a mode-expression `var` name resolves to something
+    /// real — a `results` binding, a Γ entry, or a global. Unresolvable
+    /// names are mode metavariables (PL-0004 E3).
+    fn mode_name_resolvable(lang: &Language, ctx: &TypecheckContext, name: &str) -> bool {
+        ctx.results.contains_key(name)
+            || ctx.lookup(name).is_some()
+            || lang.globals.contains_key(name)
+    }
+
+    /// The elaboration-scoped mode metavariable for `name` (PL-0004
+    /// E3): one tagged meta per name per `elaborate_mode_set` call —
+    /// repeated occurrences share it (they unify/substitute), distinct
+    /// ascriptions mint distinct metas.
+    fn mode_meta_id(ctx: &mut TypecheckContext, name: &str) -> u64 {
+        if let Some(id) = ctx.mode_metas.get(name) {
+            return *id;
+        }
+        let id = ctx.fresh_meta();
+        ctx.mode_metas.insert(name.to_string(), id);
+        id
+    }
+
+    /// A mode payload value: record literals (`{op: A ~> B}` — e.g.
+    /// an `Effects(S)`-shaped payload during the G2 transition)
+    /// elaborate entry-wise through `record_type_map` — the
+    /// op-name → value-type reading mode payloads share.
+    /// Every other payload evaluates as an annotation term first
+    /// (`Cost(3)` → `3`, `Session(!T)` → the symbolic term), falling
+    /// back to type synthesis for type-expression payloads and to a
+    /// fresh meta + warning — the honest bound — when neither works.
+    fn mode_payload_value(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Value {
+        let Some(node) = ast.get(AstRef::new(idx)) else {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: "mode ascription: payload node out of bounds — honest bound".to_string(),
+                span: None,
+            });
+            return meta_value(ctx.fresh_meta());
+        };
+        let honest = |ctx: &mut TypecheckContext| -> Value {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message:
+                    "mode ascription: payload does not elaborate — bound to a fresh meta (honest bound)"
+                        .to_string(),
+                span: node.span,
+            });
+            meta_value(ctx.fresh_meta())
+        };
+        if matches!(node.kind.as_str(), "object" | "block") {
+            return self
+                .record_type_map(lang, ast, idx, ctx)
+                .unwrap_or_else(|_| honest(ctx));
+        }
+        // PL-0004 E3 mode metavariable: a bare `var` payload that
+        // resolves nowhere mints (or reuses, within this elaboration)
+        // the elaboration-scoped tagged meta — the name then
+        // unifies/substitutes during checking (row-poly `Effects(s)`).
+        // Bound names stay rigid var terms — silent, as before.
+        let mut vn = node;
+        while vn.kind == "paren" {
+            match children_of(vn)
+                .and_then(|c| c.first())
+                .and_then(Value::as_u64)
+                .and_then(|i| ast.get(AstRef::new(i as usize)))
+            {
+                Some(inner) => vn = inner,
+                None => break,
+            }
+        }
+        if vn.kind == "var"
+            && let Some(name) = node_name(vn)
+            && !Self::mode_name_resolvable(lang, ctx, &name)
+        {
+            ctx.diagnostics.push(TypecheckDiagnostic {
+                severity: "warning".to_string(),
+                message: format!(
+                    "mode ascription: mode metavariable `{name}` does not resolve — bound to a fresh meta (honest bound)"
+                ),
+                span: vn.span,
+            });
+            let id = Self::mode_meta_id(ctx, &name);
+            return meta_value(id);
+        }
+        // Type-expression kinds synthesize as types first (an arrow
+        // payload is a *type*, not a closure value); everything else
+        // evaluates as a term first.
+        let type_first = matches!(
+            node.kind.as_str(),
+            "function"
+                | "dim_arrow"
+                | "graded_arrow"
+                | "pi"
+                | "sigma"
+                | "forall"
+                | "exists"
+                | "family"
+                | "type-annot"
+                | "mode_ascribe"
+        );
+        if type_first {
+            if let Ok(t) = self.dep_synth_type(lang, ast, idx, ctx) {
+                return t;
+            }
+        }
+        if let Ok(v) = self.eval_ann_node(lang, ast, idx, ctx) {
+            return v;
+        }
+        if !type_first && let Ok(t) = self.dep_synth_type(lang, ast, idx, ctx) {
+            return t;
+        }
+        honest(ctx)
+    }
+
+    /// `e @ μ` / the term-position reading of `mode_ascribe`
+    /// (PL-0004 E1): synthesize the subject under the ascribed ambient
+    /// mode and record the elaborated mode set on the node. In *type*
+    /// position `dep_synth_type`'s `mode_ascribe` arm handles the node
+    /// before this judgment is reached.
+    pub(crate) fn synth_mode_ascribe_judgment(
+        &self,
+        lang: &Language,
+        ast: &Ast,
+        idx: usize,
+        ctx: &mut TypecheckContext,
+    ) -> Result<Value, LangError> {
+        let node = ast.get(AstRef::new(idx)).ok_or_else(|| {
+            LangError::engine(format!("synth_mode_ascribe: node {idx} out of bounds"))
+        })?;
+        let kids = children_of(node)
+            .ok_or_else(|| LangError::engine("synth_mode_ascribe: no children".to_string()))?;
+        if kids.len() < 2 {
+            return Err(LangError::engine(
+                "synth_mode_ascribe: needs [type, mode] children".to_string(),
+            ));
+        }
+        let subj_idx = role_child_ref(lang, node, "type")
+            .or_else(|| child_at(ast, node, 0))
+            .ok_or_else(|| {
+                LangError::engine("synth_mode_ascribe: missing type child".to_string())
+            })?;
+        let mode_idx = role_child_ref(lang, node, "mode")
+            .or_else(|| child_at(ast, node, 1))
+            .ok_or_else(|| {
+                LangError::engine("synth_mode_ascribe: missing mode child".to_string())
+            })?;
+        // Elaborate the mode first (annotation discipline — diagnostics
+        // fire even when the subject fails), then judge the subject
+        // under the ascribed ambient mode.
+        let mu = self.elaborate_mode_set(lang, ast, mode_idx.index(), ctx)?;
+        let prev = ctx.ambient_mode.replace(mu.clone());
+        let res = self.synth_node(lang, ast, AstRef::new(subj_idx.index()), ctx);
+        ctx.ambient_mode = prev;
+        let ty = res?;
+        ctx.node_modes.insert(idx, mu);
+        Ok(ty)
+    }
+
+    // -- PL-0004 E2/G1: ambient-mode consumers ------------------------
+    //
+    // E1 plumbed the `Γ ⊢ t : A @ μ` slot; E2 is its first consumer.
+    // E3 adds mode metavariables (elaboration-scoped `__meta__`s for
+    // unbound `@` vars — they unify/substitute during checking) and
+    // the `Val`-descriptor compose bridge for non-`Effects` heads.
+    // G1 (design/effects-ambient-modes.md v2 §2/§6) retires the
+    // `Effects(S)` row encoding: the ambient mode is a SET of algebra
+    // applications — `{"__tag__": "type.mode_set", "modes":
+    // [{head, arg, raw}, …]}` — and every consumer keys on mode
+    // *elements* (head + payload), never on a row record. `Effects`
+    // survives only as an ordinary (unregistered) head name.
+
+    /// Whether a `type.mode_set` value holds an element headed by
+    /// `head` (PL-0004 G0 granular lookup — `perform`'s `op`-field
+    /// membership check).
+    fn mode_set_has_head(mu: &Value, head: &str) -> bool {
+        mu.get("modes")
+            .and_then(Value::as_array)
+            .is_some_and(|els| {
+                els.iter()
+                    .any(|el| el.get("head").and_then(Value::as_str) == Some(head))
+            })
+    }
+
+    /// The `(head, arg, raw)` elements of a `type.mode_set` value —
+    /// `head` `None` for bare modes (the `head: null` triple
+    /// spelling). `raw` is preserved verbatim: bare modes carry their
+    /// payload there (`arg` is `null`), so dropping it would lose the
+    /// mode value at the next rebuild (PL-0004 E3).
+    fn mode_set_elements(mu: &Value) -> Vec<(Option<String>, Value, Value)> {
+        mu.get("modes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|el| {
+                let arg = el.get("arg").cloned().unwrap_or(Value::Null);
+                let raw = el.get("raw").cloned().unwrap_or_else(|| arg.clone());
+                (
+                    el.get("head").and_then(Value::as_str).map(str::to_string),
+                    arg,
+                    raw,
+                )
+            })
+            .collect()
+    }
+
+    /// Rebuild a `type.mode_set` value from `(head, arg, raw)`
+    /// elements — the triple spelling `elaborate_mode_set` mints.
+    fn mode_set_value(
+        elements: Vec<(Option<String>, Value, Value)>,
+        ctx: &TypecheckContext,
+    ) -> Value {
+        let modes = elements
+            .into_iter()
+            .map(|(head, arg, raw)| {
+                let mut em = Map::new();
+                em.insert(
+                    "head".to_string(),
+                    head.map(Value::String).unwrap_or(Value::Null),
+                );
+                em.insert("arg".to_string(), arg);
+                em.insert("raw".to_string(), raw);
+                Value::Object(em)
+            })
+            .collect();
+        let mut m = Map::new();
+        m.insert(
+            "__tag__".to_string(),
+            Value::String("type.mode_set".to_string()),
+        );
+        m.insert(
+            "__registry__".to_string(),
+            Value::String(ctx.registry.registry_id().to_string()),
+        );
+        m.insert("modes".to_string(), Value::Array(modes));
+        Value::Object(m)
+    }
+
+    /// The judgement mode recorded for an AST node (PL-0004 E2):
+    /// `node_modes` first (`mode_ascribe` ascriptions, `>>>`-composed
+    /// modes, `handle` residuals), then `var` operands resolve through
+    /// `binding_modes` (the mode their binding was ascribed/inherited
+    /// with). `paren`s unwrap; anything else is `None` — no recorded
+    /// mode (pure/unit for composition purposes).
+    pub(crate) fn mode_of_node(
+        &self,
+        ast: &Ast,
+        idx: usize,
+        ctx: &TypecheckContext,
+    ) -> Option<Value> {
+        let mut cur = idx;
+        loop {
+            if let Some(m) = ctx.node_modes.get(&cur) {
+                return Some(m.clone());
+            }
+            let node = ast.get(AstRef::new(cur))?;
+            match node.kind.as_str() {
+                "paren" => {
+                    cur = children_of(node)?.first()?.as_u64()? as usize;
+                }
+                "var" => {
+                    let name = node_name(node)?;
+                    let m = ctx.lookup_binding_mode(&name)?;
+                    return (!m.is_null()).then(|| m.clone());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// `a ⋄ b` on ambient `type.mode_set` values — the `>>>`
+    /// composition seam (PL-0004 E2/G1; design §3 "composition computes
+    /// the mode set"). Elements merge by algebra head (a mode set
+    /// holds one element per head): same-head payloads compose through
+    /// the `Val`-descriptor bridge (PL-0004 E3;
+    /// [`compose_mode_element`]) — non-compositional effect heads
+    /// set-union idempotently, compositional heads compose payloads —
+    /// and heads present on one side only pass through.
+    fn mode_sets_compose(&self, a: &Value, b: &Value, ctx: &mut TypecheckContext) -> Value {
+        let mut out = Self::mode_set_elements(a);
+        for (hb, argb, rawb) in Self::mode_set_elements(b) {
+            match out.iter_mut().find(|(h, _, _)| *h == hb) {
+                Some(slot) => {
+                    let (na, nr) = self.compose_mode_element(
+                        hb.as_deref(),
+                        &slot.1,
+                        &slot.2,
+                        &argb,
+                        &rawb,
+                        ctx,
+                    );
+                    slot.1 = na;
+                    slot.2 = nr;
+                }
+                None => out.push((hb, argb, rawb)),
+            }
+        }
+        Self::mode_set_value(out, ctx)
+    }
+
+    /// One same-head element composition inside
+    /// [`mode_sets_compose`] — returns the composed `(arg, raw)`.
+    ///
+    /// PL-0004 G0: identical elements of a *non-compositional*
+    /// declared algebra compose to themselves — set-union
+    /// idempotence (`{H} ⋄ {H} = {H}`) — keeping bare-head effect
+    /// elements (unit payload) off the `Val`-descriptor bridge.
+    /// Compositional algebras (`compose`/`order` declared, e.g.
+    /// `Cost`) still compose payloads: `Cost(3) ⋄ Cost(3) = 6`.
+    ///
+    /// Every other pair — and bare modes — crosses the `Val`
+    /// -descriptor bridge (PL-0004 E3; the gap E2 flagged): the
+    /// `(head, arg, raw)` triples mint `Former{type.mode}`
+    /// descriptors, [`Checker::mode_compose_vals`] composes them
+    /// under the governing `mode.algebra.*` (canonical default:
+    /// numeric add / record-row union / equality), and the composite
+    /// quotes back — unsolved domain metas re-mint as tagged
+    /// `__meta__`s ([`quote_domain_metas`]) so the honest bound stays
+    /// a unifiable metavariable.
+    fn compose_mode_element(
+        &self,
+        head: Option<&str>,
+        a_arg: &Value,
+        a_raw: &Value,
+        b_arg: &Value,
+        b_raw: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> (Value, Value) {
+        if let Some(h) = head
+            && a_arg == b_arg
+            && a_raw == b_raw
+            && ctx
+                .vcheck
+                .algebra_effects
+                .get(h)
+                .is_some_and(|d| !d.compositional)
+        {
+            return (a_arg.clone(), a_raw.clone());
+        }
+        // Lift both sides into the `Val` domain (tagged `__meta__`
+        // leaves remap to fresh domain metas), compose the
+        // descriptors, quote the composite back.
+        let la_arg = domain_lift(a_arg, ctx);
+        let la_raw = domain_lift(a_raw, ctx);
+        let lb_arg = domain_lift(b_arg, ctx);
+        let lb_raw = domain_lift(b_raw, ctx);
+        let da = ctx.vcheck.mode_desc(head, la_arg, la_raw);
+        let db = ctx.vcheck.mode_desc(head, lb_arg, lb_raw);
+        let dc = ctx.vcheck.mode_compose_vals(&da, &db);
+        let (_h, ca, cr) = ctx.vcheck.mode_descriptor_parts(&dc);
+        let qa = domain_quote(&ca, ctx);
+        let qr = domain_quote(&cr, ctx);
+        let mut mmap = HashMap::new();
+        (
+            quote_domain_metas(&qa, &mut mmap, ctx),
+            quote_domain_metas(&qr, &mut mmap, ctx),
+        )
+    }
+
+    /// Effect widening at an `@ μ` ascription (PL-0004 G1 — the
+    /// ambient-mode site of set-inclusion subsumption;
+    /// design/effects-ambient-modes.md v2 §3 "widening" /
+    /// `check_mode_heads_subsumption` made authoritative): the judged
+    /// term's own mode `actual` must be usable where `expected` is
+    /// ascribed — every *named* head `actual` holds must appear in
+    /// `expected` (`{PutStr} ≤ {PutStr, ReadFile}`;
+    /// `{PutStr, ReadFile} ≰ {PutStr}`). Same-head payloads
+    /// (`Raise(Nat)`-style parameters, `Cost(3)`-style grades)
+    /// unify — a decided mismatch warns + passes (the honest bound;
+    /// a compositional head's `order` has no `Value`-domain
+    /// interpreter yet, so payload order is the same honest bound —
+    /// G3/model parity owns a real `order` bridge).
+    ///
+    /// PL-0004 E3 mode metavariables: payload metas on either side
+    /// instantiate through `dep_unify` (`?s := {…}` — the
+    /// substitution a polymorphic ascription performs at the use
+    /// site). A *head-less* element on either side — a bare mode
+    /// (`@ m`, `@ [3]`) or a mode metavariable the set cannot
+    /// enumerate — makes the head set undecidable: the check passes
+    /// (the honest bound), never rejects.
+    pub(crate) fn check_mode_subsumption(
+        &self,
+        actual: &Value,
+        expected: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Result<(), LangError> {
+        /// The `(head, payload)` pairs of a mode set's named elements.
+        /// `None` when any element is head-less — a bare mode or mode
+        /// metavariable the set cannot enumerate.
+        fn heads_of(mu: &Value) -> Option<Vec<(String, Value)>> {
+            let els = mu.get("modes")?.as_array()?;
+            let mut out = Vec::new();
+            for el in els {
+                let h = el.get("head").and_then(Value::as_str)?;
+                out.push((h.to_string(), el.get("arg").cloned().unwrap_or(Value::Null)));
+            }
+            Some(out)
+        }
+        let (Some(a_heads), Some(e_heads)) = (heads_of(actual), heads_of(expected)) else {
+            return Ok(());
+        };
+        for (h, a_arg) in &a_heads {
+            match e_heads.iter().find(|(eh, _)| eh == h) {
+                None => {
+                    return Err(LangError::engine(format!(
+                        "typecheck: ambient mode subsumption: effect head `{h}` is not permitted by the ascription's mode set"
+                    )));
+                }
+                Some((_, e_arg)) => {
+                    let mark = ctx.store_mark();
+                    if self.dep_unify(a_arg, e_arg, ctx).is_err() {
+                        ctx.store_restore(mark);
+                        ctx.diagnostics.push(TypecheckDiagnostic {
+                            severity: "warning".to_string(),
+                            message: format!(
+                                "mode subsumption: head `{h}`'s payloads do not unify — passing (honest bound)"
+                            ),
+                            span: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `A ~[G]~> B` — a graded arrow is a 1-cell with a grade annotation
-    /// (graded-arrows.md §4 P1): the emitted former is `Hom(1, src, tgt)`
-    /// — the grade never enters the `type.hom` index (ADR-0153 §6) — and
-    /// the grade child still synthesizes so names resolve and
-    /// diagnostics fire (well-formedness only; grade constraint
-    /// enforcement is deferred).
+    /// (graded-arrows.md §4 P1): the emitted former is
+    /// `Hom(1, src, tgt, mode)` — the mode descriptor rides the
+    /// optional 4th `type.hom` index (pl-0002 M2; conversion strips
+    /// it until M3 subsumption) — and the grade child still
+    /// synthesizes so names resolve and diagnostics fire
+    /// (well-formedness only; grade constraint enforcement is
+    /// deferred).
     pub(crate) fn synth_graded_arrow_judgment(
         &self,
         lang: &Language,
@@ -9369,11 +11402,13 @@ impl NbeTypecheckEngine {
         })(ctx);
         ctx.restore(law_mark);
         let (src, tgt) = judged?;
-        // A graded arrow is a 1-cell: `Hom(1, src, tgt)`.
+        // A graded arrow is a 1-cell: `Hom(1, src, tgt, mode)` — the
+        // mode descriptor rides the optional 4th index (pl-0002 M2).
+        let mode = self.mode_descriptor(lang, ast, grade_idx, ctx)?;
         let dim_v = Val::Const(TaggedValue::Int(1));
         let va = domain_lift(&src, ctx);
         let vb = domain_lift(&tgt, ctx);
-        Ok(hom_former(dim_v, va, vb, ctx))
+        Ok(hom_former_mode(dim_v, va, vb, Some(mode), ctx))
     }
 
     /// Bind the free `var`s of a `~[N]~>` law endpoint to fresh metas —
@@ -9425,6 +11460,7 @@ impl NbeTypecheckEngine {
         lang: &Language,
         ast: &Ast,
         node: &AstNode,
+        flow_idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
         let kids =
@@ -9442,6 +11478,23 @@ impl NbeTypecheckEngine {
             as usize;
         let f_ty = self.synth_node(lang, ast, AstRef::new(f_idx), ctx)?;
         let g_ty = self.synth_node(lang, ast, AstRef::new(g_idx), ctx)?;
+        // PL-0004 E2: `>>>` computes the ambient-mode rows — the
+        // operands' judgement modes compose through the `Effects`
+        // algebra (`{puts} ⋄ {fs} = {puts,fs}`); the composite is
+        // recorded on the node so a binding/`handle`/ascription reads
+        // it back via `mode_of_node`. An operand with no recorded
+        // mode composes as the algebra unit (its known side passes
+        // through — the honest bound for un-annotated code).
+        let ma = self.mode_of_node(ast, f_idx, ctx);
+        let mb = self.mode_of_node(ast, g_idx, ctx);
+        let composed = match (ma, mb) {
+            (None, None) => None,
+            (Some(m), None) | (None, Some(m)) => Some(m),
+            (Some(a), Some(b)) => Some(self.mode_sets_compose(&a, &b, ctx)),
+        };
+        if let Some(mu) = composed {
+            ctx.node_modes.insert(flow_idx, mu);
+        }
         self.flow_of(&f_ty, &g_ty, ctx)
     }
 
@@ -9617,7 +11670,11 @@ impl NbeTypecheckEngine {
                     .max()
                     .map(|m| Val::Const(TaggedValue::Int(m as i64)))
                     .unwrap_or_else(|| dim_meta(ctx));
-                Ok(hom_former(d, va, vb, ctx))
+                // The unchecked store still carries the composed mode
+                // (pl-0002 M2) — operands' descriptors paste through
+                // the same `mode.algebra.*` data.
+                let mode = ctx.vcheck.compose_cell_modes(&va, &vb);
+                Ok(hom_former_mode(d, va, vb, mode, ctx))
             }
         }
     }
@@ -9731,16 +11788,17 @@ impl NbeTypecheckEngine {
         is_perform && ctx.lookup_gamma("perform").is_none() && !ctx.results.contains_key("perform")
     }
 
-    /// `perform(op, arg)` — synthesize `IO{op: T}` (ADR-0153 §4). `op` is
+    /// `perform(op, arg)` — synthesize the op's result type
+    /// (ADR-0153 §4; PL-0004 G1/G2 granular-authoritative). `op` is
     /// a *named* op: a `var` reads as the op *name* (at runtime an
     /// unbound var evaluates to its name string; `puts` is deliberately
     /// never checked as a value), a string literal reads directly, and
-    /// `sym("name")`/`sym.seeded("name")` reads its seed. `T` is `arg`'s
-    /// synthesized type (`type.unit` when the arg is omitted). The
-    /// result is canonical `Former{type.io}` data — the same spelling
-    /// `dep_synth_call_type`'s `IO(sig)` arm emits — so `handle`'s
-    /// `handle_sig_check` and sig record-width subtyping read it
-    /// unchanged.
+    /// `sym("name")`/`sym.seeded("name")` reads its seed. When `op`
+    /// names a declared effect algebra with an `op : A ~> B` field
+    /// and the head sits in the ambient mode set, `arg` checks
+    /// against `A` and the result is `B`; every other op name is the
+    /// honest bound — warn + a fresh type meta (G2 retired the
+    /// `IO{op:T}` codomain mint).
     fn synth_perform(
         &self,
         lang: &Language,
@@ -9803,6 +11861,9 @@ impl NbeTypecheckEngine {
                     .to_string(),
             ));
         };
+        // The argument is synthesized up front (its own
+        // checks/diagnostics run); the granular `op`-field arms consume
+        // its type, the honest bound below discards it.
         let arg_ty = match kids.get(2).and_then(Value::as_u64) {
             Some(i) => self.synth_node(lang, ast, AstRef::new(i as usize), ctx)?,
             None => {
@@ -9810,28 +11871,88 @@ impl NbeTypecheckEngine {
                 make_tag(ctx, "type.unit", std::mem::take(&mut m))
             }
         };
-        let mut sig = Map::new();
-        sig.insert(op_name, arg_ty);
-        let vs = domain_lift(&Value::Object(sig), ctx);
-        Ok(domain_quote(
-            &Val::Former {
-                head: checker::type_sym("type.io"),
-                args: vec![vs],
-            },
-            ctx,
-        ))
+        // PL-0004 G1/G2: ambient `perform` is *granular-authoritative*
+        // (design/effects-ambient-modes.md v2 §3): `perform(Head, arg)`
+        // where `Head` is a declared effect algebra whose `op : A ~> B`
+        // signature is on record resolves domain/codomain from `op`,
+        // and `Head` MUST sit in the ambient mode set — absent is a
+        // hard rejection ("effect head X is not permitted"). G2 retires
+        // the legacy `IO{op:T}` codomain mint: an op name with no
+        // declared `op` field cannot be checked against the mode set,
+        // so the honest bound is warn + a fresh type meta — it
+        // unifies with whatever the context expects and mints no `IO`
+        // data (with or without an ambient mode).
+        if let Some(mu) = ctx.ambient_mode.clone() {
+            if let Some(op_sig) = ctx
+                .vcheck
+                .algebra_effects
+                .get(&op_name)
+                .and_then(|d| d.op.clone())
+            {
+                if !Self::mode_set_has_head(&mu, &op_name) {
+                    return Err(LangError::engine(format!(
+                        "typecheck: perform: effect head `{op_name}` is not permitted by the ambient mode set"
+                    )));
+                }
+                let entry = self.zonk(&op_sig, ctx);
+                if tag_of(&entry) == Some("type.function") {
+                    // `op : A ~> B` — check the argument against the
+                    // declared domain, yield the codomain.
+                    let dom = entry.get("param").cloned().unwrap_or(Value::Null);
+                    let cod = entry.get("body").cloned().unwrap_or(Value::Null);
+                    self.dep_unify(&arg_ty, &dom, ctx).map_err(|e| {
+                        LangError::engine(format!(
+                            "typecheck: perform: argument does not match op `{op_name}`'s domain: {e}"
+                        ))
+                    })?;
+                    ctx.performed_effects.push((op_name.clone(), entry.clone()));
+                    return Ok(self.zonk(&cod, ctx));
+                }
+                // Non-arrow `op` — the honest bound: the signature
+                // reads as both domain and codomain.
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message: format!(
+                        "perform: op `{op_name}`'s `op` field is not an arrow type `A ~> B` — treating it as domain and codomain (honest bound)"
+                    ),
+                    span: op_node.span,
+                });
+                self.dep_unify(&arg_ty, &entry, ctx).map_err(|e| {
+                    LangError::engine(format!(
+                        "typecheck: perform: argument does not match op `{op_name}`'s signature: {e}"
+                    ))
+                })?;
+                ctx.performed_effects.push((op_name.clone(), entry.clone()));
+                return Ok(entry);
+            }
+            // No declared `op` for this name — it cannot be a member
+            // of the granular mode set; fall through to the honest
+            // bound below (G2 removed the `IO` mint with the corpus
+            // migration).
+        }
+        // The honest bound (PL-0004 G2): the op is undeclared, so its
+        // request/codomain types are unknowable — warn and return a
+        // fresh type meta (unifies with the expected type; no `IO`
+        // codomain data is minted). The argument was still
+        // synthesized above, so errors inside it surface normally.
+        ctx.diagnostics.push(TypecheckDiagnostic {
+            severity: "warning".to_string(),
+            message: format!(
+                "perform: op `{op_name}` is not a declared effect algebra — bound to a fresh meta (honest bound)"
+            ),
+            span: op_node.span,
+        });
+        Ok(meta_value(ctx.fresh_meta()))
     }
 
     /// `check_call` — the directed `call` check (the `type.call` `check`
     /// scheme, lifted to a judgment so `perform` can intercept). For a
     /// `perform(op, arg)` call the generic scheme cannot see that `op`
     /// is a *name* — checking it as a value reports an unbound `puts` —
-    /// so the call is synthesized (`synth_call`'s `synth_perform` branch
-    /// mints `IO{op: T}`) and unified against the expected type — record
-    /// -width sig subtyping included (`IO{puts: Str}` accepts an
-    /// `IO{puts, fs}` expectation). Every other call reproduces the
-    /// former scheme verbatim: synth the callee, check the first
-    /// argument against its `param`, yield `body`.
+    /// so the call is synthesized (`synth_call`'s `synth_perform` branch)
+    /// and unified against the expected type. Every other call
+    /// reproduces the former scheme verbatim: synth the callee, check
+    /// the first argument against its `param`, yield `body`.
     pub(crate) fn check_call_judgment(
         &self,
         lang: &Language,
@@ -9955,12 +12076,13 @@ impl NbeTypecheckEngine {
             .as_u64()
             .ok_or_else(|| LangError::engine("call: callee index not a u64".to_string()))?
             as usize;
-        // `perform` — the `IO<sig>` op-emission builtin (ADR-0153 §4):
-        // `perform(op, arg)` synthesizes `IO{op: T}` — `op` is a *named*
-        // op (a name operand, not a checked value) and `T` the arg's
-        // type. The name-keyed callee dispatch mirrors
-        // `dep_synth_call_type`'s `IO`/`Pi`/`Family` table — the scheme
-        // vocabulary cannot compute a sig record from an op name.
+        // `perform` — the op-emission builtin (ADR-0153 §4; PL-0004
+        // G1/G2 granular): `perform(op, arg)` resolves the op's
+        // `A ~> B` signature from its declared effect algebra — `op`
+        // is a *named* op (a name operand, not a checked value).
+        // The name-keyed callee dispatch mirrors
+        // `dep_synth_call_type`'s `Pi`/`Family` table — the scheme
+        // vocabulary cannot compute an op signature from an op name.
         if self.is_perform_call(ast, node, ctx) {
             return self.synth_perform(lang, ast, node, kids, ctx);
         }
@@ -10296,43 +12418,29 @@ impl NbeTypecheckEngine {
         }
     }
 
-    /// `synth_handle` — `handle <body> with <h>` typed-effect handler
-    /// typing (phase-2 WS-F; ADR-0153 §4 "effects are objects in the
-    /// codomain").
+    /// `synth_handle` — `handle <body> with <h>` ambient-mode handler
+    /// typing (PL-0004 G2; design/effects-ambient-modes.md v2 §3): the
+    /// body type passes through unchanged — the `IO(S)` codomain
+    /// rewrite (`handle_sig_check`/`effects_residual_row`) is retired
+    /// with the `type.io` former — and [`Self::ambient_handle_modality`]
+    /// owns the mode residual `μ → μ′` recorded on the node.
     ///
-    /// The body's `IO(S)` former has its op set checked against `h`'s
-    /// declared impls, and the result re-wraps as `IO(S')` mirroring the
-    /// runtime's interpret-in-place semantics ([`exec-tree-walk`]
-    /// `interpret_io_former`): each covered entry's declared type is
-    /// replaced by the impl's declared *return* type (the op is
-    /// interpreted, its result is data); each uncovered entry keeps its
-    /// declared signature (the op stays `IO` data for an outer handler
-    /// or user destructuring). The residual sig is therefore
-    /// `S'` = `(S \ S_h) ∪ {op: ret_ty}` — the spec's
-    /// `IO(S \ S_h) × results` shape.
-    ///
-    /// Coverage rules:
-    /// - `h`'s op names are its record fields (`type.record{fields}`).
-    ///   A covered impl `h_k : dom ~> ret` must accept the op's declared
-    ///   sig entry — `S[k] <: dom` — and `ret` is the result type.
-    /// - An impl `h` declares for an op `S` never names → diagnostic
-    ///   (spurious — the impl can never fire).
-    /// - `S` non-empty with `h` covering none of it → diagnostic (the
-    ///   `handle` is a guaranteed no-op — almost certainly a bug).
-    /// - `h` op-untyped (meta / `type.Obj` / `type.unknown`) or `S`
-    ///   symbolic (a sig meta/var — row-polymorphic `IO(s)`) → the
-    ///   check is undecidable → pass through unchanged (honest bound).
-    /// - `body`'s type is `A ~> IO(S)` (a `type.function` whose codomain
-    ///   is an `IO` former) — the deep-handler case (`handle f with h`
-    ///   binds the handled arrow, runtime `attach_carried_handler`):
-    ///   the codomain's sig is checked the same way, producing
-    ///   `A ~> IO(S')`. A `type.pi` codomain (a closure) can't rewrite
-    ///   statically → passthrough.
+    /// The ops the handled computation performs are journaled by
+    /// `perform` while the target synthesizes (`eff_mark..`), split
+    /// from the handler impl's own performs (`impl_eff_mark..` =
+    /// `μ_handler`, design §4.2); the target's own judgement mode
+    /// (`>>>`-composed, ascribed, or binding-carried —
+    /// [`mode_of_node`]) joins them as the handled set. Coverage
+    /// (spurious impls / guaranteed no-op / impl-domain rejection) and
+    /// the requires-closed residual `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler`
+    /// are computed element-wise over mode *heads* — the same three
+    /// diagnostic classes the retired `IO(S)` path emitted.
     pub(crate) fn synth_handle_judgment(
         &self,
         lang: &Language,
         ast: &Ast,
         node: &AstNode,
+        handle_idx: usize,
         ctx: &mut TypecheckContext,
     ) -> Result<Value, LangError> {
         let target_idx = role_child_ref(lang, node, "target")
@@ -10341,7 +12449,20 @@ impl NbeTypecheckEngine {
         let impl_idx = role_child_ref(lang, node, "impl")
             .or_else(|| child_at(ast, node, 1))
             .ok_or_else(|| LangError::engine("handle: missing impl child".to_string()))?;
+        // PL-0004 E2/G1: mark the effects journal before the target's
+        // synthesis — the ops `perform`ed inside it are the handled
+        // computation's used-effect set; a second mark after the
+        // target splits the handler impl's own performs (`μ_handler`,
+        // design §4.2) from the handled computation's.
+        let eff_mark = ctx.performed_effects.len();
         let t_body = self.synth_node(lang, ast, target_idx, ctx)?;
+        let impl_eff_mark = ctx.performed_effects.len();
+        let used_effects: Vec<(String, Value)> =
+            ctx.performed_effects[eff_mark..impl_eff_mark].to_vec();
+        // The target's own judgement mode (`>>>`-composed, ascribed,
+        // or binding-carried) — resolved before the impl synthesis so
+        // `ambient_handle_modality` needs no AST access.
+        let target_mode = self.mode_of_node(ast, target_idx.index(), ctx);
         let t_impl = self.synth_node(lang, ast, impl_idx, ctx)?;
         // ADR-0158 `acc` clause: `handle f with h acc s0` — the optional
         // trailing child is the accumulator seed; synthesize it (for
@@ -10349,138 +12470,202 @@ impl NbeTypecheckEngine {
         if let Some(acc_idx) = role_child_ref(lang, node, "acc") {
             let _t_acc = self.synth_node(lang, ast, acc_idx, ctx)?;
         }
-        self.handle_result_type(&t_body, &t_impl, ctx)
+        // PL-0004 G2: the body's type passes through unchanged — the
+        // `IO(S)` codomain rewrite is retired with the `type.io`
+        // former; the ambient modality `μ → μ′` below owns the mode
+        // residual (the `@ [..]` spelling records it on `node_modes`).
+        self.ambient_handle_modality(
+            target_mode,
+            &used_effects,
+            (eff_mark, impl_eff_mark),
+            &t_impl,
+            handle_idx,
+            ctx,
+        )?;
+        Ok(t_body)
     }
 
-    /// The `IO(S')` result of `handle` given the body's and handler's
-    /// types — see [`Self::synth_handle_judgment`] for the coverage
-    /// rules.
-    fn handle_result_type(
+    /// The ambient-mode half of `handle` (PL-0004 G1; design/effects-
+    /// ambient-modes.md v2 §3/§4.2): `handle m with h` as a modality
+    /// `μ → μ′` over mode *elements*. The handled computation's op set
+    /// is its own judgement mode's effect heads (`>>>`-composed,
+    /// ascribed, or binding-carried — [`mode_of_node`]) unioned with
+    /// the ops literally `perform`ed while synthesizing the target;
+    /// the handler impl's own performs (`handler_mark..` of the
+    /// journal) are `μ_handler`. Coverage and the residual
+    /// `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler` run element-wise — the three
+    /// diagnostic classes `handle` emits:
+    ///
+    /// - Spurious impls — `h` declares ops the handled set never
+    ///   names → error.
+    /// - Handled ops non-empty with `h` covering none → error (the
+    ///   `handle` is a guaranteed no-op).
+    /// - A covered impl `h_k : dom ~> ret` whose domain rejects the
+    ///   op's declared domain → error.
+    ///
+    /// A handled head does not vanish: its element's payload re-keys
+    /// to the impl's return type (`op ↦ ret`), so a deep handler can
+    /// re-perform it and an outer handler still sees it. The residual
+    /// set is recorded on the handle node (`node_modes`) so a binding
+    /// inherits it, requires-closed like every elaborated mode set,
+    /// and the effects journal is rewritten to the residual so an
+    /// outer `handle` sees exactly the surviving ops. A head-less
+    /// (symbolic) mode element, a non-record handler, or an empty
+    /// effects context is the honest bound — passthrough.
+    /// `marks` is `(eff_mark, handler_mark)` — the journal offsets
+    /// bracketing the target's synthesis and the impl's synthesis.
+    fn ambient_handle_modality(
         &self,
-        t_body: &Value,
+        target_mode: Option<Value>,
+        used_effects: &[(String, Value)],
+        marks: (usize, usize),
         t_impl: &Value,
+        handle_idx: usize,
         ctx: &mut TypecheckContext,
-    ) -> Result<Value, LangError> {
-        let tb = self.zonk(t_body, ctx);
-        if io_headed(&tb) {
-            return self.handle_sig_check(&tb, t_impl, ctx);
-        }
-        if tag_of(&tb) == Some("type.function") {
-            let body = self.zonk(&tb.get("body").cloned().unwrap_or(Value::Null), ctx);
-            if io_headed(&body) {
-                let residual = self.handle_sig_check(&body, t_impl, ctx)?;
-                let mut out = tb.as_object().cloned().unwrap_or_default();
-                out.insert("body".to_string(), residual);
-                return Ok(Value::Object(out));
+    ) -> Result<(), LangError> {
+        let (eff_mark, handler_mark) = marks;
+        // The handled computation's op set: `(name, request)` where
+        // `request` is the op signature `A ~> B` (journaled `perform`
+        // entries) or the head's declared `op` (ascribed heads that
+        // were never literally performed). Only heads with a declared
+        // `op` — plus literally performed ops — are handleable; bare
+        // algebra heads (`Cost(3)`, unknown heads, legacy `Effects`)
+        // are modes, not ops.
+        let mut ops: Vec<(String, Value)> = Vec::new();
+        for (name, entry) in used_effects {
+            if !ops.iter().any(|(n, _)| n == name) {
+                ops.push((name.clone(), entry.clone()));
             }
         }
-        Ok(tb)
-    }
-
-    /// Compute `IO(S')` for an `IO(S)`-headed value and a handler type —
-    /// the coverage check itself.
-    fn handle_sig_check(
-        &self,
-        io_val: &Value,
-        t_impl: &Value,
-        ctx: &mut TypecheckContext,
-    ) -> Result<Value, LangError> {
-        // The sig record — `{"__former__": {…, "args": [sig]}}` (the
-        // `dep_synth_type`/`quote` spelling) or the runtime-style
-        // `{"indices": [sig]}` mint (`type.IO` in lib-type).
-        let sig = io_val
-            .get("__former__")
-            .and_then(|f| f.get("args"))
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .or_else(|| {
-                io_val
-                    .get("indices")
-                    .and_then(|a| a.as_array())
-                    .and_then(|a| a.first())
+        if let Some(m) = &target_mode {
+            // A head-less element (bare mode / mode metavariable)
+            // makes the handled set unenumerable — honest bound.
+            let els = m.get("modes").and_then(Value::as_array);
+            if els.is_some_and(|els| {
+                els.iter()
+                    .any(|el| el.get("head").is_none_or(Value::is_null))
+            }) {
+                return Ok(());
+            }
+            for el in els.into_iter().flatten() {
+                let Some(h) = el.get("head").and_then(Value::as_str) else {
+                    continue;
+                };
+                if ops.iter().any(|(n, _)| n == h) {
+                    continue;
+                }
+                // Handleable = declared `op` signature, else an
+                // arrow-typed payload standing in as the request
+                // (`name : A ~> B` elements). Bare algebra heads
+                // (`Cost(3)`, unknown heads, legacy `Effects` rows)
+                // are modes, not ops — they stay out of the coverage
+                // set.
+                let req = ctx
+                    .vcheck
+                    .algebra_effects
+                    .get(h)
+                    .and_then(|d| d.op.clone())
+                    .or_else(|| {
+                        let arg = el.get("arg").cloned().unwrap_or(Value::Null);
+                        (tag_of(&arg) == Some("type.function")).then_some(arg)
+                    });
+                if let Some(req) = req {
+                    ops.push((h.to_string(), req));
+                }
+            }
+        }
+        let handler_effects: Vec<(String, Value)> = ctx.performed_effects[handler_mark..].to_vec();
+        let has_context = !ops.is_empty()
+            || !handler_effects.is_empty()
+            || target_mode.as_ref().is_some_and(|m| {
+                m.get("modes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
             })
-            .cloned()
-            .unwrap_or(Value::Null);
-        let sig = self.zonk(&sig, ctx);
-        let Some(sig_obj) = sig.as_object() else {
-            // `IO(⊤)` (arity-0, any sig) or a symbolic sig (a row
-            // meta/var `IO(s)` — coverage is undecidable at this use;
-            // solving happens at the arrow's call site).
-            return Ok(io_val.clone());
+            || ctx.ambient_mode.as_ref().is_some_and(|m| {
+                m.get("modes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            });
+        if !has_context {
+            // No effects context at all — the handled computation is
+            // pure; the journaled entries (if any) stay.
+            return Ok(());
+        }
+        let Some(fields) = self.handler_op_fields(t_impl, ctx) else {
+            // `type.Obj` / meta / unknown handler — op set unknowable;
+            // passthrough (honest bound).
+            return Ok(());
         };
-        // The handler's declared op set — `type.record{fields}`.
-        let ti = self.zonk(t_impl, ctx);
-        let fields = if tag_of(&ti) == Some("type.record") {
-            // ADR-0158: `return` is the handler's unit clause and
-            // `__*__` keys are reserved slots (`__acc__`, …) — neither
-            // is an op impl, so both drop out of coverage/spurious
-            // accounting.
-            ti.get("fields")
-                .and_then(Value::as_object)
-                .cloned()
-                .map(|f| {
-                    f.into_iter()
-                        .filter(|(k, _)| k != "return" && !k.starts_with("__"))
-                        .collect::<Map<String, Value>>()
-                })
-        } else {
-            None
-        };
-        let Some(fields) = fields else {
-            // `type.Obj` / meta / unknown handler — its op set is
-            // unknowable statically; the runtime still dispatches by
-            // name. Passthrough (honest bound).
-            return Ok(io_val.clone());
-        };
-        // Spurious impls — `h` declares ops the body can never perform.
-        let spurious: Vec<&String> = fields
-            .keys()
-            .filter(|k| !sig_obj.contains_key(*k))
+        // Coverage, keyed on op names — vacuous when the handled
+        // computation names no granular ops (a pure target, or a body
+        // whose effects never reach the mode set): the modality stays
+        // the honest bound and only unions `μ_handler` into the
+        // residual.
+        let op_names: Vec<&String> = ops.iter().map(|(n, _)| n).collect();
+        if !ops.is_empty() {
+            let spurious: Vec<&String> = fields.keys().filter(|k| !op_names.contains(k)).collect();
+            if !spurious.is_empty() {
+                return Err(LangError::engine(format!(
+                    "typecheck: handle: handler declares impls for ops the body's mode never names: {}",
+                    spurious
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        let covered: Vec<&String> = op_names
+            .iter()
+            .filter(|k| fields.contains_key(**k))
+            .copied()
             .collect();
-        if !spurious.is_empty() {
+        if !ops.is_empty() && covered.is_empty() {
             return Err(LangError::engine(format!(
-                "typecheck: handle: handler declares impls for ops the body's sig never names: {}",
-                spurious
+                "typecheck: handle: handler covers none of the body's declared ops ({}) — the handle is a guaranteed no-op",
+                op_names
                     .iter()
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
         }
-        let covered: Vec<&String> = sig_obj.keys().filter(|k| fields.contains_key(*k)).collect();
-        if !sig_obj.is_empty() && covered.is_empty() {
-            return Err(LangError::engine(format!(
-                "typecheck: handle: handler covers none of the body's declared ops ({}) — the handle is a guaranteed no-op",
-                sig_obj.keys().cloned().collect::<Vec<_>>().join(", ")
-            )));
-        }
-        let mut out_sig = Map::new();
-        for (k, req) in sig_obj.iter() {
-            match fields.get(k) {
+        // Residual `μ′`: base = ambient (else the handled
+        // computation's) mode; every handled op re-keys to its impl's
+        // return type (`op ↦ ret`) or stays verbatim when uncovered;
+        // `μ_handler` heads union in. `ret`/`req` per op are computed
+        // once and shared between the elements and the journal.
+        let mut residual_kv: Vec<(String, Value)> = Vec::new();
+        let mut elements = ctx
+            .ambient_mode
+            .clone()
+            .or_else(|| target_mode.clone())
+            .map(|m| Self::mode_set_elements(&m))
+            .unwrap_or_default();
+        for (name, req) in &ops {
+            match fields.get(name) {
                 Some(it) => {
-                    // Covered — interpret in place: the entry's declared
-                    // type becomes the impl's declared return type.
+                    // Covered — the impl domain must accept the op's
+                    // declared *domain* `A` (what `perform` feeds it).
                     let it = self.zonk(it, ctx);
+                    let req_check = if tag_of(req) == Some("type.function") {
+                        req.get("param").cloned().unwrap_or_else(|| req.clone())
+                    } else {
+                        req.clone()
+                    };
                     let ret = if tag_of(&it) == Some("type.function") {
                         let dom = it.get("param").cloned().unwrap_or(Value::Null);
-                        // `dispatch_op` feeds the sig entry's *value* to
-                        // the impl — its domain must accept the declared
-                        // sig entry.
-                        if tag_of(req) == Some("type.unknown") {
-                            // `IO<{ puts }>`-style unstated requests: skip
-                            // the domain check, and an unsolved return
-                            // meta defaults to the request (a shared
-                            // `?m` inside the sig object can't solve in
-                            // `conv` — Const compares structurally).
+                        if req_check == Value::Null || tag_of(&req_check) == Some("type.unknown") {
                             let body = it.get("body").cloned().unwrap_or(Value::Null);
                             if let Some(id) = extract_meta_id(&body) {
-                                ctx.solve_meta(id, req.clone());
+                                ctx.solve_meta(id, req_check.clone());
                             }
                             self.zonk(&body, ctx)
                         } else {
-                            self.check_subtype(req, &dom, ctx).map_err(|_| {
+                            self.check_subtype(&req_check, &dom, ctx).map_err(|_| {
                                 LangError::engine(format!(
-                                    "typecheck: handle: impl '{k}' domain does not accept the op's declared signature"
+                                    "typecheck: handle: impl '{name}' domain does not accept the op's declared signature"
                                 ))
                             })?;
                             it.get("body").cloned().unwrap_or(Value::Null)
@@ -10489,29 +12674,144 @@ impl NbeTypecheckEngine {
                         // A non-arrow impl produces its declared type.
                         it
                     };
-                    out_sig.insert(k.clone(), ret);
+                    residual_kv.push((name.clone(), ret.clone()));
+                    // `op ↦ ret` — re-key the head's payload to the
+                    // return type, in place when the base set already
+                    // holds the head.
+                    let raw = app_term(var_term(name), vec![ret.clone()]);
+                    match elements
+                        .iter_mut()
+                        .find(|(h, _, _)| h.as_deref() == Some(name))
+                    {
+                        Some(slot) => {
+                            slot.1 = ret;
+                            slot.2 = raw;
+                        }
+                        None => elements.push((Some(name.clone()), ret, raw)),
+                    }
                 }
                 None => {
-                    // Uncovered — the op request stays (still `IO` data
-                    // for an outer handler).
-                    out_sig.insert(k.clone(), req.clone());
+                    // Uncovered — the op request stays verbatim: the
+                    // base element when present, else a bare-head
+                    // element carrying the op signature as payload.
+                    residual_kv.push((name.clone(), req.clone()));
+                    if !elements.iter().any(|(h, _, _)| h.as_deref() == Some(name)) {
+                        let arg = if req == &Value::Null {
+                            Value::Null
+                        } else {
+                            req.clone()
+                        };
+                        let raw = if arg == Value::Null {
+                            var_term(name)
+                        } else {
+                            app_term(var_term(name), vec![arg.clone()])
+                        };
+                        elements.push((Some(name.clone()), arg, raw));
+                    }
                 }
             }
         }
-        // Re-wrap in the body's own spelling.
-        let mut out = io_val.as_object().cloned().unwrap_or_default();
-        if let Some(f) = out.get_mut("__former__").and_then(Value::as_object_mut) {
-            if let Some(args) = f.get_mut("args").and_then(Value::as_array_mut)
-                && let Some(slot) = args.first_mut()
-            {
-                *slot = Value::Object(out_sig);
+        // `μ_handler` — ops the handler impl itself performs union
+        // into the residual (design §4.2); names already present keep
+        // their (possibly re-keyed) element — set union is
+        // idempotent.
+        for (name, entry) in &handler_effects {
+            // A handler re-performing an op it also handles leaves the
+            // `op ↦ ret` element as the surviving request — don't
+            // double-journal the name.
+            if ops.iter().any(|(n, _)| n == name) {
+                continue;
             }
-        } else if let Some(indices) = out.get_mut("indices").and_then(Value::as_array_mut)
-            && let Some(slot) = indices.first_mut()
-        {
-            *slot = Value::Object(out_sig);
+            residual_kv.push((name.clone(), entry.clone()));
+            if !elements.iter().any(|(h, _, _)| h.as_deref() == Some(name)) {
+                elements.push((
+                    Some(name.clone()),
+                    entry.clone(),
+                    app_term(var_term(name), vec![entry.clone()]),
+                ));
+            }
         }
-        Ok(Value::Object(out))
+        // Requires-closure (design §4.1/§6): the residual is a mode
+        // set like any other — handled heads' `requires` and
+        // handler-effect implications re-enter transitively.
+        let elements = Self::close_mode_elements_requires(elements, ctx);
+        let mu2 = Self::mode_set_value(elements, ctx);
+        ctx.node_modes.insert(handle_idx, mu2);
+        // The handle expression's own effects are the residual —
+        // rewrite the journal slice so an outer `handle` (or an
+        // ascription subsumption check) sees exactly the surviving
+        // `op ↦ ret` / uncovered / handler ops.
+        ctx.performed_effects.truncate(eff_mark);
+        for (k, v) in residual_kv {
+            ctx.performed_effects.push((k, v));
+        }
+        Ok(())
+    }
+
+    /// Close a `(head, arg, raw)` element list under `requires`
+    /// (PL-0004 G1; design §4.1): every named head's declared
+    /// `requires` list unions in transitively as bare-head elements —
+    /// the same closure `elaborate_mode_set_inner` applies to `@`
+    /// ascriptions. Unresolvable heads warn + pass (the honest
+    /// bound).
+    fn close_mode_elements_requires(
+        elements: Vec<(Option<String>, Value, Value)>,
+        ctx: &mut TypecheckContext,
+    ) -> Vec<(Option<String>, Value, Value)> {
+        let mut out = elements;
+        let mut heads: std::collections::HashSet<String> =
+            out.iter().filter_map(|(h, _, _)| h.clone()).collect();
+        let mut queue: Vec<String> = heads.iter().cloned().collect();
+        while let Some(h) = queue.pop() {
+            let reqs = ctx
+                .vcheck
+                .algebra_effects
+                .get(&h)
+                .map(|d| d.requires.clone())
+                .unwrap_or_default();
+            for r in reqs {
+                if heads.contains(&r) {
+                    continue;
+                }
+                if !Self::mode_head_declared(ctx, &r) {
+                    ctx.diagnostics.push(TypecheckDiagnostic {
+                        severity: "warning".to_string(),
+                        message: format!(
+                            "mode ascription: `{h}` requires unknown algebra head `{r}` — passing (honest bound)"
+                        ),
+                        span: None,
+                    });
+                    continue;
+                }
+                heads.insert(r.clone());
+                out.push((Some(r.clone()), Value::Null, var_term(&r)));
+                queue.push(r);
+            }
+        }
+        out
+    }
+
+    /// The handler's declared op impls — `type.record{fields}` minus
+    /// the `return` unit clause and `__*__` reserved slots
+    /// (ADR-0158). `None` for non-record handlers (meta / `type.Obj` /
+    /// `type.unknown`) whose op set is unknowable statically.
+    fn handler_op_fields(
+        &self,
+        t_impl: &Value,
+        ctx: &mut TypecheckContext,
+    ) -> Option<Map<String, Value>> {
+        let ti = self.zonk(t_impl, ctx);
+        if tag_of(&ti) != Some("type.record") {
+            return None;
+        }
+        ti.get("fields")
+            .and_then(Value::as_object)
+            .cloned()
+            .map(|f| {
+                f.into_iter()
+                    .filter(|(k, _)| k != "return" && !k.starts_with("__"))
+                    .collect::<Map<String, Value>>()
+            })
     }
 }
 
@@ -10535,6 +12835,7 @@ impl NbeTypecheckEngine {
     /// class of binding). Returns `(name, [(binder, sort_node?)])`
     /// where each arg is a `var` (unsorted) or
     /// `type-annot(var, sort)`; `None` for any other subject shape.
+    #[allow(clippy::type_complexity)]
     fn implicit_binder_head(
         &self,
         lang: &Language,
@@ -10786,6 +13087,32 @@ impl NbeTypecheckEngine {
                 (n, AstRef::new(vidx), None)
             }
         };
+        // `X := new T(args) { members }` — the `new` declaration form
+        // (graded-arrows.md §3): binds `X` as a mode-family former and
+        // registers the member dict as `X`'s instance. Handled whole
+        // here because the family/instance head is the assign target —
+        // a `new`-node-local judgment cannot see it.
+        if let Some(vn) = ast.get(value_ref)
+            && vn.kind == "new"
+        {
+            if ann_ref.is_some() {
+                ctx.diagnostics.push(TypecheckDiagnostic {
+                    severity: "warning".to_string(),
+                    message:
+                        "annotation ignored on `new` declaration — `X := new …` binds its own mode family"
+                            .to_string(),
+                    span: vn.span,
+                });
+            }
+            self.synth_new_decl_judgment(lang, ast, vn, &name, ctx)?;
+            let mut m = Map::new();
+            return Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)));
+        }
+        // PL-0004 E2: the binding's ambient mode — the ascribed μ when
+        // the annotation carries one, else the value node's own mode
+        // (`>>>`-composed, `handle`-residual, or var-carried); `None`
+        // records the pure marker.
+        let mut bound_mode: Option<Value> = None;
         let bound_type = if let Some(params) = alias_params {
             // The alias binds its expansion record, not a synthesized
             // type — `Name`/`Name(args)` in type position substitute
@@ -10823,8 +13150,21 @@ impl NbeTypecheckEngine {
             }
             let ann = match self
                 .dep_synth_type(lang, ast, ann_ref.index(), ctx)
-                .or_else(|_| crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry))
-            {
+                .or_else(|dep_err| {
+                    // `mode_ascribe` is `dep_synth_type`'s own node —
+                    // its errors (duplicate algebra heads, malformed
+                    // mode sets) are authoritative; the
+                    // `interpret_type_expr`/term fallbacks cannot read
+                    // the node and would mask the real diagnostic.
+                    if self
+                        .mode_ascribe_mode_child(lang, ast, ann_ref.index())
+                        .is_some()
+                    {
+                        Err(dep_err)
+                    } else {
+                        crate::interpret_type_expr(lang, ast, type_expr_node, &ctx.registry)
+                    }
+                }) {
                 // A term-valued annotation (e.g. `call` on a results-bound
                 // name — `inc(4)` lowers to `App{var inc, [4]}`) reduces
                 // against the bound-value env before classification.
@@ -10886,6 +13226,18 @@ impl NbeTypecheckEngine {
             };
             ctx.restore(binder_mark);
             ctx.results = binder_results;
+            // PL-0004 E1: `x : T @ μ := v` — the annotation's ambient
+            // mode scopes over the *value* judgement (`Γ ⊢ v : T @ μ`).
+            // `dep_synth_type` above populated `node_modes` when the
+            // annotation was a `mode_ascribe`; restore on exit so the
+            // mode never leaks past the binding. (Error paths abort the
+            // whole check, so an early `?` leaking `ambient_mode` is
+            // unreachable in a successful run.)
+            // `mode_ascription_at` unwraps `paren`s and reads the
+            // cached elaboration `dep_synth_type` recorded — `None`
+            // for ordinary annotations (pure ambient, unchanged).
+            let mode_scope = self.mode_ascription_at(lang, ast, ann_ref.index(), ctx)?;
+            let prev_mode = mode_scope.clone().map(|m| ctx.ambient_mode.replace(m));
             // An explicit `x : type.unknown = v` annotation opts the
             // binding into the dynamic lane. It typechecks (top accepts
             // everything), but the silence is worth a warning — unlike
@@ -10966,6 +13318,26 @@ impl NbeTypecheckEngine {
                 let value_type = self.synth_node(lang, ast, value_ref, ctx)?;
                 self.dep_unify(&value_type, &ann, ctx)?;
             }
+            // PL-0004 E2/G1: effect widening — the value's own ambient
+            // mode must be ≤ the ascribed μ (set inclusion over mode
+            // heads: every head the value's mode names must be
+            // permitted by the ascription's mode set). Terms with no
+            // recorded mode pass (pure/unit).
+            if let Some(mu_a) = &mode_scope
+                && let Some(mu_v) = self.mode_of_node(ast, value_ref.index(), ctx)
+            {
+                self.check_mode_subsumption(&mu_v, mu_a, ctx)?;
+            }
+            // The binding records the ascribed mode (the contract);
+            // an annotation without `@` inherits the value's own.
+            bound_mode = mode_scope
+                .clone()
+                .or_else(|| self.mode_of_node(ast, value_ref.index(), ctx));
+            // PL-0004 E1: the ascribed ambient mode's scope ends with
+            // the value judgement.
+            if let Some(p) = prev_mode {
+                ctx.ambient_mode = p;
+            }
             ann
         } else {
             // A `name<b,…>`/`name<N>` head on a bare assign scopes its
@@ -10984,9 +13356,16 @@ impl NbeTypecheckEngine {
             let ty = self.synth_node(lang, ast, value_ref, ctx);
             ctx.restore(binder_mark);
             ctx.results = binder_results;
+            // PL-0004 E2: an un-annotated binding inherits the value's
+            // ambient mode — `h := g >>> f` carries the composed row.
+            bound_mode = self.mode_of_node(ast, value_ref.index(), ctx);
             ty?
         };
         ctx.extend(name.clone(), bound_type);
+        // PL-0004 E2: record the binding's ambient mode (after `extend`
+        // so the scope stamp is correct) — `Null` marks a pure binding
+        // that shadows any outer same-named mode.
+        ctx.bind_mode(name.clone(), bound_mode);
         // ADR-0103: record the bound *term* of the value — the bound-value
         // env ordered annotations evaluate against (the model's
         // `tc_bind_result`). `var{name}` inside a call annotation resolves
@@ -11138,6 +13517,35 @@ fn freeze_metas(v: &Value, inst: usize, pos: &mut usize) -> Value {
         Value::Array(xs) => Value::Array(xs.iter().map(|x| freeze_metas(x, inst, pos)).collect()),
         _ => v.clone(),
     }
+}
+
+/// Substitute a constraint shape's schematic index vars with a
+/// `family_app`'s index args — the `ev.<field>` projection path
+/// (`record_field_type` on `type.family_app{head, args}`). `vars` is
+/// the declaration's first-appearance var order (`"<head>.shape.vars"`);
+/// `args` is the goal's index telescope, positional. Vars without a
+/// corresponding arg stay rigid; extra args are ignored (the head's
+/// declared arity already bounds the telescope).
+pub(crate) fn subst_shape_vars(v: &Value, vars: &[String], args: &[Value]) -> Value {
+    fn go(v: &Value, vars: &[String], args: &[Value]) -> Value {
+        if tag_of(v) == Some("var")
+            && let Some(name) = v.get("name").and_then(Value::as_str)
+            && let Some(i) = vars.iter().position(|n| n == name)
+            && let Some(arg) = args.get(i)
+        {
+            return arg.clone();
+        }
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .map(|(k, x)| (k.clone(), go(x, vars, args)))
+                    .collect(),
+            ),
+            Value::Array(xs) => Value::Array(xs.iter().map(|x| go(x, vars, args)).collect()),
+            _ => v.clone(),
+        }
+    }
+    go(v, vars, args)
 }
 
 /// Guard the *goal* side of an instance lookup: wrap each rigid `var`
@@ -11593,7 +14001,7 @@ impl NbeTypecheckEngine {
         f: &Value,
         args: &[Value],
         ctx: &mut TypecheckContext,
-        fuel: u32,
+        _fuel: u32,
     ) -> Result<Value, LangError> {
         // Growable-stack seam (WS-H, see `crate::STACK_RED_ZONE`).
         stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
@@ -11632,8 +14040,8 @@ impl NbeTypecheckEngine {
                 Some("CompVal") => {
                     let l = f.get("l").cloned().unwrap_or(Value::Null);
                     let r = f.get("r").cloned().unwrap_or(Value::Null);
-                    let inner = self.apply_ann_val(lang, ast, &l, args, ctx, fuel - 1)?;
-                    self.apply_ann_val(lang, ast, &r, &[inner], ctx, fuel - 1)
+                    let inner = self.apply_ann_val(lang, ast, &l, args, ctx, _fuel - 1)?;
+                    self.apply_ann_val(lang, ast, &r, &[inner], ctx, _fuel - 1)
                 }
                 _ => Ok(app_term(f.clone(), args.to_vec())),
             }

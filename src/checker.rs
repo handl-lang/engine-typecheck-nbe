@@ -24,7 +24,7 @@
 //! `DescendantOf(type.number)`/`DescendantOf(type.float)`; unresolved
 //! metas default to the constraint anchor (`default_unsolved`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use handl_value::nbe::{self, ArrowVal, Lvl, MetaConstraint, MetaId, MetaStore, Spine, Val};
@@ -122,12 +122,6 @@ pub enum FormerSig {
     /// `cell.id(k, x)` — the identity k-cell on `x` (`id_k`). Its type
     /// is `Hom(k, x, x)` — see [`Checker::infer_id`].
     Id,
-    /// `IO(sig)` — the typed-effect former (ADR-0153 §4): an `IO` type
-    /// is an effect object whose index is the op-signature record.
-    /// `IO` bare (arity 0) is `IO(⊤)` — the top signature, accepting
-    /// any. Subtyping is record-width on the sig index — see
-    /// [`Checker::subtype`].
-    Io,
 }
 
 /// Errors the `Val` checker reports.
@@ -218,6 +212,85 @@ pub struct Checker {
     /// the store (the store's entries are private; defaults need the
     /// constraint back).
     meta_constraints: Vec<MetaConstraint>,
+    /// Mode-algebra registry (`mode.algebra.*` language globals,
+    /// pl-0002 M2): full global name → `{compose, unit, order}` data.
+    /// Seeded from `lang.globals` by the `TypecheckContext` owner;
+    /// empty means every mode composition takes the honest bound.
+    pub mode_algebras: HashMap<String, serde_json::Value>,
+    /// Latched once a mode-carrying `Hom(d, s, t, m)` enters the
+    /// context — gates the mode pass in [`Checker::conv`]/
+    /// [`Checker::subtype`] (pl-0002 M2 carried the mode index; M3
+    /// enforces it: conversion requires the modes to be *compatible*
+    /// — subsumption in at least one direction — and `subtype`
+    /// requires the directed `actual ≤ expected` reading through the
+    /// governing algebra's `order` field).
+    pub mode_homs: bool,
+    /// Honest-bound warnings minted while composing modes inside the
+    /// `Val` domain — the `Checker` has no diagnostic channel, so the
+    /// `TypecheckContext` drains these into `diagnostics`.
+    pub mode_warnings: Vec<String>,
+    /// Mode-algebra heads declared by `X := new Algebra(…) {…}` in the
+    /// checked module (PL-0004 E1): the `new` declaration registers
+    /// the family/instance entry, and this set lets `@ [X(p), …]`
+    /// mode ascriptions resolve `X` as a *declared* algebra even though
+    /// its `compose`/`unit`/`order` live in the instance table the
+    /// `Val` domain cannot evaluate. Resolution is name-level only —
+    /// composing through such a head still takes the honest bound
+    /// until the algebra bridge lands (E2+).
+    pub algebra_heads: HashSet<String>,
+    /// Effect-declaration fields of `new Algebra` heads (PL-0004
+    /// G0/G1/G2): `op` signatures and `requires` implications,
+    /// populated by `synth_new_decl`'s `Algebra` arm. Heads absent
+    /// here (or with `op: None`) cannot drive `perform` — the op
+    /// name takes the honest bound (warn + fresh meta; the legacy
+    /// `IO{op:T}` codomain mint is retired).
+    pub algebra_effects: HashMap<String, AlgebraEffectDecl>,
+}
+
+/// The effect-relevant fields of a `new Algebra { … }` declaration
+/// record (PL-0004 G0; design/effects-ambient-modes.md §2/§4): `op`
+/// is the canonical operation signature (`op : A ~> B`, elaborated
+/// as a type — `perform` reads domain/codomain from it) and
+/// `requires` lists the algebra heads the operation implies
+/// (effect implication — `elaborate_mode_set` closes mode sets under
+/// it, transitively). `compose`/`unit`/`order` stay instance-table
+/// data: effect algebras compose by set union and subsume by set
+/// inclusion, so they declare neither.
+#[derive(Debug, Default, Clone)]
+pub struct AlgebraEffectDecl {
+    /// `op : A ~> B` — the operation's domain/codomain signature.
+    pub op: Option<serde_json::Value>,
+    /// `requires : [Head, …]` — algebra heads implied by this one.
+    pub requires: Vec<String>,
+    /// The dict declared `compose`/`order` — a *compositional*
+    /// (graded-style) algebra whose same-head mode elements compose
+    /// payloads (`Cost(3) ⋄ Cost(3) = Cost(6)`). `false` marks an
+    /// effect algebra: same-head elements set-union
+    /// (`{H} ⋄ {H} = {H}`), subsumption is set inclusion.
+    pub compositional: bool,
+}
+
+/// The verdict of a mode subsumption check `actual ≤ expected`
+/// (pl-0002 M3): `Yes`/`No` are decided by the governing algebra's
+/// `order` field; `Unknown` is the honest bound — the modes could
+/// not be ordered (open metas, unregistered algebra, non-data order
+/// op) and the check *passes* with a warning recorded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModeOrd {
+    /// `actual ≤ expected` holds.
+    Yes,
+    /// `actual ≤ expected` decisively fails — a real rejection.
+    No,
+    /// Undecidable — pass through (the honest bound).
+    Unknown,
+}
+
+impl ModeOrd {
+    /// Whether the verdict permits the subsumption (everything but a
+    /// decided `No`).
+    fn accepts(self) -> bool {
+        !matches!(self, Self::No)
+    }
 }
 
 impl Checker {
@@ -233,9 +306,6 @@ impl Checker {
         c.declare_pi();
         c.declare_hom();
         c.declare_cell_formers();
-        // `IO(sig)` — the typed-effect former (ADR-0153 §4).
-        c.formers
-            .insert(type_sym("type.io").handle(), FormerSig::Io);
         c
     }
 
@@ -390,7 +460,130 @@ impl Checker {
             return true;
         }
         let lvl = self.lvl();
+        // Mode-carrying `Hom(d, s, t, m)` cell types (pl-0002 M2/M3):
+        // conversion requires the modes to be *compatible* — subsumption
+        // (`order` in the governing algebra) must hold in at least one
+        // direction; `conv` is the symmetric reading, `subtype` adds
+        // the directed one. Only a decided `order` failure rejects —
+        // unresolvable modes pass (the honest bound). Compatible modes
+        // then strip to the dimensional part, so `Hom(1, A, B, m)` and
+        // `Hom(1, A, B)` convert iff the modes order. The strip latches
+        // `mode_homs` on first sight so later convs pay the walk only
+        // when modes are actually in play.
+        if self.mode_homs {
+            if !self.modes_compatible(a, b) {
+                return false;
+            }
+            let sa = self.strip_hom_modes(a);
+            let sb = self.strip_hom_modes(b);
+            let (ra, rb) = match (&sa, &sb) {
+                (Some(x), Some(y)) => (x, y),
+                (Some(x), None) => (x, b),
+                (None, Some(y)) => (a, y),
+                (None, None) => (a, b),
+            };
+            return nbe::conv(&mut self.metas, lvl, ra, rb);
+        }
         nbe::conv(&mut self.metas, lvl, a, b)
+    }
+
+    /// Drop the mode index (args ≥ 3) of every `type.hom` former in
+    /// `v`, recursively. Returns `None` when nothing changed — the
+    /// common case allocates nothing. Latches [`Checker::mode_homs`]
+    /// when a mode is actually stripped (or found already stripped by
+    /// a mint site).
+    fn strip_hom_modes(&mut self, v: &Val) -> Option<Val> {
+        match v {
+            Val::Former { head, args } => {
+                let is_hom = head.handle() == type_sym("type.hom").handle();
+                let mut changed = is_hom && args.len() > 3;
+                if changed {
+                    self.mode_homs = true;
+                }
+                let keep = if is_hom { 3 } else { args.len() };
+                let mut new_args: Vec<Val> = Vec::with_capacity(keep.min(args.len()));
+                for (i, arg) in args.iter().enumerate() {
+                    if i >= keep {
+                        changed = true;
+                        continue;
+                    }
+                    match self.strip_hom_modes(arg) {
+                        Some(s) => {
+                            changed = true;
+                            new_args.push(s);
+                        }
+                        None => new_args.push(arg.clone()),
+                    }
+                }
+                if !changed {
+                    None
+                } else {
+                    Some(Val::Former {
+                        head: head.clone(),
+                        args: new_args,
+                    })
+                }
+            }
+            Val::Rigid { lvl, spine } => {
+                self.strip_spine_modes(spine.0.iter())
+                    .map(|args| Val::Rigid {
+                        lvl: *lvl,
+                        spine: Spine(args),
+                    })
+            }
+            Val::Flex { meta, spine } => {
+                self.strip_spine_modes(spine.0.iter())
+                    .map(|args| Val::Flex {
+                        meta: *meta,
+                        spine: Spine(args),
+                    })
+            }
+            Val::Unfold { name, spine, value } => {
+                self.strip_spine_modes(spine.0.iter())
+                    .map(|args| Val::Unfold {
+                        name: name.clone(),
+                        spine: Spine(args),
+                        value: value.clone(),
+                    })
+            }
+            Val::Arrow(a) => {
+                let mut changed = false;
+                let mut binds = (*a.binds).clone();
+                for bv in binds.values_mut() {
+                    if let Some(s) = self.strip_hom_modes(bv) {
+                        *bv = s;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    None
+                } else {
+                    Some(Val::Arrow(Rc::new(ArrowVal {
+                        params: a.params.clone(),
+                        body_def: a.body_def.clone(),
+                        binds: Rc::new(binds),
+                    })))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Strip helper for elimination spines — `None` when no element
+    /// changed (avoids rebuilding the `Val` wrapper).
+    fn strip_spine_modes<'a>(&mut self, args: impl Iterator<Item = &'a Val>) -> Option<Vec<Val>> {
+        let mut changed = false;
+        let mut out = Vec::new();
+        for arg in args {
+            match self.strip_hom_modes(arg) {
+                Some(s) => {
+                    changed = true;
+                    out.push(s);
+                }
+                None => out.push(arg.clone()),
+            }
+        }
+        changed.then_some(out)
     }
 
     /// Subtyping `a <: b` (ADR-0154 §2): conversion, else the `parent`
@@ -400,51 +593,23 @@ impl Checker {
     /// not subtype — `Vec(Nat)` is not a `Vec(Int)`).
     pub fn subtype(&mut self, a: &Val, b: &Val) -> bool {
         if self.conv(a, b) {
-            return true;
+            // pl-0002 M3: conversion established mode *compatibility*
+            // (subsumption in either direction); subsumption itself is
+            // directed — the actual's modes must be `≤` the expected's
+            // under the governing algebra's `order`. Only a decided
+            // `No` rejects; unresolvable modes pass (honest bound).
+            return self.modes_subsumed(a, b);
         }
         let af = self.metas.force_head_rc(a);
         let bf = self.metas.force_head_rc(b);
         match (af.as_val(), bf.as_val()) {
             (Val::Universe(i), Val::Universe(j)) => i <= j,
             (Val::Nominal(x), Val::Nominal(y)) => x.has_ancestor(y),
-            // `IO(sa) <: IO(sb)` — signature subtyping: `sb` must name
-            // at least the ops `sa` does (record-width on the sig
-            // index, `sb <: sa`). An arity-0 expected (`IO` bare =
-            // `IO(⊤)`) accepts any signature; an arity-0 actual is ⊤
-            // itself and only satisfies ⊤.
-            (Val::Former { head: ha, args: aa }, Val::Former { head: hb, args: ab })
-                if ha.handle() == hb.handle() && ha.handle() == type_sym("type.io").handle() =>
-            {
-                match (aa.first(), ab.first()) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(sa), Some(sb)) => self.sig_width_subtype(sb, sa),
-                }
-            }
             // A bare nominal can inhabit a family application only if it
             // *is* that family's head with no indices — `Nat <: Nat()` —
             // covered by conv elsewhere; nominal-vs-former is not a
             // subtype step.
             _ => false,
-        }
-    }
-
-    /// Record-width subtyping on `IO` signature objects: `wider`
-    /// supplies every op `narrower` names, with convertible field
-    /// values (op signatures compare by `conv` — structural, per
-    /// ADR-0154 §3). Non-record sigs fall back to conversion.
-    fn sig_width_subtype(&mut self, wider: &Val, narrower: &Val) -> bool {
-        let w = self.metas.force_head_rc(wider);
-        let n = self.metas.force_head_rc(narrower);
-        match (w.as_val(), n.as_val()) {
-            (Val::Const(TaggedValue::Obj(wm)), Val::Const(TaggedValue::Obj(nm))) => {
-                nm.iter().all(|(k, v)| {
-                    wm.get(k).is_some_and(|wv| {
-                        self.conv(&Val::Const(wv.clone()), &Val::Const(v.clone()))
-                    })
-                })
-            }
-            _ => self.conv(w.as_val(), n.as_val()),
         }
     }
 
@@ -579,18 +744,6 @@ impl Checker {
                 };
                 self.infer_comp_axis(k, a, b)
             }
-            FormerSig::Io => {
-                // `IO(sig) : Type(0)` — the sig index is an
-                // op-signature record; arity 0 is `IO(⊤)`.
-                if args.len() > 1 {
-                    return Err(TcError::Arity {
-                        former: head.name().to_string(),
-                        want: 1,
-                        got: args.len(),
-                    });
-                }
-                Ok(Val::Universe(0))
-            }
             FormerSig::Id => match args {
                 [x] => self.infer_id(None, x),
                 [k, x] => self.infer_id(Some(k), x),
@@ -620,13 +773,20 @@ impl Checker {
     /// - `n ≤ 0` and non-literal `n`: stores unchecked (honest bound —
     ///   the open-dimension case, unchanged).
     pub fn infer_hom(&mut self, head: &Rc<Sym>, args: &[Val]) -> Result<Val, TcError> {
-        let [n, src, tgt] = args else {
+        // `Hom(d, s, t)` or the mode-carrying `Hom(d, s, t, m)`
+        // (pl-0002 M2 — the mode index is data carried for
+        // `mode_compose`, never part of the boundary law).
+        if args.len() < 3 || args.len() > 4 {
             return Err(TcError::Arity {
                 former: head.name().to_string(),
                 want: 3,
                 got: args.len(),
             });
-        };
+        }
+        if args.len() == 4 {
+            self.mode_homs = true;
+        }
+        let (n, src, tgt) = (&args[0], &args[1], &args[2]);
         let k = match self.metas.force_head(n) {
             Val::Const(TaggedValue::Int(k)) => *k,
             _ => return Ok(Val::Universe(0)), // non-literal dim: store only
@@ -687,7 +847,7 @@ impl Checker {
     fn cell_faces_at(&mut self, v: &Val, vt: &Val, j: u64) -> Result<Option<(Val, Val)>, TcError> {
         if let Val::Former { head, args } = self.metas.force_head(vt)
             && head.handle() == type_sym("type.hom").handle()
-            && args.len() == 3
+            && args.len() >= 3
         {
             return match self.metas.force_head(&args[0]) {
                 Val::Const(TaggedValue::Int(m)) => {
@@ -747,7 +907,7 @@ impl Checker {
     fn cell_boundaries(&mut self, v: &Val, vt: &Val) -> Result<(Val, Val), TcError> {
         if let Val::Former { head, args } = self.metas.force_head(vt)
             && head.handle() == type_sym("type.hom").handle()
-            && args.len() == 3
+            && args.len() >= 3
         {
             return Ok((args[1].clone(), args[2].clone()));
         }
@@ -766,7 +926,7 @@ impl Checker {
     fn hom_dim(&self, vt: &Val) -> Option<u64> {
         if let Val::Former { head, args } = self.metas.force_head(vt)
             && head.handle() == type_sym("type.hom").handle()
-            && args.len() == 3
+            && args.len() >= 3
             && let Val::Const(TaggedValue::Int(m)) = self.metas.force_head(&args[0])
         {
             return u64::try_from(*m).ok();
@@ -852,15 +1012,19 @@ impl Checker {
         // only the unchecked regime tolerates that.
         let cells_ok = ma.is_some() || self.cell_boundaries(a, ta).is_ok();
         let cells_ok = cells_ok && (mb.is_some() || self.cell_boundaries(b, tb).is_ok());
+        // Mode composition (pl-0002 M2): graded-arrow operands carry a
+        // mode descriptor as the 4th `type.hom` index; `⋄` resolves
+        // through the governing `mode.algebra.*` data — an ungraded
+        // operand is the algebra unit, so the other mode passes
+        // through. Attached to every stored composite below;
+        // subsumption/enforcement is M3.
+        let cell_mode = self.compose_cell_modes(ta, tb);
         let k = match axis {
             Some(k) => k,
             // Non-literal axis: store the composite unchecked at the
             // operand dimension.
             None => {
-                return Ok(Val::Former {
-                    head: type_sym("type.hom"),
-                    args: vec![k.clone(), sa, tb_b],
-                });
+                return Ok(self.hom_with_mode(k.clone(), sa, tb_b, &cell_mode));
             }
         };
         // `Hom(?d, ·, ·)` — a cell type whose dimension is a meta or
@@ -874,17 +1038,14 @@ impl Checker {
             }
             if let Val::Former { head, args } = self.metas.force_head(vt)
                 && head.handle() == type_sym("type.hom").handle()
-                && args.len() == 3
+                && args.len() >= 3
             {
                 return Some(args[0].clone());
             }
             None
         };
         if let Some(dv) = open_dim(ta, ma).or_else(|| open_dim(tb, mb)) {
-            return Ok(Val::Former {
-                head: type_sym("type.hom"),
-                args: vec![dv, sa, tb_b],
-            });
+            return Ok(self.hom_with_mode(dv, sa, tb_b, &cell_mode));
         }
         if !cells_ok {
             let bad = if self.cell_boundaries(a, ta).is_err() && ma.is_none() {
@@ -924,10 +1085,12 @@ impl Checker {
             let (Some(tk), Some(sk)) = (tk, sk) else {
                 // Open k-faces — stuck; store the composite at the
                 // operand dimension (the honest bound).
-                return Ok(Val::Former {
-                    head: type_sym("type.hom"),
-                    args: vec![Val::Const(TaggedValue::Int(d as i64)), sa, tb_b],
-                });
+                return Ok(self.hom_with_mode(
+                    Val::Const(TaggedValue::Int(d as i64)),
+                    sa,
+                    tb_b,
+                    &cell_mode,
+                ));
             };
             if !self.conv(&tk, &sk) {
                 return Err(TcError::Mismatch {
@@ -941,10 +1104,540 @@ impl Checker {
             };
             (sub(sa, sb), sub(ta_b, tb_b))
         };
-        Ok(Val::Former {
+        Ok(self.hom_with_mode(Val::Const(TaggedValue::Int(d as i64)), src, tgt, &cell_mode))
+    }
+
+    /// `Hom(d, s, t)` with the optional mode index attached
+    /// (pl-0002 M2): `Some(m)` yields the 4-index form
+    /// `Hom(d, s, t, m)` and latches [`Checker::mode_homs`].
+    fn hom_with_mode(&mut self, d: Val, s: Val, t: Val, mode: &Option<Val>) -> Val {
+        let mut args = vec![d, s, t];
+        if let Some(m) = mode {
+            args.push(m.clone());
+            self.mode_homs = true;
+        }
+        Val::Former {
             head: type_sym("type.hom"),
-            args: vec![Val::Const(TaggedValue::Int(d as i64)), src, tgt],
+            args,
+        }
+    }
+
+    /// The mode descriptor carried by a `Hom(d, s, t, m)` cell type —
+    /// `args[3]` when present (`None` for ungraded cells and non-cell
+    /// types). The descriptor is a `Former{type.mode, [head, arg,
+    /// raw]}` value minted by the graded-arrow judgments.
+    pub fn hom_mode(&self, vt: &Val) -> Option<Val> {
+        if let Val::Former { head, args } = self.metas.force_head(vt)
+            && head.handle() == type_sym("type.hom").handle()
+            && args.len() >= 4
+        {
+            return Some(args[3].clone());
+        }
+        None
+    }
+
+    /// Compose the modes of two composition operands (pl-0002 M2):
+    /// `None` on both sides → `None`; one side → that mode passes
+    /// through (the ungraded operand is the algebra unit); both →
+    /// [`Checker::mode_compose_vals`] through the governing algebra.
+    pub fn compose_cell_modes(&mut self, ta: &Val, tb: &Val) -> Option<Val> {
+        match (self.hom_mode(ta), self.hom_mode(tb)) {
+            (None, None) => None,
+            (Some(m), None) | (None, Some(m)) => Some(m),
+            (Some(a), Some(b)) => Some(self.mode_compose_vals(&a, &b)),
+        }
+    }
+
+    /// The `(head, arg, raw)` triple of a `Former{type.mode}`
+    /// descriptor — the read side of [`Checker::mode_desc`] for the
+    /// PL-0004 E3 `Value`-descriptor bridge (non-descriptor values
+    /// read as bare modes over themselves, same as `mode_parts`).
+    pub(crate) fn mode_descriptor_parts(&self, m: &Val) -> (Option<String>, Val, Val) {
+        self.mode_parts(m)
+    }
+
+    /// `(head, arg, raw)` of a `Former{type.mode}` descriptor —
+    /// `head` `Some(name)` for call-head modes (`Cost(3)` selects
+    /// `mode.algebra.Cost`), `None` for bare modes; `arg` the payload
+    /// (`Const Null` when absent), `raw` the self-describing form.
+    /// Non-descriptor values read as bare modes over themselves.
+    fn mode_parts(&self, m: &Val) -> (Option<String>, Val, Val) {
+        if let Val::Former { head, args } = self.metas.force_head(m)
+            && head.handle() == type_sym("type.mode").handle()
+            && args.len() >= 3
+        {
+            let h = match self.metas.force_head(&args[0]) {
+                Val::Const(TaggedValue::Str(s)) => Some(s.to_string()),
+                _ => None,
+            };
+            return (h, args[1].clone(), args[2].clone());
+        }
+        (None, Val::Const(TaggedValue::Null), m.clone())
+    }
+
+    /// Mint a `Former{type.mode, [head, arg, raw]}` descriptor —
+    /// `head` `Some(name)` → `Const(Str)` (call-head mode), `None` →
+    /// `Const(Null)` (bare mode).
+    pub(crate) fn mode_desc(&self, head: Option<&str>, arg: Val, raw: Val) -> Val {
+        let hv = match head {
+            Some(h) => Val::Const(TaggedValue::Str(Rc::from(h))),
+            None => Val::Const(TaggedValue::Null),
+        };
+        Val::Former {
+            head: type_sym("type.mode"),
+            args: vec![hv, arg, raw],
+        }
+    }
+
+    /// The payload a descriptor composes on: `arg` unless it is the
+    /// `null` placeholder (a call with no args, or a bare mode whose
+    /// payload is `raw`).
+    fn mode_payload(&self, arg: &Val, raw: &Val) -> Val {
+        if matches!(self.metas.force_head(arg), Val::Const(TaggedValue::Null)) {
+            raw.clone()
+        } else {
+            arg.clone()
+        }
+    }
+
+    /// `mode.algebra.<head>` (or `mode.algebra.default` for `None`) —
+    /// the `{compose, unit, order}` data record, `None` when
+    /// unregistered. A named head falls back to `default` (the model's
+    /// `mode_algebra_`).
+    fn mode_algebra(&self, head: Option<&str>) -> Option<serde_json::Value> {
+        let name = match head {
+            Some(h) => format!("mode.algebra.{h}"),
+            None => "mode.algebra.default".to_string(),
+        };
+        self.mode_algebras.get(&name).cloned().or_else(|| {
+            if head.is_some() {
+                self.mode_algebras.get("mode.algebra.default").cloned()
+            } else {
+                None
+            }
         })
+    }
+
+    /// `a ⋄ b` — compose two mode descriptors through the mode algebra
+    /// governing the pair (pl-0002 M2; the model's `mode_compose_`
+    /// port). Same-head call modes compose payloads under
+    /// `mode.algebra.<head>`; bare modes compose raws under
+    /// `mode.algebra.default`; mismatched heads take the honest bound.
+    /// Subsumption is M3 — this only computes the composite mode.
+    /// `pub(crate)` for the PL-0004 E3 `Value`-descriptor bridge
+    /// (`dependent::compose_mode_element`).
+    pub(crate) fn mode_compose_vals(&mut self, a: &Val, b: &Val) -> Val {
+        let null = || Val::Const(TaggedValue::Null);
+        let (ha, aa, ra) = self.mode_parts(a);
+        let (hb, ab, rb) = self.mode_parts(b);
+        let sa = self.mode_payload(&aa, &ra);
+        let sb = self.mode_payload(&ab, &rb);
+        if ha.is_some() && ha == hb {
+            // Same call-head: `Head(p) ⋄ Head(q)` composes payloads
+            // under `mode.algebra.<head>` and rebuilds the
+            // self-describing `Head(…)` form (graded-arrows.md
+            // "canonical forms" — `arg` is authoritative whenever
+            // non-null, so `raw` mirrors the composed payload).
+            let h = ha.as_deref().unwrap_or("");
+            // M3 enforcement: an unregistered head still composes
+            // under `default` (the M2 fallback — `new`-declared
+            // algebras live in the instance table, not this registry),
+            // but the fallback is no longer silent. Heads declared
+            // via `new Algebra` are *known* — effect algebras
+            // deliberately declare no `compose`/`order` (set union /
+            // set inclusion, PL-0004 G0), so composing them under
+            // `default` is by design, not a gap.
+            if !self
+                .mode_algebras
+                .contains_key(&format!("mode.algebra.{h}"))
+                && !self.algebra_heads.contains(h)
+            {
+                self.mode_warnings.push(format!(
+                    "mode compose: unknown algebra head `{h}` (composing under `default`)"
+                ));
+            }
+            let alg = self.mode_algebra(Some(h));
+            let cres = self.mode_apply_compose(alg, &sa, &sb);
+            return self.mode_desc(Some(h), cres.clone(), cres);
+        }
+        if ha.is_none() && hb.is_none() {
+            // Bare modes compose their raw values under the default
+            // algebra.
+            let alg = self.mode_algebra(None);
+            let cres = self.mode_apply_compose(alg, &ra, &rb);
+            return self.mode_desc(None, null(), cres);
+        }
+        // Mismatched algebras (call-head vs bare, or two different
+        // heads): no single algebra governs the pair — honest bound.
+        let hname = ha.as_deref().unwrap_or("<default>");
+        let gname = hb.as_deref().unwrap_or("<default>");
+        let m = self.mode_honest(&format!("mismatched mode algebras ({hname} vs {gname})"));
+        self.mode_desc(None, null(), m)
+    }
+
+    /// Run the algebra's `compose` field over two payloads. The field
+    /// is data: a string opcode naming a builtin operation
+    /// (`canonical`, `add`, `eq` — `lang.globals` is pure
+    /// JSON and cannot hold closures, so user algebras arrive as named
+    /// ops until the instance machinery lands). Anything else is the
+    /// honest bound (the model's `mode_apply_compose_`).
+    fn mode_apply_compose(&mut self, alg: Option<serde_json::Value>, a: &Val, b: &Val) -> Val {
+        let op = alg
+            .as_ref()
+            .and_then(|g| g.get("compose"))
+            .and_then(|c| c.as_str());
+        match op {
+            Some("canonical") => self.mode_canonical_compose(a, b),
+            Some("add") => self
+                .mode_num_add(a, b)
+                .unwrap_or_else(|| self.mode_honest("`add` needs numeric modes")),
+            Some("eq") => {
+                if self.mode_val_eq(a, b) {
+                    a.clone()
+                } else {
+                    self.mode_honest("modes differ under `eq`")
+                }
+            }
+            Some(other) => self.mode_honest(&format!("unknown algebra compose op `{other}`")),
+            None => self.mode_honest("algebra has no applicable compose"),
+        }
+    }
+
+    /// The canonical default algebra's `compose` (graded-arrows.md
+    /// §4.2 / pl-0002 M2): numeric add for literal counts,
+    /// record-row union for rows, equality for named grades, fresh
+    /// meta + deferred diagnostic otherwise.
+    fn mode_canonical_compose(&mut self, a: &Val, b: &Val) -> Val {
+        if let Some(n) = self.mode_num_add(a, b) {
+            return n;
+        }
+        let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
+        if let (Val::Const(TaggedValue::Obj(_)), Val::Const(TaggedValue::Obj(_))) = (fa, fb) {
+            return self.mode_rows_union(a, b);
+        }
+        if self.mode_val_eq(a, b) {
+            return a.clone();
+        }
+        // Meta passthrough — an open mode stays open (the model's
+        // `is_meta` arms).
+        if matches!(fa, Val::Flex { .. }) {
+            return a.clone();
+        }
+        if matches!(fb, Val::Flex { .. }) {
+            return b.clone();
+        }
+        self.mode_honest("no canonical rule for these mode values")
+    }
+
+    /// Record-row union for the canonical default algebra (bare
+    /// record mode payloads — PL-0004 G1 retired the `Effects`-specific
+    /// `row_union`/`row_width` opcodes and the E0 entry-merge rule with
+    /// the row encoding): disjoint keys union; a shared key keeps its
+    /// entry iff the two entries are structurally equal — a decided
+    /// conflict degrades *that entry* to a fresh meta (the honest
+    /// bound), never a silent pick and never a whole-row bound that
+    /// would discard the disjoint keys. Non-record operands are the
+    /// honest bound.
+    fn mode_rows_union(&mut self, a: &Val, b: &Val) -> Val {
+        // Clone the record maps out before merging — the fresh-meta
+        // mint mutates the meta store the `force_head` borrows hold.
+        let (x, y) = {
+            let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
+            match (fa, fb) {
+                (Val::Const(TaggedValue::Obj(x)), Val::Const(TaggedValue::Obj(y))) => {
+                    (x.clone(), y.clone())
+                }
+                _ => return self.mode_honest("row union needs record modes"),
+            }
+        };
+        let mut merged = x.as_ref().clone();
+        for (k, v) in y.iter() {
+            match x.get(k.as_ref()) {
+                None => {
+                    merged.insert(k.clone(), v.clone());
+                }
+                Some(w) if handl_value::eq(w, v) => {}
+                Some(_) => {
+                    self.mode_warnings.push(
+                        "mode compose: record rows conflict on a shared key — entry is a fresh meta"
+                            .into(),
+                    );
+                    let m = self.fresh_meta(Val::Universe(0));
+                    merged.insert(
+                        k.clone(),
+                        nbe::quote(&self.metas, self.lvl(), &self.meta_val(m)),
+                    );
+                }
+            }
+        }
+        Val::Const(TaggedValue::Obj(Rc::new(merged)))
+    }
+
+    /// `a + b` on literal numeric modes — `Int` stays `Int` when the
+    /// sum fits, everything else is `Float`.
+    fn mode_num_add(&self, a: &Val, b: &Val) -> Option<Val> {
+        let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
+        let (Val::Const(x), Val::Const(y)) = (fa, fb) else {
+            return None;
+        };
+        match (x, y) {
+            (TaggedValue::Int(i), TaggedValue::Int(j)) => Some(match i.checked_add(*j) {
+                Some(n) => Val::Const(TaggedValue::Int(n)),
+                None => Val::Const(TaggedValue::Float(*i as f64 + *j as f64)),
+            }),
+            (TaggedValue::Int(i), TaggedValue::Float(f))
+            | (TaggedValue::Float(f), TaggedValue::Int(i)) => {
+                Some(Val::Const(TaggedValue::Float(*i as f64 + f)))
+            }
+            (TaggedValue::Float(x), TaggedValue::Float(y)) => {
+                Some(Val::Const(TaggedValue::Float(x + y)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Structural equality for mode payloads — `Const` data via
+    /// `handl_value::eq`, nominal/universe heads by identity, formers
+    /// by head + recursive args, unsolved metas by id. Anything else
+    /// is simply unequal (the honest bound decides downstream).
+    fn mode_val_eq(&self, a: &Val, b: &Val) -> bool {
+        let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
+        match (fa, fb) {
+            (Val::Const(x), Val::Const(y)) => handl_value::eq(x, y),
+            (Val::Nominal(x), Val::Nominal(y)) => x == y,
+            (Val::Universe(i), Val::Universe(j)) => i == j,
+            (Val::Former { head: h1, args: a1 }, Val::Former { head: h2, args: a2 }) => {
+                (Rc::ptr_eq(h1, h2) || h1 == h2)
+                    && a1.len() == a2.len()
+                    && a1
+                        .iter()
+                        .zip(a2.iter())
+                        .all(|(x, y)| self.mode_val_eq(x, y))
+            }
+            (Val::Flex { meta: m1, .. }, Val::Flex { meta: m2, .. }) => m1 == m2,
+            (Val::Rigid { lvl: l1, .. }, Val::Rigid { lvl: l2, .. }) => l1 == l2,
+            _ => false,
+        }
+    }
+
+    /// The honest bound: a fresh meta stands for the unresolvable
+    /// mode and a warning records the deferral (the `infer_hom`/
+    /// `ambient_handle_modality` convention).
+    pub(crate) fn mode_honest(&mut self, what: &str) -> Val {
+        let m = self.fresh_meta(Val::Universe(0));
+        self.mode_warnings.push(format!("mode compose: {what}"));
+        self.meta_val(m)
+    }
+
+    // -- M3: mode subsumption (`order`) ---------------------------------
+
+    /// Whether two types' mode indices are *compatible* — subsumption
+    /// holds in at least one direction (pl-0002 M3). `conv` is the
+    /// symmetric reading of "usable as"; [`Checker::subtype`] adds the
+    /// directed check. Only a decided `order` failure rejects.
+    fn modes_compatible(&mut self, a: &Val, b: &Val) -> bool {
+        self.mode_walk_sub(a, b) || self.mode_walk_sub(b, a)
+    }
+
+    /// Directed mode subsumption `a ≤ b` between two types (pl-0002
+    /// M3): a paired structural walk in which only `type.hom` mode
+    /// indices decide — `mode_leq` on `args[3]` — while
+    /// dims, endpoints, former args, and spines recurse for nested
+    /// modes. Returns `false` *only* on a decided `order` failure;
+    /// unresolvable modes pass (the honest bound). No-op when no
+    /// mode-carrying `Hom` has been seen ([`Checker::mode_homs`]).
+    pub fn modes_subsumed(&mut self, a: &Val, b: &Val) -> bool {
+        if !self.mode_homs {
+            return true;
+        }
+        self.mode_walk_sub(a, b)
+    }
+
+    /// The paired walk behind [`Checker::modes_subsumed`]/
+    /// [`Checker::modes_compatible`]. Non-`Hom` structure pairs
+    /// recursively; a `type.hom` former on *either* side whose
+    /// counterpart is not a `type.hom` defers to `conv` (returns
+    /// `true` — shape mismatches are not mode decisions).
+    fn mode_walk_sub(&mut self, a: &Val, b: &Val) -> bool {
+        let fa = self.metas.force_head_rc(a);
+        let fb = self.metas.force_head_rc(b);
+        let hom = type_sym("type.hom").handle();
+        if let (Val::Former { head: ha, args: aa }, Val::Former { head: hb, args: ab }) =
+            (fa.as_val(), fb.as_val())
+            && ha.handle() == hom
+            && hb.handle() == hom
+        {
+            // The mode index (`args[3]`, absent = ungraded) decides by
+            // `order`; the dimensional part recurses — modes can nest
+            // inside cell endpoints.
+            if !self.mode_leq(aa.get(3), ab.get(3)).accepts() {
+                return false;
+            }
+            return aa
+                .iter()
+                .zip(ab.iter())
+                .take(3)
+                .all(|(x, y)| self.mode_walk_sub(x, y));
+        }
+        match (fa.as_val(), fb.as_val()) {
+            (Val::Former { args: aa, .. }, Val::Former { args: ab, .. }) => aa
+                .iter()
+                .zip(ab.iter())
+                .all(|(x, y)| self.mode_walk_sub(x, y)),
+            (Val::Rigid { spine: sa, .. }, Val::Rigid { spine: sb, .. })
+            | (Val::Flex { spine: sa, .. }, Val::Flex { spine: sb, .. })
+            | (Val::Unfold { spine: sa, .. }, Val::Unfold { spine: sb, .. }) => {
+                sa.0.iter()
+                    .zip(sb.0.iter())
+                    .all(|(x, y)| self.mode_walk_sub(x, y))
+            }
+            (Val::Arrow(x), Val::Arrow(y)) => x
+                .binds
+                .iter()
+                .all(|(k, v)| y.binds.get(k).is_none_or(|w| self.mode_walk_sub(v, w))),
+            _ => true,
+        }
+    }
+
+    /// `actual ≤ expected` on mode indices — `None` is the ungraded
+    /// side (no mode index on the `Hom`):
+    ///
+    /// - `None ≤ None` and `Some ≤ None` → yes: grading *refines* the
+    ///   mode-erased `Hom(d, s, t)`, so a graded cell is always usable
+    ///   where an ungraded one is expected.
+    /// - `None ≤ Some(m)` → `order(unit, m)` under `m`'s governing
+    ///   algebra: an ungraded cell only satisfies a grade it is the
+    ///   algebra *unit* of (the same reading `compose_cell_modes`
+    ///   gives composition operands). The algebra must resolve
+    ///   strictly — a named head with no registered
+    ///   `mode.algebra.<head>` is the honest bound, not a silent
+    ///   `default` fallback (the real algebra may live in the `new`/
+    ///   instance table the `Val` domain cannot see).
+    /// - `Some ≤ Some` → [`Checker::mode_order_vals`].
+    fn mode_leq(&mut self, actual: Option<&Val>, expected: Option<&Val>) -> ModeOrd {
+        match (actual, expected) {
+            (None, None) | (Some(_), None) => ModeOrd::Yes,
+            (Some(a), Some(b)) => self.mode_order_vals(a, b),
+            (None, Some(m)) => {
+                let (h, am, rm) = self.mode_parts(m);
+                let pm = self.mode_payload(&am, &rm);
+                let alg = self.mode_algebra_strict(h.as_deref());
+                let Some(alg) = alg else {
+                    return ModeOrd::Unknown;
+                };
+                let Some(unit) = alg.get("unit") else {
+                    self.mode_warnings
+                        .push("mode order: algebra has no `unit` for the ungraded side".into());
+                    return ModeOrd::Unknown;
+                };
+                let unit_v = self.mode_json_lift(unit);
+                self.mode_apply_order(Some(&alg), &unit_v, &pm)
+            }
+        }
+    }
+
+    /// `mode.algebra.<head>` (or `mode.algebra.default` for bare
+    /// modes) *without* the named-head → `default` fallback
+    /// [`Checker::mode_algebra`] keeps for composition: ordering is a
+    /// decision, so an unregistered head is the honest bound — a
+    /// warning names the gap instead of silently applying `default`'s
+    /// `order` to another algebra's payloads.
+    fn mode_algebra_strict(&mut self, head: Option<&str>) -> Option<serde_json::Value> {
+        let name = match head {
+            Some(h) => format!("mode.algebra.{h}"),
+            None => "mode.algebra.default".to_string(),
+        };
+        let alg = self.mode_algebras.get(&name).cloned();
+        if alg.is_none() {
+            self.mode_warnings.push(format!(
+                "mode order: unknown algebra head `{}`",
+                head.unwrap_or("default")
+            ));
+        }
+        alg
+    }
+
+    /// Lift a `mode.algebra.*` JSON field into the `Val` domain —
+    /// `unit` is registry *data* (a literal/record), not a mode
+    /// descriptor, so it lifts through the ordinary boundary bridge.
+    fn mode_json_lift(&self, v: &serde_json::Value) -> Val {
+        lift(self.lvl(), &handl_value::TaggedValue::from(v.clone()))
+    }
+
+    /// `a ≤ b` on two *graded* mode descriptors through the governing
+    /// algebra's `order` field (pl-0002 M3; the `order` half of the
+    /// `mode_compose_vals` port). Same-head call modes order payloads
+    /// under `mode.algebra.<head>`; bare modes under
+    /// `mode.algebra.default`; mismatched heads have no governing
+    /// algebra — warning + honest bound, matching composition.
+    fn mode_order_vals(&mut self, a: &Val, b: &Val) -> ModeOrd {
+        let (ha, aa, ra) = self.mode_parts(a);
+        let (hb, ab, rb) = self.mode_parts(b);
+        let sa = self.mode_payload(&aa, &ra);
+        let sb = self.mode_payload(&ab, &rb);
+        if ha != hb {
+            // Mismatched algebras (call-head vs bare, or two different
+            // heads): no single algebra governs the pair — honest bound.
+            let hname = ha.as_deref().unwrap_or("<default>");
+            let gname = hb.as_deref().unwrap_or("<default>");
+            self.mode_warnings.push(format!(
+                "mode order: mismatched mode algebras ({hname} vs {gname})"
+            ));
+            return ModeOrd::Unknown;
+        }
+        // Identical modes subsume under any algebra — decided before
+        // registry lookup so `Cost(3) ≤ Cost(3)` holds even when the
+        // `Cost` algebra is only `new`-declared (instance-side).
+        if self.mode_val_eq(&sa, &sb) {
+            return ModeOrd::Yes;
+        }
+        let Some(alg) = self.mode_algebra_strict(ha.as_deref()) else {
+            return ModeOrd::Unknown;
+        };
+        self.mode_apply_order(Some(&alg), &sa, &sb)
+    }
+
+    /// Run the algebra's `order` field over `(actual, expected)`
+    /// payloads — the M3 counterpart of [`Checker::mode_apply_compose`].
+    /// `order` is data: a string opcode naming a builtin operation
+    /// (`eq`); open modes (`Flex`/`Rigid`/`Unfold`) are
+    /// undecidable by convention, and anything else — a Handl closure
+    /// the `Val` domain cannot apply, a missing field — is the honest
+    /// bound.
+    fn mode_apply_order(&mut self, alg: Option<&serde_json::Value>, a: &Val, b: &Val) -> ModeOrd {
+        // Open modes stay open — a meta/rigid mode variable is
+        // undecidable, never a decided rejection (the symbolic-sig
+        // convention; M3.5 will make mode vars rigid-but-quantified).
+        let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
+        if matches!(
+            fa,
+            Val::Flex { .. } | Val::Rigid { .. } | Val::Unfold { .. }
+        ) || matches!(
+            fb,
+            Val::Flex { .. } | Val::Rigid { .. } | Val::Unfold { .. }
+        ) {
+            return ModeOrd::Unknown;
+        }
+        let op = alg.and_then(|g| g.get("order")).and_then(|o| o.as_str());
+        match op {
+            Some("eq") => {
+                if self.mode_val_eq(a, b) {
+                    ModeOrd::Yes
+                } else {
+                    ModeOrd::No
+                }
+            }
+            Some(other) => {
+                self.mode_warnings
+                    .push(format!("mode order: unknown algebra order op `{other}`"));
+                ModeOrd::Unknown
+            }
+            None => {
+                self.mode_warnings
+                    .push("mode order: algebra has no applicable `order`".into());
+                ModeOrd::Unknown
+            }
+        }
     }
 
     /// `id_k(x)` — the identity cell at level `k` (ADR-0153 §2): the
@@ -2165,5 +2858,191 @@ mod tests {
                 "axis {k}"
             );
         }
+    }
+
+    // --- M3: mode subsumption (`order`) ---------------------------------
+
+    /// A bare mode descriptor over a literal payload — the
+    /// `~[3]~>`-shaped mode `mode_descriptor` mints for non-call
+    /// children (`{head: null, arg: null, raw: <value>}`).
+    fn bare_mode(v: Val) -> Val {
+        Val::Former {
+            head: type_sym("type.mode"),
+            args: vec![
+                Val::Const(TaggedValue::Null),
+                Val::Const(TaggedValue::Null),
+                v,
+            ],
+        }
+    }
+
+    /// A call-head mode descriptor — `Cost(3)`'s `{head: "Cost",
+    /// arg: 3, raw: Cost(3)}` shape.
+    fn call_mode(head: &str, payload: Val) -> Val {
+        Val::Former {
+            head: type_sym("type.mode"),
+            args: vec![
+                Val::Const(TaggedValue::Str(Rc::from(head))),
+                payload.clone(),
+                payload,
+            ],
+        }
+    }
+
+    /// `Hom(1, Int, Nat[, mode])` — the graded-arrow cell type.
+    fn hom_mode1(c: &mut Checker, mode: Option<Val>) -> Val {
+        c.hom_with_mode(
+            Val::Const(TaggedValue::Int(1)),
+            Val::Nominal(int()),
+            Val::Nominal(nat()),
+            &mode,
+        )
+    }
+
+    fn alg_default() -> serde_json::Value {
+        serde_json::json!({"compose": "canonical", "unit": null, "order": "eq"})
+    }
+
+    #[test]
+    fn mode_subsumption_eq_order() {
+        let mut c = Checker::new();
+        c.mode_algebras
+            .insert("mode.algebra.default".into(), alg_default());
+        let m3 = bare_mode(Val::Const(TaggedValue::Int(3)));
+        let m4 = bare_mode(Val::Const(TaggedValue::Int(4)));
+        let h3 = hom_mode1(&mut c, Some(m3));
+        let h4 = hom_mode1(&mut c, Some(m4));
+        let hp = hom_mode1(&mut c, None);
+        // Equal modes subsume; different modes under `eq` reject —
+        // decided `No` fails *both* conv (compatibility) and subtype
+        // (direction).
+        assert!(c.subtype(&h3, &h3));
+        assert!(!c.conv(&h3, &h4));
+        assert!(!c.subtype(&h3, &h4));
+        assert!(!c.subtype(&h4, &h3));
+        // Grading refines the mode-erased cell: `Hom(…, m) <: Hom(…)`.
+        assert!(c.conv(&h3, &hp));
+        assert!(c.subtype(&h3, &hp));
+        // The reverse needs `order(unit, m)` — `null ≰ 3` under `eq`,
+        // so an ungraded cell does *not* satisfy a graded position.
+        assert!(c.conv(&hp, &h3));
+        assert!(!c.subtype(&hp, &h3));
+    }
+
+    /// PL-0004 G1 — the `Effects`-row opcodes are retired: a
+    /// `mode.algebra.*` record still naming `row_union`/`row_width`
+    /// (legacy `globals.yaml` data) takes the honest bound — unknown
+    /// op warning + undecided compose/order — never a silent row
+    /// merge or width check.
+    #[test]
+    fn mode_retired_row_opcodes_honest_bound() {
+        let mut c = Checker::new();
+        c.mode_algebras.insert(
+            "mode.algebra.Effects".into(),
+            serde_json::json!({"compose": "row_union", "unit": {}, "order": "row_width"}),
+        );
+        let eff =
+            |fields: serde_json::Value| call_mode("Effects", Val::Const(TaggedValue::from(fields)));
+        let comp = c.mode_compose_vals(
+            &eff(serde_json::json!({"puts": "P"})),
+            &eff(serde_json::json!({"fs": "F"})),
+        );
+        assert!(
+            c.mode_warnings
+                .iter()
+                .any(|w| w.contains("unknown algebra compose op `row_union`")),
+            "warnings: {:?}",
+            c.mode_warnings
+        );
+        // Order: `row_width` is unknown → `Unknown` → subsumption
+        // passes with a warning, never a decided row-width rejection.
+        let h_a = hom_mode1(&mut c, Some(eff(serde_json::json!({"io": "S"}))));
+        let h_b = hom_mode1(&mut c, Some(eff(serde_json::json!({"io": "S", "fs": "P"}))));
+        assert!(c.subtype(&h_a, &h_b));
+        assert!(
+            c.mode_warnings
+                .iter()
+                .any(|w| w.contains("unknown algebra order op `row_width`")),
+            "warnings: {:?}",
+            c.mode_warnings
+        );
+        let _ = comp;
+    }
+
+    #[test]
+    fn mode_order_unknown_head_is_honest_bound() {
+        let mut c = Checker::new();
+        // No `mode.algebra.*` registered at all — `Cost(3)` vs `Cost(5)`
+        // cannot be ordered: warning + pass, never a silent `default`.
+        let c3 = call_mode("Cost", Val::Const(TaggedValue::Int(3)));
+        let c5 = call_mode("Cost", Val::Const(TaggedValue::Int(5)));
+        let h3 = hom_mode1(&mut c, Some(c3));
+        let h5 = hom_mode1(&mut c, Some(c5));
+        assert!(c.subtype(&h3, &h5));
+        assert!(
+            c.mode_warnings
+                .iter()
+                .any(|w| w.contains("unknown algebra head `Cost`")),
+            "warnings: {:?}",
+            c.mode_warnings
+        );
+        // Identical modes still subsume — decided before lookup.
+        let h3b = hom_mode1(
+            &mut c,
+            Some(call_mode("Cost", Val::Const(TaggedValue::Int(3)))),
+        );
+        assert!(c.subtype(&h3, &h3b));
+        // Mismatched heads (call vs bare) have no governing algebra.
+        let hb = hom_mode1(&mut c, Some(bare_mode(Val::Const(TaggedValue::Int(3)))));
+        assert!(c.subtype(&h3, &hb));
+        assert!(
+            c.mode_warnings
+                .iter()
+                .any(|w| w.contains("mismatched mode algebras")),
+            "warnings: {:?}",
+            c.mode_warnings
+        );
+    }
+
+    #[test]
+    fn mode_compose_fires_through_cell_modes() {
+        let mut c = Checker::new();
+        c.mode_algebras
+            .insert("mode.algebra.default".into(), alg_default());
+        let m3 = bare_mode(Val::Const(TaggedValue::Int(3)));
+        let m3c = m3.clone();
+        let m4 = bare_mode(Val::Const(TaggedValue::Int(4)));
+        let h3 = hom_mode1(&mut c, Some(m3));
+        let h4 = hom_mode1(&mut c, Some(m4));
+        // `Hom(…,3) ⋄ Hom(…,4)` — the `>>>` boundary law's mode half:
+        // `canonical` compose adds literal counts → mode `7`.
+        let comp = c.compose_cell_modes(&h3, &h4).expect("both sides graded");
+        let Val::Former { args, .. } = &comp else {
+            panic!("composite mode is a descriptor, got {}", c.show(&comp))
+        };
+        assert_eq!(args.len(), 3);
+        assert!(
+            matches!(&args[2], Val::Const(TaggedValue::Int(7))),
+            "expected composed mode 3 ⋄ 4 = 7, got {}",
+            c.show(&args[2])
+        );
+        // An ungraded operand is the unit — the other mode passes
+        // through unchanged.
+        let hp = hom_mode1(&mut c, None);
+        let passthrough = c.compose_cell_modes(&h3, &hp).expect("one side graded");
+        assert!(c.mode_val_eq(&passthrough, &m3c));
+        // Unknown call-head compose warns but still produces a mode.
+        let c3 = call_mode("Cost", Val::Const(TaggedValue::Int(3)));
+        let c5 = call_mode("Cost", Val::Const(TaggedValue::Int(5)));
+        let hc3 = hom_mode1(&mut c, Some(c3));
+        let hc5 = hom_mode1(&mut c, Some(c5));
+        let _ = c.compose_cell_modes(&hc3, &hc5);
+        assert!(
+            c.mode_warnings
+                .iter()
+                .any(|w| w.contains("unknown algebra head `Cost`")),
+            "warnings: {:?}",
+            c.mode_warnings
+        );
     }
 }

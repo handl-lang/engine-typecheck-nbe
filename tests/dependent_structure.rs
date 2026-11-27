@@ -948,41 +948,6 @@ fn type_alias_expands_transparently() {
     );
 }
 
-/// `IO(sig)` — the typed-effect former (ADR-0153 §4): an `IO` type is
-/// an effect object indexed by the op-signature record. Checking
-/// `IO(s)` against `IO(s')` is signature subtyping — `s'` names at
-/// least the ops `s` does (record-width on the index). Bare `IO` is
-/// `IO(⊤)` — it accepts any signature in expected position.
-#[test]
-fn io_signature_subtyping() {
-    let lang = canonical_lang();
-    let good = parse_block(
-        &lang,
-        &[
-            "narrow : IO<{ puts: Str ~> Unit }> ~> IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> := x ~> x",
-            "top : IO<{ puts: Str ~> Unit }> ~> IO := x ~> x",
-        ],
-    );
-    let result = typecheck(&lang, good);
-    assert!(
-        !has_error(&result),
-        "IO<{{puts}}> should check against IO<{{puts,gets}}> and bare IO, got {:?}",
-        diags_of(&result)
-    );
-
-    let bad = parse_block(
-        &lang,
-        &[
-            "widen : IO<{ puts: Str ~> Unit, gets: Unit ~> Str }> ~> IO<{ puts: Str ~> Unit }> := x ~> x",
-        ],
-    );
-    let result = typecheck(&lang, bad);
-    assert!(
-        has_error(&result),
-        "IO<{{puts,gets}}> must not check against IO<{{puts}}> — extra op not allowed"
-    );
-}
-
 /// `Ctor: absurd` is the explicit dismissal of a decided-impossible arm:
 /// `VNil : Vec(0, ?a)` can never produce a `Vec(2, Bool)` scrutinee, so
 /// `VNil: absurd` is *discharged* — no unreachable-branch diagnostic —
@@ -1685,195 +1650,12 @@ fn ordered_call_annotation_checks_equality() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-2 WS-F — typed-effect handler typing + effect-row polymorphism
-// (ADR-0153 §4: effects are objects in the codomain; `IO(sig)` sig records
-// are checked against `handle … with`'s declared impls)
+// `perform` builtin edge cases — the op-emission builtin's name-read and
+// shadowing rules are unchanged by the PL-0004 G2 granular migration
+// (granular `op`-field resolution + ambient-mode coverage live in
+// `mode_effects.rs`/`mode_granular.rs`; the `IO<sig>` codomain tests are
+// retired with the former).
 // ---------------------------------------------------------------------------
-
-/// A covering impl's declared return replaces the op's sig entry — the
-/// interpret-in-place semantics of the runtime's `interpret_io_former`
-/// (`handle print("x") with {puts: puts_impl}` produces
-/// `IO<{ puts: Unit }>`).
-#[test]
-fn handle_covered_op_returns_impl_result() {
-    let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &[
-            "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
-            "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
-            "x : IO<{ puts: Unit }> := handle print(\"x\") with {puts: puts_impl}",
-        ],
-    );
-    let result = typecheck(&lang, ast);
-    assert!(
-        !has_error(&result),
-        "covered op should check, got {:?}",
-        diags_of(&result)
-    );
-}
-
-/// A handler that declares impls for ops the body's sig never names is a
-/// diagnostic; a handler covering none of the body's ops is a guaranteed
-/// no-op and also a diagnostic (phase-2 WS-F coverage rules).
-#[test]
-fn handle_missing_required_op_errors() {
-    let lang = canonical_lang();
-    let decls = [
-        "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
-        "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
-    ];
-    let spurious = parse_block(
-        &lang,
-        &[
-            decls[0],
-            decls[1],
-            "x := handle print(\"x\") with {gets: puts_impl}",
-        ],
-    );
-    let result = typecheck(&lang, spurious);
-    assert!(
-        has_error(&result),
-        "handler declaring a spurious op should error"
-    );
-    let empty = parse_block(&lang, &[decls[0], "x := handle print(\"x\") with {}"]);
-    let result = typecheck(&lang, empty);
-    assert!(
-        has_error(&result),
-        "handler covering none of the declared ops should error"
-    );
-}
-
-/// An uncovered op passes through as `IO(rest)` — the residual stays an
-/// op for an outer handler (the runtime leaves its request data intact).
-#[test]
-fn handle_uncovered_op_passes_through_as_io() {
-    let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &[
-            "send : String ~> IO<{ puts: String ~> Unit, gets: String ~> Unit }> := s ~> send(s)",
-            "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
-            // `gets` uncovered → stays an op in the residual;
-            // `puts` covered → its entry is replaced by the impl's
-            // `Unit` return (annotating `puts: Unit` proves the
-            // replacement — a stale `String ~> Unit` would fail conv).
-            "x : IO<{ puts: Unit, gets: String ~> Unit }> := handle send(\"x\") with {puts: puts_impl}",
-        ],
-    );
-    let result = typecheck(&lang, ast);
-    assert!(
-        !has_error(&result),
-        "residual IO should carry the uncovered op and the impl result, got {:?}",
-        diags_of(&result)
-    );
-}
-
-/// `handle f with h` on an arrow body — the deep-handler case (the
-/// runtime's `attach_carried_handler`): the arrow's `IO` codomain is
-/// checked the same way, producing `A ~> IO(S')`.
-#[test]
-fn handle_arrow_codomain_checked() {
-    let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &[
-            "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
-            "puts_impl : (String ~> Unit) ~> Unit := req ~> req(\"x\")",
-            "handled_print : String ~> IO<{ puts: Unit }> := handle print with {puts: puts_impl}",
-        ],
-    );
-    let result = typecheck(&lang, ast);
-    assert!(
-        !has_error(&result),
-        "handled arrow should produce A ~> IO(S'), got {:?}",
-        diags_of(&result)
-    );
-}
-
-/// `perform(op, arg)` — the `IO<sig>` op-emission builtin (ADR-0153 §4):
-/// it mints `IO{op: T}` from the op *name* and the arg's type — the
-/// checked-side inverse of the runtime's `io.perform` mint.
-/// `synth_perform` reads the `puts` operand as a name (a bare identifier
-/// is deliberately never env-resolved or checked as a value).
-#[test]
-fn perform_mints_io_sig_from_op_name() {
-    let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &[
-            "x : IO<{ puts: Str }> := perform(puts, \"hi\")",
-            "y : IO<{ puts: Str }> := io.perform(puts, \"hi\")",
-            "z : IO<{ fs: Str }> := perform(\"fs\", \"path\")",
-        ],
-    );
-    let result = typecheck(&lang, ast);
-    assert!(
-        !has_error(&result),
-        "perform should mint IO{{op: T}}, got {:?}",
-        diags_of(&result)
-    );
-}
-
-/// A wrong sig-entry type is a decided mismatch — `perform(puts, "hi")`
-/// is `IO{puts: Str}`, never `IO{puts: Nat}`.
-#[test]
-fn perform_wrong_sig_entry_errors() {
-    let lang = canonical_lang();
-    let ast = parse_block(&lang, &["x : IO<{ puts: Nat }> := perform(puts, \"hi\")"]);
-    let result = typecheck(&lang, ast);
-    assert!(
-        has_error(&result),
-        "IO{{puts: Str}} checked against IO{{puts: Nat}} should error"
-    );
-}
-
-/// `handle` on a `perform`ed op runs the same `handle_sig_check`
-/// coverage logic as a declared effect — the covered entry takes the
-/// impl's declared return type.
-#[test]
-fn perform_through_handle_checks_sig_coverage() {
-    let lang = canonical_lang();
-    // Positive: the covered entry takes the impl's declared return type.
-    let ok = parse_block(
-        &lang,
-        &[
-            "puts_impl : Str ~> Str := s ~> s",
-            "x : IO<{ puts: Str }> := handle perform(puts, \"hi\") with {puts: puts_impl}",
-        ],
-    );
-    let result = typecheck(&lang, ok);
-    assert!(
-        !has_error(&result),
-        "handled perform should check, got {:?}",
-        diags_of(&result)
-    );
-    // A handler declaring ops the performed sig never names is the
-    // WS-F spurious-impl diagnostic; an empty handler covering none of
-    // the performed ops is the guaranteed-no-op diagnostic.
-    let spurious = parse_block(
-        &lang,
-        &[
-            "puts_impl : Str ~> Str := s ~> s",
-            "z := handle perform(puts, \"hi\") with {fs: puts_impl}",
-        ],
-    );
-    let result = typecheck(&lang, spurious);
-    assert!(
-        diags_of(&result).iter().any(|d| d.contains("never names")),
-        "spurious impl should diagnose, got {:?}",
-        diags_of(&result)
-    );
-    let none = parse_block(&lang, &["z := handle perform(puts, \"hi\") with {}"]);
-    let result = typecheck(&lang, none);
-    assert!(
-        diags_of(&result)
-            .iter()
-            .any(|d| d.contains("none of the body's declared ops")),
-        "empty handler should diagnose, got {:?}",
-        diags_of(&result)
-    );
-}
 
 /// `perform` is a *named* op emission — a non-name operand (a computed
 /// expression) is a decided error.
@@ -1905,30 +1687,6 @@ fn perform_is_shadowable() {
     assert!(
         !has_error(&result),
         "a source-level perform binding should shadow the builtin, got {:?}",
-        diags_of(&result)
-    );
-}
-
-/// Effect-row polymorphism: `IO(s)` with `s` a `{…}`-bound sig var — the
-/// implicit `type.pi` binder inserts a fresh meta at application and the
-/// record-width sig unification solves it to the concrete sig object.
-#[test]
-fn sig_row_polymorphism_solves_meta() {
-    let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &[
-            "print : String ~> IO<{ puts: String ~> Unit }> := s ~> print(s)",
-            "id_io<s> : (String ~> IO(s)) ~> String ~> IO(s) := f ~> x ~> f(x)",
-            "y : IO<{ puts: String ~> Unit }> := id_io(print)(\"x\")",
-            "id_sig<s : Sig> : (String ~> IO(s)) ~> String ~> IO(s) := f ~> x ~> f(x)",
-            "z : IO<{ puts: String ~> Unit }> := id_sig(print)(\"x\")",
-        ],
-    );
-    let result = typecheck(&lang, ast);
-    assert!(
-        !has_error(&result),
-        "sig row-metas should solve to the concrete sig, got {:?}",
         diags_of(&result)
     );
 }
@@ -2068,26 +1826,6 @@ fn generic_indexed_instance_resolves() {
     assert!(
         !has_error(&result),
         "Eq (List Nat) should resolve through the generic Eq (List a) instance, got {:?}",
-        diags_of(&result)
-    );
-}
-
-/// The bare-name sig shorthand: `IO<{ puts }>` declares op `puts` with an
-/// unstated request — handler typing still checks coverage.
-#[test]
-fn io_bare_name_sig_checks_coverage() {
-    let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &[
-            "print : String ~> IO<{ puts }> := s ~> print(s)",
-            "x : IO<{ puts }> := handle print(\"x\") with {puts: (s) ~> s}",
-        ],
-    );
-    let result = typecheck(&lang, ast);
-    assert!(
-        !has_error(&result),
-        "bare-name sig should check coverage, got {:?}",
         diags_of(&result)
     );
 }
