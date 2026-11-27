@@ -10,9 +10,9 @@
 //! - `type.family_app{name, args}` — a saturated family application;
 //!   `args` are *index terms*.
 //! - `type.ctor_sig{ctor, family, params, args, result, bare}` — a
-//!   constructor signature spec; [`instantiate_ctor`] re-elaborates it
-//!   per use into a `type.function` chain ending in `family_app` (fresh
-//!   index metavariable per parameter).
+//!   constructor signature spec; [`instantiate_ctor_full`] re-elaborates
+//!   it per use into a `type.function` chain ending in `family_app`
+//!   (fresh index metavariable per parameter).
 //! - Index terms — `Value` numbers, `{"__meta__": id}` metas,
 //!   `{"__tag__": "var", "name": n}` rigid variables, `{"__tag__": "Bin",
 //!   "op": kind, "l", "r"}` and `{"__tag__": "Un", "op", "operand"}`
@@ -1550,7 +1550,7 @@ fn eval_index_fuel(v: &Value, ctx: &TypecheckContext, fuel: u32) -> Value {
 //
 // The rewrite is *decidable, not a rewrite rule*: it runs inside
 // `eval_index`, so every consumer (`unify_index`, `dep_unify`, match
-// refinement, `closed_num`, `eval_ann_term`) sees normal forms before
+// refinement, `eval_ann_term`) sees normal forms before
 // meta-solving. Distribution is bounded (`POLY_*` caps) — a product too
 // large to expand keeps the factored `canon_bin` shape instead of
 // blowing up; that case is not silent, it just stays unnormalized.
@@ -1830,11 +1830,6 @@ fn ring_normalize(v: &Value) -> Option<Value> {
 /// normal form when the term is in the bounded fragment.
 fn ring_canon(v: Value) -> Value {
     ring_normalize(&v).unwrap_or(v)
-}
-
-/// The closed numeric value of a term, if it evaluates to a numeral.
-fn closed_num(v: &Value, ctx: &TypecheckContext) -> Option<f64> {
-    num_val(&eval_index(v, ctx))
 }
 
 /// Whether the `{"__meta__": id}` term `needle` occurs anywhere in `v`
@@ -4169,7 +4164,9 @@ impl NbeTypecheckEngine {
             "IO" => {
                 ctx.diagnostics.push(TypecheckDiagnostic {
                     severity: "warning".to_string(),
-                    message: "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`".to_string(),
+                    message:
+                        "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`"
+                            .to_string(),
                     span: None,
                 });
                 return Ok(self.cub_open_meta(ctx));
@@ -4450,7 +4447,9 @@ impl NbeTypecheckEngine {
                     // whole form is retired).
                     ctx.diagnostics.push(TypecheckDiagnostic {
                         severity: "warning".to_string(),
-                        message: "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`".to_string(),
+                        message:
+                            "`IO` is retired — effects are ambient modes: write `T @ [Algebra(…)]`"
+                                .to_string(),
                         span: node.span,
                     });
                     Ok(self.cub_open_meta(ctx))
@@ -5148,7 +5147,7 @@ impl NbeTypecheckEngine {
     }
 
     // -----------------------------------------------------------------------
-    // `synth_data` / `instantiate_ctor`
+    // `synth_data` / `instantiate_ctor_full`
     // -----------------------------------------------------------------------
 
     /// The `synth_data` judgment: bind `F : type.family{name, base}` (one
@@ -5252,7 +5251,7 @@ impl NbeTypecheckEngine {
             ctx.extend(name.clone(), make_tag(ctx, "type.family", m));
         }
         // Ctor signatures — the `type.ctor_sig` spec re-elaborated per
-        // use by `instantiate_ctor`.
+        // use by `instantiate_ctor_full`.
         for c in &ctors {
             if c.name.is_empty() {
                 continue;
@@ -5505,7 +5504,7 @@ impl NbeTypecheckEngine {
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
     }
 
-    /// Instantiate a `type.ctor_sig` spec into a fresh `type.function`
+    /// Instantiate a `type.ctor_sig` spec into a `type.function`
     /// chain ending in `type.family_app` — one index metavariable per
     /// family parameter (bound in Γ *and* `results` under the internal
     /// `__fam_<name>` spelling, so `xs : Vec(n, a)` elaborates
@@ -5513,53 +5512,6 @@ impl NbeTypecheckEngine {
     /// same meta while a user's rigid `var{n}` stays untouched).
     /// Constructor argument names self-bind to `var{name}` terms so
     /// later domains may mention them.
-    pub(crate) fn instantiate_ctor(&self, spec: &Value, ctx: &mut TypecheckContext) -> Value {
-        let mark = ctx.mark();
-        let old_results = ctx.results.clone();
-        let params: Vec<Value> = spec
-            .get("params")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut metas = Vec::with_capacity(params.len());
-        for p in &params {
-            let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
-            let id = ctx.fresh_meta();
-            if p.get("nat").and_then(Value::as_bool).unwrap_or(false) {
-                ctx.nonneg_metas.insert(id);
-            }
-            let mv = meta_value(id);
-            if !pname.is_empty() {
-                // `__fam_<name>` — family param names are internal to
-                // the telescope, never a user's same-named rigid.
-                let bname = fam_binding_name(pname);
-                ctx.extend(bname.clone(), mv.clone());
-                ctx.bind_result(bname, mv.clone());
-            }
-            metas.push(mv);
-        }
-        let args: Vec<Value> = spec
-            .get("args")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for a in &args {
-            let aname = a.get("name").and_then(Value::as_str).unwrap_or("");
-            if !aname.is_empty() {
-                ctx.extend(aname.to_string(), var_term(aname));
-                ctx.bind_result(aname.to_string(), var_term(aname));
-            }
-        }
-        // This lang/ast-less path only mints the parameter metas and
-        // returns the spec — callers that have `lang`/`ast` use
-        // `instantiate_ctor_full` for the real elaboration.
-        let _ = (args, metas.clone());
-        ctx.restore(mark);
-        ctx.results = old_results;
-        spec.clone()
-    }
-
-    /// Full instantiation with AST access — the real `instantiate_ctor_`.
     pub(crate) fn instantiate_ctor_full(
         &self,
         lang: &Language,
@@ -12842,7 +12794,6 @@ impl NbeTypecheckEngine {
                     .collect::<Map<String, Value>>()
             })
     }
-
 }
 
 impl NbeTypecheckEngine {

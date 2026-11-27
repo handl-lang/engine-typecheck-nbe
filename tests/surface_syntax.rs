@@ -1,5 +1,6 @@
 //! Surface-syntax upgrade coverage (typed-binder Π arrows, dependent
-//! pairs, `~>[n]` dimension arrows, brace-free `IO<ops>` sigs).
+//! pairs, `~>[n]` dimension arrows, brace-free `IO<ops>` sigs — retired
+//! former, PL-0004 G2).
 //!
 //! Harness mirrors `dependent_structure.rs`: parse statements under a
 //! synthetic `block` root and run the NBE engine.
@@ -105,6 +106,13 @@ fn diags_of(result: &hnl_tool_typecheck::TypecheckResult) -> Vec<String> {
 
 fn has_error(result: &hnl_tool_typecheck::TypecheckResult) -> bool {
     result.diagnostics.iter().any(|d| d.severity == "error")
+}
+
+fn has_warning_containing(result: &hnl_tool_typecheck::TypecheckResult, needle: &str) -> bool {
+    result
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == "warning" && d.message.contains(needle))
 }
 
 /// `(x : A) ~> B` in type position mints the same `type.pi` `Pi(A, x ~>
@@ -279,11 +287,14 @@ fn graded_arrow_effects_mode_descriptor() {
     );
 }
 
-/// `IO<puts, fs>` — the brace-free sig record: bare names declare ops
-/// (`type.unknown` payload), `name : T` declares the payload type.
-/// Widening/coverage rules are identical to `IO<{ … }>`.
+/// `IO<puts, fs>` — the brace-free sig record still *parses* (bare
+/// names declare ops, `name : T` declares the payload type), but the
+/// `type.io` former is retired (PL-0004 G2): every `IO<…>` site warns
+/// and binds an open meta — effects are ambient modes
+/// (`T @ [Algebra(…)]`). The `handle`-coverage spelling it fed is gone
+/// with `handle_sig_check`.
 #[test]
-fn io_bare_sig_record() {
+fn io_bare_sig_record_retired() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
@@ -291,18 +302,18 @@ fn io_bare_sig_record() {
             "export printLn : Str ~> IO<puts> := s ~> printLn(s)",
             "export readFile : Str ~> IO<fs> := p ~> readFile(p)",
             "export both : Str ~> IO<puts, fs> := s ~> both(s)",
-            "puts_handler : (Str ~> Unit) ~> Unit := req ~> req(\"handled\")",
-            "fs_handler : (Str ~> Str) ~> Str := req ~> req(\"contents\")",
-            "handled_partial : Str ~> IO<puts: Unit, fs> := handle both with {puts: puts_handler}",
-            "handled_full : Str ~> IO<puts: Unit, fs: Str> := handle both with {puts: puts_handler, fs: fs_handler}",
-            "widen_ok : Str ~> IO<puts, fs> := s ~> printLn(s)",
             "braced : Str ~> IO<{ puts, fs }> := s ~> both(s)",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "IO<puts, fs> should check like IO<{{ puts, fs }}>, got {:?}",
+        "IO<puts, fs> still checks via the retired-former honest bound, got {:?}",
+        diags_of(&result)
+    );
+    assert!(
+        has_warning_containing(&result, "`IO` is retired"),
+        "expected the retired-former warning, got {:?}",
         diags_of(&result)
     );
 }

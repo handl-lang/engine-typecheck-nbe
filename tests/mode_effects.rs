@@ -2,15 +2,16 @@
 //! design/effects-ambient-modes.md v2 §3/§4.2/§6): `perform(Head, arg)`
 //! resolves domain/codomain from the head's declared `op : A ~> B` and
 //! *requires* `Head` in the ambient mode set (absent → hard rejection;
-//! undeclared op names keep the honest-bound `IO{op:T}` mint + warning),
+//! undeclared op names get the honest bound — warn + a fresh type
+//! meta, no `IO` mint since G2),
 //! `handle` is a modality `μ → μ′` over mode *elements* — coverage,
 //! `op ↦ ret` re-keying, `μ ∖ H`, and `μ_handler` union, requires-closed
 //! — `>>>` composes mode sets by head union, and `@ μ` ascriptions
 //! check widening by set inclusion over heads.
 //!
 //! The `Effects(S)` row encoding is retired: row *keys* are not mode
-//! heads, so `perform(puts, …)` under `@ [Effects({ puts: … })]` keeps
-//! only the honest bound (warn + `IO` mint — pinned by
+//! heads, so `perform(puts, …)` under `@ [Effects({ puts: … })]` gets
+//! only the honest bound (warn + fresh meta — pinned by
 //! `effects_row_keys_are_not_heads`).
 //!
 //! Harness mirrors `mode_granular.rs`: parse statements under a
@@ -215,24 +216,24 @@ fn ambient_perform_head_not_permitted_rejected() {
     );
 }
 
-/// An op *name* with no declared `op` field keeps the legacy
-/// `IO{op:T}` codomain path *with a warning* — the honest bound while
-/// the `IO<sig>` spelling transitions out (G2).
+/// An op *name* with no declared `op` field gets the honest bound —
+/// warn + a fresh type meta (G2 retired the `IO{op:T}` mint with the
+/// `type.io` former).
 #[test]
-fn ambient_perform_undeclared_op_warns_and_mints_io() {
+fn ambient_perform_undeclared_op_warns_and_binds_meta() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
             ALGEBRA_STUB,
             "PutStr := new Algebra { op: Str ~> Unit }",
-            "x : IO<{ fs: Str }> @ [PutStr] := perform(fs, \"x\")",
+            "x : Str @ [PutStr] := perform(fs, \"x\")",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "undeclared op falls back to the IO mint (honest bound), got {:?}",
+        "undeclared op falls back to warn + fresh meta (honest bound), got {:?}",
         diags_of(&result)
     );
     assert!(
@@ -244,19 +245,19 @@ fn ambient_perform_undeclared_op_warns_and_mints_io() {
 
 /// The retired `Effects(S)` row does not make its keys performable
 /// heads: `puts` inside `Effects({ puts: … })` is a row entry, not a
-/// declared algebra — `perform(puts, …)` keeps only the honest bound
-/// (warn + `IO` mint), exactly like any undeclared op name.
+/// declared algebra — `perform(puts, …)` gets only the honest bound
+/// (warn + fresh meta), exactly like any undeclared op name.
 #[test]
 fn effects_row_keys_are_not_heads() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
-        &["x : IO<{ puts: Str }> @ [Effects({ puts: Str ~> Unit })] := perform(puts, \"hi\")"],
+        &["x : Str @ [Effects({ puts: Str ~> Unit })] := perform(puts, \"hi\")"],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "row keys are not granular heads — the IO mint is the honest bound, got {:?}",
+        "row keys are not granular heads — warn + fresh meta is the honest bound, got {:?}",
         diags_of(&result)
     );
     assert!(
@@ -266,21 +267,22 @@ fn effects_row_keys_are_not_heads() {
     );
 }
 
-/// Un-annotated code is unaffected: `perform` with no ambient mode
-/// mints `IO{op:T}` silently, exactly as before G1.
+/// Un-annotated code gets the same honest bound: `perform` with no
+/// ambient mode warns and binds a fresh meta — G2 removed the silent
+/// `IO{op:T}` mint even without a mode ascription.
 #[test]
-fn unannotated_perform_unchanged() {
+fn unannotated_perform_warns_and_binds_meta() {
     let lang = canonical_lang();
-    let ast = parse_block(&lang, &["x : IO<{ puts: Str }> := perform(puts, \"a\")"]);
+    let ast = parse_block(&lang, &["x : Str := perform(puts, \"a\")"]);
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "un-annotated perform must check identically, got {:?}",
+        "un-annotated perform must check via the honest bound, got {:?}",
         diags_of(&result)
     );
     assert!(
-        !has_warning_containing(&result, "not a declared effect algebra"),
-        "no ambient mode must not warn, got {:?}",
+        has_warning_containing(&result, "not a declared effect algebra"),
+        "undeclared op warns even without an ambient mode, got {:?}",
         diags_of(&result)
     );
 }

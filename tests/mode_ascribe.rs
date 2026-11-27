@@ -9,7 +9,7 @@
 //! (order irrelevant, one element per head, duplicate heads rejected),
 //! head resolution (`mode.algebra.*` globals + `new Algebra`
 //! declarations), the mode-metavariable honest bound, and the `IO<…>`
-//! deprecation diagnostic.
+//! retired-former diagnostic (G2 — points at `T @ [Algebra(…)]`).
 //!
 //! Harness mirrors `surface_syntax.rs`: parse statements under a
 //! synthetic `block` root and run the NBE engine.
@@ -124,18 +124,21 @@ fn has_warning_containing(result: &hnl_tool_typecheck::TypecheckResult, needle: 
         .any(|d| d.severity == "warning" && d.message.contains(needle))
 }
 
-/// `x : T @ [Effects(S)] := v` checks cleanly: the `Effects` head
-/// resolves through the canonical `mode.algebra.Effects` global, the
-/// mode set elaborates, and the value checks against `T` exactly as
-/// the un-annotated form (μ is judgement metadata, not part of `A`).
+/// `x : T @ [Head] := v` checks cleanly: a `new Algebra`-declared head
+/// resolves, the mode set elaborates, and the value checks against `T`
+/// exactly as the un-annotated form (μ is judgement metadata, not part
+/// of `A`). (`Effects` itself is no longer a registered global — the
+/// `Effects(S)` row encoding retired with PL-0004 G2.)
 #[test]
-fn effects_ascription_checks() {
+fn declared_head_ascription_checks() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Unit }",
             "plain : Nat := 1",
-            "eff : Nat @ [Effects({ puts: Str ~> Unit })] := 1",
+            "eff : Nat @ [PutStr] := 1",
             "pure : Nat @ [] := 2",
         ],
     );
@@ -147,7 +150,7 @@ fn effects_ascription_checks() {
     );
     assert!(
         !has_warning_containing(&result, "unknown algebra head"),
-        "Effects is a registered algebra head, got {:?}",
+        "a `new Algebra` head resolves without warning, got {:?}",
         diags_of(&result)
     );
 }
@@ -157,9 +160,9 @@ fn effects_ascription_checks() {
 /// replaces it with the real algebra type).
 const ALGEBRA_STUB: &str = "Algebra<c : Type> := { mkAlgebra : (compose : c ~> c ~> c, unit : c, order : c ~> c ~> Bool) ~> Algebra }";
 
-/// Set semantics: one element per algebra head — `Effects` and a
-/// `new Algebra`-declared `Cost` compose in one ascription, order
-/// irrelevant, and the declared head resolves without a warning.
+/// Set semantics: one element per algebra head — two `new
+/// Algebra`-declared heads compose in one ascription, order irrelevant,
+/// and both resolve without a warning.
 #[test]
 fn multi_algebra_set_and_declared_head() {
     let lang = canonical_lang();
@@ -168,8 +171,9 @@ fn multi_algebra_set_and_declared_head() {
         &[
             ALGEBRA_STUB,
             "Cost := new Algebra(Nat) { compose: (a, b) ~> a + b, unit: 0, order: (a, b) ~> a <= b }",
-            "f : Nat @ [Effects({ puts: Str ~> Unit }), Cost(3)] := 1",
-            "g : Nat @ [Cost(3), Effects({ fs: Str ~> Str })] := 2",
+            "FsRead := new Algebra { op: Unit ~> Str }",
+            "f : Nat @ [FsRead, Cost(3)] := 1",
+            "g : Nat @ [Cost(3), FsRead] := 2",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -190,11 +194,18 @@ fn multi_algebra_set_and_declared_head() {
 #[test]
 fn duplicate_head_rejected() {
     let lang = canonical_lang();
-    let ast = parse_block(&lang, &["bad : Nat @ [Effects(A), Effects(B)] := 1"]);
+    let ast = parse_block(
+        &lang,
+        &[
+            ALGEBRA_STUB,
+            "FsRead := new Algebra { op: Unit ~> Str }",
+            "bad : Nat @ [FsRead, FsRead] := 1",
+        ],
+    );
     let result = typecheck(&lang, ast);
     assert!(
         has_error(&result),
-        "duplicate `Effects` heads must be rejected, got {:?}",
+        "duplicate `FsRead` heads must be rejected, got {:?}",
         diags_of(&result)
     );
     assert!(
@@ -236,8 +247,10 @@ fn mode_metavariable_honest_bound() {
             "f : Nat @ m := 1",
             "g : Nat @ [m] := 2",
             // A bound payload name resolves — `S` is results-bound, so
-            // `Effects(S)` elaborates silently (only *unbound* bare
-            // vars warn as metavariables).
+            // `Effects(S)` elaborates without a *metavariable* warning
+            // (`Effects` itself is now an unknown head — the retired
+            // `Effects(S)` row global — which warns separately; only
+            // *unbound* bare vars warn as metavariables).
             "S := 0",
             "h : Nat @ [Effects(S)] := 3",
         ],
@@ -276,11 +289,11 @@ fn unannotated_code_unaffected() {
     );
 }
 
-/// `IO(…)`/`IO<…>` surface sites carry the deprecation diagnostic
-/// pointing at `@ [Effects(S)]` — warn, don't reject (the corpus
-/// migrates phase by phase).
+/// `IO(…)`/`IO<…>` surface sites carry the retired-former diagnostic
+/// pointing at `T @ [Algebra(…)]` — warn + an open meta, don't reject
+/// (the corpus migrates phase by phase; PL-0004 G2).
 #[test]
-fn io_former_deprecated_warning() {
+fn io_former_retired_warning() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
@@ -291,17 +304,17 @@ fn io_former_deprecated_warning() {
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "IO<…> still checks (deprecation is a warning), got {:?}",
+        "IO<…> still checks (retirement is a warning + open meta), got {:?}",
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "`IO(…)`/`IO<…>` is deprecated"),
-        "expected the IO deprecation warning, got {:?}",
+        has_warning_containing(&result, "`IO` is retired"),
+        "expected the IO retired-former warning, got {:?}",
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "@ [Effects(S)]"),
-        "deprecation must point at the ambient spelling, got {:?}",
+        has_warning_containing(&result, "T @ [Algebra(…)]"),
+        "retirement must point at the ambient spelling, got {:?}",
         diags_of(&result)
     );
 }

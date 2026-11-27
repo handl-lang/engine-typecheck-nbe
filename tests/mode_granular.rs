@@ -390,23 +390,29 @@ fn compositional_algebra_still_composes_payloads() {
     );
 }
 
-/// Un-annotated code is unaffected: `perform` with no ambient mode
-/// mints `IO{op:T}` silently, exactly as before G0.
+/// Un-annotated code gets the same honest bound: `perform` with no
+/// ambient mode warns and binds a fresh meta — G2 removed the silent
+/// `IO{op:T}` mint (and the `IO<sig>` spelling) entirely.
 #[test]
-fn unannotated_perform_unchanged() {
+fn unannotated_perform_warns_and_binds_meta() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
             ALGEBRA_STUB,
             "PutStr := new Algebra { op: Str ~> Unit }",
-            "x : IO<{ puts: Str }> := perform(puts, \"a\")",
+            "x : Str := perform(puts, \"a\")",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "un-annotated perform must check identically, got {:?}",
+        "un-annotated perform must check via the honest bound, got {:?}",
+        diags_of(&result)
+    );
+    assert!(
+        has_warning_containing(&result, "not a declared effect algebra"),
+        "undeclared op warns even without an ambient mode, got {:?}",
         diags_of(&result)
     );
 }

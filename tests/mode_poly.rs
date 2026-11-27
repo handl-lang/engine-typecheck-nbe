@@ -205,19 +205,16 @@ fn bare_mode_metavariable_mints_meta() {
 
 /// `perform` under a symbolic `Effects` payload: `puts` is not a
 /// declared effect head (row keys are not heads under G1), so the
-/// honest bound is warn + the legacy `IO` mint — the `IO<sig>`
-/// spelling G2 retires.
+/// honest bound is warn + a fresh type meta — G2 retired the legacy
+/// `IO` mint and the `IO<sig>` spelling it fed.
 #[test]
-fn perform_under_symbolic_row_warns_and_mints() {
+fn perform_under_symbolic_row_warns_and_binds_meta() {
     let lang = canonical_lang();
-    let ast = parse_block(
-        &lang,
-        &["x : IO<{ puts: Str }> @ [Effects(r)] := perform(puts, \"a\")"],
-    );
+    let ast = parse_block(&lang, &["x : Str @ [Effects(r)] := perform(puts, \"a\")"]);
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "undeclared perform must fall back to the IO mint, got {:?}",
+        "undeclared perform must fall back to warn + fresh meta, got {:?}",
         diags_of(&result)
     );
     assert!(
@@ -258,11 +255,12 @@ fn compose_bridges_non_effects_algebra() {
     );
 }
 
-/// `Effects` payload metas compose through the `Val`-descriptor
-/// bridge: `?r ⋄ {puts}` cannot union without a solver — the retired
-/// `row_union` opcode is an unknown compose op (honest bound +
-/// warning) — and the composite still passes a wider concrete
-/// ascription (the payload meta unifies at subsumption).
+/// `Effects` payload metas compose through the honest bound: with the
+/// `Effects(S)` row global retired (PL-0004 G2), `Effects` is an
+/// unknown head — `?r ⋄ {puts}` cannot union without a solver, so
+/// compose falls back to the `default` algebra with a warning — and
+/// the composite still passes a wider concrete ascription (the
+/// payload meta unifies at subsumption).
 #[test]
 fn compose_effects_meta_honest_bound() {
     let lang = canonical_lang();
@@ -282,7 +280,7 @@ fn compose_effects_meta_honest_bound() {
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "unknown algebra compose op"),
+        has_warning_containing(&result, "unknown algebra head `Effects`"),
         "expected the compose honest-bound warning, got {:?}",
         diags_of(&result)
     );
