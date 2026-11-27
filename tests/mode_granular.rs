@@ -343,8 +343,10 @@ fn granular_subsumption_accepts_narrower_set() {
 }
 
 /// The `Effects(S)` transition path still works alongside granular
-/// heads: an `Effects` row ascription keeps its row machinery, and a
-/// granular head in the same set composes by union.
+/// heads: an `Effects` row ascription keeps its row element (G1
+/// retired the row machinery — `Effects` is now an ordinary head
+/// name), and a granular head in the same set composes by union.
+/// `perform` names the granular head: row keys are not heads.
 #[test]
 fn effects_row_and_granular_heads_coexist() {
     let lang = canonical_lang();
@@ -353,7 +355,7 @@ fn effects_row_and_granular_heads_coexist() {
         &[
             ALGEBRA_STUB,
             "PutStr := new Algebra { op: Str ~> Unit }",
-            "greet : Unit @ [Effects({ puts: Str ~> Unit }), PutStr] := perform(puts, \"hi\")",
+            "greet : Unit @ [Effects({ puts: Str ~> Unit }), PutStr] := perform(PutStr, \"hi\")",
         ],
     );
     let result = typecheck(&lang, ast);

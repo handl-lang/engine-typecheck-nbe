@@ -2634,10 +2634,10 @@ impl NbeTypecheckEngine {
                         ctx.ambient_mode = p;
                     }
                     let expr_type = expr_res?;
-                    // PL-0004 E2: effect widening — the subject's own
-                    // ambient mode must be ≤ the ascribed μ (the
-                    // `Effects` algebra's `order`/`row_width` at the
-                    // ambient site). Terms with no recorded mode pass.
+                    // PL-0004 E2/G1: effect widening — the subject's
+                    // own ambient mode must be ≤ the ascribed μ (set
+                    // inclusion over mode heads). Terms with no
+                    // recorded mode pass.
                     if let Some(mu_a) = &mode_scope
                         && let Some(mu_v) = self.mode_of_node(ast, expr_idx, ctx)
                     {
@@ -6559,12 +6559,13 @@ struct TypecheckContext {
     /// `mode_ascribe` arm reach it (no duplicate diagnostics).
     mode_set_cache: HashMap<usize, Value>,
     /// Effects performed under the ambient mode, in synthesis order
-    /// (PL-0004 E2): `(op name, op row-entry type `A ~> B`)` appended
-    /// by `synth_perform`'s ambient arm — the judgement-mode extension
-    /// `perform` records so `handle` can compute the residual row.
-    /// `synth_handle_judgment` slices from a mark taken before its
-    /// target's synthesis and rewrites the slice to the residual, so
-    /// nested handles propagate exactly the unhandled ops outward.
+    /// (PL-0004 E2/G1): `(op head name, op signature `A ~> B`)`
+    /// appended by `synth_perform`'s granular arm — the judgement-mode
+    /// extension `perform` records so `handle` can compute the
+    /// residual `(μ ∖ H) ∪ {op ↦ ret} ∪ μ_handler`. `synth_handle_judgment`
+    /// slices from marks bracketing the target's and impl's synthesis
+    /// and rewrites the slice to the residual, so nested handles
+    /// propagate exactly the unhandled ops outward.
     performed_effects: Vec<(String, Value)>,
     /// Elaboration-scoped mode metavariables (PL-0004 E3): `name →
     /// tagged meta id` for unbound `var`s inside `@ μ` ascriptions.

@@ -176,36 +176,37 @@ fn expected_side_metavariable_instantiates() {
     );
 }
 
-/// Actual-side symbolic row: `f`'s `Effects(?r)` cannot be enumerated
-/// — subsumption honest-bounds (warning + pass), never rejects. (E2
-/// read the symbolic payload as the empty row and rejected every
-/// effect — the regression this fixes.)
+/// An unbound `var` *head* inside `@ […]` is a mode metavariable: it
+/// warns (honest bound) but mints a unifiable meta — a head-less
+/// element the head-set subsumption cannot enumerate, so widening
+/// checks pass (never reject) while elaboration stays honest.
 #[test]
-fn actual_side_symbolic_row_honest_bound() {
+fn bare_mode_metavariable_mints_meta() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "f : (Str ~> Str) @ [Effects(r)] := t ~> t",
+            "f : (Str ~> Str) @ [m] := t ~> t",
             "x : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := f",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "symbolic actual row must honest-bound, got {:?}",
+        "head-less mode metavariable must not reject, got {:?}",
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "`Effects` row is symbolic"),
-        "expected the symbolic-row warning, got {:?}",
+        has_warning_containing(&result, "mode metavariable `m`"),
+        "expected the metavariable warning, got {:?}",
         diags_of(&result)
     );
 }
 
-/// `perform` under a symbolic `Effects` payload cannot decide op
-/// membership — warn + the legacy `IO` mint (the E2 dual-path
-/// decision stays warn+mint until the corpus migrates).
+/// `perform` under a symbolic `Effects` payload: `puts` is not a
+/// declared effect head (row keys are not heads under G1), so the
+/// honest bound is warn + the legacy `IO` mint — the `IO<sig>`
+/// spelling G2 retires.
 #[test]
 fn perform_under_symbolic_row_warns_and_mints() {
     let lang = canonical_lang();
@@ -216,12 +217,12 @@ fn perform_under_symbolic_row_warns_and_mints() {
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "symbolic-row perform must fall back to the IO mint, got {:?}",
+        "undeclared perform must fall back to the IO mint, got {:?}",
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "`Effects` row is symbolic"),
-        "expected the symbolic-row perform warning, got {:?}",
+        has_warning_containing(&result, "not a declared effect algebra"),
+        "expected the undeclared-op warning, got {:?}",
         diags_of(&result)
     );
 }
@@ -257,10 +258,11 @@ fn compose_bridges_non_effects_algebra() {
     );
 }
 
-/// `Effects` row metas compose to the honest bound: `?r ⋄ {puts}`
-/// cannot union without a solver — fresh meta + warning — and the
-/// composite still passes a wider concrete ascription (symbolic
-/// actual row).
+/// `Effects` payload metas compose through the `Val`-descriptor
+/// bridge: `?r ⋄ {puts}` cannot union without a solver — the retired
+/// `row_union` opcode is an unknown compose op (honest bound +
+/// warning) — and the composite still passes a wider concrete
+/// ascription (the payload meta unifies at subsumption).
 #[test]
 fn compose_effects_meta_honest_bound() {
     let lang = canonical_lang();
@@ -280,7 +282,7 @@ fn compose_effects_meta_honest_bound() {
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "`Effects` payload is not a row record"),
+        has_warning_containing(&result, "unknown algebra compose op"),
         "expected the compose honest-bound warning, got {:?}",
         diags_of(&result)
     );

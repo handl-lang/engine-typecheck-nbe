@@ -1,13 +1,22 @@
-//! Effects as ambient modes — E2 consumers (PL-0004;
-//! design/effects-ambient-modes.md §3): `perform` extends the ambient
-//! mode's `Effects` row and returns the op's codomain (no `IO{op:T}`
-//! mint), `handle` is a modality `μ → μ′` with the coverage/residual
-//! computation ported behind it, `>>>` composes the rows
-//! (`{puts} ⋄ {fs} = {puts,fs}`), and `@ μ` ascriptions check effect
-//! widening through the `Effects` algebra's `order`/`row_width`.
+//! Effects as ambient modes — G1 granular consumers (PL-0004;
+//! design/effects-ambient-modes.md v2 §3/§4.2/§6): `perform(Head, arg)`
+//! resolves domain/codomain from the head's declared `op : A ~> B` and
+//! *requires* `Head` in the ambient mode set (absent → hard rejection;
+//! undeclared op names keep the honest-bound `IO{op:T}` mint + warning),
+//! `handle` is a modality `μ → μ′` over mode *elements* — coverage,
+//! `op ↦ ret` re-keying, `μ ∖ H`, and `μ_handler` union, requires-closed
+//! — `>>>` composes mode sets by head union, and `@ μ` ascriptions
+//! check widening by set inclusion over heads.
 //!
-//! Harness mirrors `mode_ascribe.rs`: parse statements under a
-//! synthetic `block` root and run the NBE engine.
+//! The `Effects(S)` row encoding is retired: row *keys* are not mode
+//! heads, so `perform(puts, …)` under `@ [Effects({ puts: … })]` keeps
+//! only the honest bound (warn + `IO` mint — pinned by
+//! `effects_row_keys_are_not_heads`).
+//!
+//! Harness mirrors `mode_granular.rs`: parse statements under a
+//! synthetic `block` root and run the NBE engine. `Algebra` itself is
+//! stubbed exactly as `mode_ascribe.rs`/`new_decl.rs` do (M2 owns the
+//! real former).
 
 use handl_kit_data_prelude::language_from_yaml;
 use handl_language::{Ast, AstNode, AstRef, Language};
@@ -119,9 +128,14 @@ fn has_warning_containing(result: &hnl_tool_typecheck::TypecheckResult, needle: 
         .any(|d| d.severity == "warning" && d.message.contains(needle))
 }
 
-/// `perform(op, arg)` under `@ [Effects({op: A ~> B})]` checks `arg`
-/// against the declared domain `A` and returns the codomain `B` —
-/// no `IO{op:T}` mint (a minted `IO` would fail the `Unit`
+/// Stub `Algebra` former — a record-family so `Algebra(Nat)`/bare
+/// `Algebra` declarations elaborate (same stub `mode_ascribe.rs` uses;
+/// M2 owns the real former).
+const ALGEBRA_STUB: &str = "Algebra<c : Type> := { mkAlgebra : (compose : c ~> c ~> c, unit : c, order : c ~> c ~> Bool) ~> Algebra }";
+
+/// `perform(Head, arg)` under `@ […, Head, …]` checks `arg` against
+/// the head's declared `op : A ~> B` domain and returns the codomain
+/// `B` — no `IO{op:T}` mint (a minted `IO` would fail the `Unit`
 /// annotation's unification).
 #[test]
 fn ambient_perform_returns_codomain() {
@@ -129,8 +143,11 @@ fn ambient_perform_returns_codomain() {
     let ast = parse_block(
         &lang,
         &[
-            "greet : Unit @ [Effects({ puts: Str ~> Unit })] := perform(puts, \"hi\")",
-            "read : Str @ [Effects({ gets: Unit ~> Str })] := perform(gets)",
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Unit }",
+            "GetStr := new Algebra { op: Unit ~> Str }",
+            "greet : Unit @ [PutStr] := perform(PutStr, \"hi\")",
+            "read : Str @ [GetStr] := perform(GetStr)",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -141,14 +158,18 @@ fn ambient_perform_returns_codomain() {
     );
 }
 
-/// The declared domain is enforced: `perform(puts, 1)` against
-/// `puts : Str ~> Unit` rejects (the argument is not a `Str`).
+/// The declared domain is enforced: `perform(PutStr, 1)` against
+/// `op: Str ~> Unit` rejects (the argument is not a `Str`).
 #[test]
 fn ambient_perform_checks_domain() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
-        &["bad : Unit @ [Effects({ puts: Str ~> Unit })] := perform(puts, 1)"],
+        &[
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Unit }",
+            "bad : Unit @ [PutStr] := perform(PutStr, 1)",
+        ],
     );
     let result = typecheck(&lang, ast);
     assert!(
@@ -156,33 +177,97 @@ fn ambient_perform_checks_domain() {
         "perform with a wrong-typed argument must reject, got {:?}",
         diags_of(&result)
     );
+    assert!(
+        diags_of(&result)
+            .iter()
+            .any(|d| d.contains("does not match op `PutStr`'s domain")),
+        "expected the op-domain diagnostic, got {:?}",
+        diags_of(&result)
+    );
 }
 
-/// An op missing from the ambient `Effects` row keeps the legacy
-/// `IO{op:T}` codomain path *with a warning* — the dual-path
-/// transition (the smoke corpus still spells effects `IO<…>`).
+/// G1 hard rejection: a *declared* op head absent from the ambient
+/// mode set is not permitted — no `IO` mint fallback.
 #[test]
-fn ambient_perform_missing_op_warns_and_mints_io() {
+fn ambient_perform_head_not_permitted_rejected() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
-        &["x : IO<{ fs: Str }> @ [Effects({ puts: Str ~> Unit })] := perform(fs, \"x\")"],
+        &[
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Unit }",
+            "GetStr := new Algebra { op: Unit ~> Str }",
+            "bad : Str @ [PutStr] := perform(GetStr)",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        has_error(&result),
+        "perform of an unpermitted declared head must reject, got {:?}",
+        diags_of(&result)
+    );
+    assert!(
+        diags_of(&result)
+            .iter()
+            .any(|d| d.contains("effect head `GetStr` is not permitted")),
+        "expected the not-permitted diagnostic, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// An op *name* with no declared `op` field keeps the legacy
+/// `IO{op:T}` codomain path *with a warning* — the honest bound while
+/// the `IO<sig>` spelling transitions out (G2).
+#[test]
+fn ambient_perform_undeclared_op_warns_and_mints_io() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Unit }",
+            "x : IO<{ fs: Str }> @ [PutStr] := perform(fs, \"x\")",
+        ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "missing op falls back to the IO mint (transition), got {:?}",
+        "undeclared op falls back to the IO mint (honest bound), got {:?}",
         diags_of(&result)
     );
     assert!(
-        has_warning_containing(&result, "not in the ambient mode's `Effects` row"),
-        "expected the missing-op transition warning, got {:?}",
+        has_warning_containing(&result, "not a declared effect algebra"),
+        "expected the undeclared-op warning, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// The retired `Effects(S)` row does not make its keys performable
+/// heads: `puts` inside `Effects({ puts: … })` is a row entry, not a
+/// declared algebra — `perform(puts, …)` keeps only the honest bound
+/// (warn + `IO` mint), exactly like any undeclared op name.
+#[test]
+fn effects_row_keys_are_not_heads() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &["x : IO<{ puts: Str }> @ [Effects({ puts: Str ~> Unit })] := perform(puts, \"hi\")"],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "row keys are not granular heads — the IO mint is the honest bound, got {:?}",
+        diags_of(&result)
+    );
+    assert!(
+        has_warning_containing(&result, "not a declared effect algebra"),
+        "expected the undeclared-op warning, got {:?}",
         diags_of(&result)
     );
 }
 
 /// Un-annotated code is unaffected: `perform` with no ambient mode
-/// mints `IO{op:T}` silently, exactly as before E2.
+/// mints `IO{op:T}` silently, exactly as before G1.
 #[test]
 fn unannotated_perform_unchanged() {
     let lang = canonical_lang();
@@ -194,25 +279,29 @@ fn unannotated_perform_unchanged() {
         diags_of(&result)
     );
     assert!(
-        !has_warning_containing(&result, "ambient mode's `Effects` row"),
-        "pure ambient must not warn, got {:?}",
+        !has_warning_containing(&result, "not a declared effect algebra"),
+        "no ambient mode must not warn, got {:?}",
         diags_of(&result)
     );
 }
 
-/// `handle m with h` as a modality `μ → μ′`: the handler's ops are
-/// checked against the handled computation's `Effects` row (the
-/// binding-carried mode), covered entries take the impl's return
-/// type, and the residual mode propagates to the binding.
+/// `handle m with h` as a modality `μ → μ′` over mode elements: the
+/// handler's op fields are checked against the handled computation's
+/// mode heads (the binding-carried mode), covered heads re-key to the
+/// impl's return type, and the residual mode propagates to the
+/// binding — a second `handle` still sees the covered head.
 #[test]
 fn ambient_handle_modality() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "f : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := s ~> s",
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
             "puts_h : Str ~> Str := s ~> s",
-            "handled := handle f with { puts: puts_h }",
+            "handled := handle f with { PutStr: puts_h }",
+            "handled_again := handle handled with { PutStr: puts_h }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -223,17 +312,20 @@ fn ambient_handle_modality() {
     );
 }
 
-/// Coverage diagnostics are preserved on the ambient path: a handler
-/// declaring an op the handled row never names is spurious.
+/// Coverage diagnostics are preserved on the granular path: a handler
+/// declaring an op the handled mode never names is spurious.
 #[test]
 fn ambient_handle_spurious_impl_rejected() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "f : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := s ~> s",
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "FsWrite := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
             "fs_h : Str ~> Str := s ~> s",
-            "bad := handle f with { fs: fs_h }",
+            "bad := handle f with { FsWrite: fs_h }",
         ],
     );
     let result = typecheck(&lang, ast);
@@ -249,75 +341,136 @@ fn ambient_handle_spurious_impl_rejected() {
     );
 }
 
-/// `>>>` computes the effect rows: `{puts} ⋄ {fs} = {puts,fs}` — the
-/// composed binding's mode is the union, and an ascription naming
-/// both ops accepts it (row_width subsumption).
+/// `μ_handler` unions into the residual (design §4.2): a handler impl
+/// that itself performs `Ioctl` leaves `Ioctl` in the handled
+/// computation's residual mode, so the ascription must permit it.
 #[test]
-fn composition_unions_effect_rows() {
+fn handle_residual_unions_handler_effects() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "f : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := s ~> s",
-            "g : (Str ~> Str) @ [Effects({ fs: Str ~> Str })] := s ~> s",
-            "h := g >>> f",
-            "both : (Str ~> Str) @ [Effects({ puts: Str ~> Str, fs: Str ~> Str })] := h",
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "Ioctl := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
+            "handled : (Str ~> Str) @ [PutStr, Ioctl] := handle f with { PutStr: s ~> perform(Ioctl, \"x\") }",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "composed rows should union and subsume, got {:?}",
+        "handler effects must union into the residual, got {:?}",
         diags_of(&result)
     );
 }
 
-/// Effect widening is directional: `h`'s `{puts, fs}` row does not
-/// fit an ascription permitting only `{puts}` — `fs` is undecided
-/// (`row_width`: every actual key must be in the expected row).
+/// Requires-closure of the residual (design §4.1/§6): `Ioctl
+/// requires [FsRead]` — the residual mode set must carry `FsRead`
+/// even though nothing performed or handled it, so an *outer*
+/// `handle` sees `FsRead` as a coverable op rather than a spurious
+/// impl.
 #[test]
-fn subsumption_rejects_uncovered_effect() {
+fn handle_residual_is_requires_closed() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "f : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := s ~> s",
-            "g : (Str ~> Str) @ [Effects({ fs: Str ~> Str })] := s ~> s",
+            ALGEBRA_STUB,
+            "FsRead := new Algebra { op: Str ~> Str }",
+            "Ioctl := new Algebra { op: Str ~> Str, requires: [FsRead] }",
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
+            "r_h : Str ~> Str := s ~> s",
+            "handled : (Str ~> Str) @ [PutStr, Ioctl] := handle f with { PutStr: s ~> perform(Ioctl, \"x\") }",
+            "outer := handle handled with { FsRead: r_h }",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "requires-closed residual must expose implied heads to outer handles, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// `>>>` computes the mode set: `{PutStr} ⋄ {FsWrite} = {PutStr,
+/// FsWrite}` — the composed binding's mode is the union, and an
+/// ascription naming both heads accepts it (set inclusion).
+#[test]
+fn composition_unions_mode_heads() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "FsWrite := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
+            "g : (Str ~> Str) @ [FsWrite] := s ~> s",
             "h := g >>> f",
-            "narrow : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := h",
+            "both : (Str ~> Str) @ [PutStr, FsWrite] := h",
+        ],
+    );
+    let result = typecheck(&lang, ast);
+    assert!(
+        !has_error(&result),
+        "composed mode sets should union and subsume, got {:?}",
+        diags_of(&result)
+    );
+}
+
+/// Effect widening is directional: `{PutStr, FsWrite} ≰ {PutStr}` —
+/// `FsWrite` is not permitted by the narrower ascription.
+#[test]
+fn subsumption_rejects_uncovered_head() {
+    let lang = canonical_lang();
+    let ast = parse_block(
+        &lang,
+        &[
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "FsWrite := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
+            "g : (Str ~> Str) @ [FsWrite] := s ~> s",
+            "h := g >>> f",
+            "narrow : (Str ~> Str) @ [PutStr] := h",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         has_error(&result),
-        "widening beyond the ascribed row must reject, got {:?}",
+        "widening beyond the ascribed mode set must reject, got {:?}",
         diags_of(&result)
     );
     assert!(
         diags_of(&result)
             .iter()
-            .any(|d| d.contains("ambient mode subsumption")),
+            .any(|d| d.contains("effect head `FsWrite` is not permitted")),
         "expected the subsumption diagnostic, got {:?}",
         diags_of(&result)
     );
 }
 
-/// A narrower actual row fits a wider ascription — `{puts} ≤
-/// {puts, fs}` is exactly the `io_headed`/`row_width` direction.
+/// A narrower actual set fits a wider ascription — `{PutStr} ≤
+/// {PutStr, FsWrite}` is exactly set inclusion.
 #[test]
-fn subsumption_accepts_narrower_row() {
+fn subsumption_accepts_narrower_set() {
     let lang = canonical_lang();
     let ast = parse_block(
         &lang,
         &[
-            "f : (Str ~> Str) @ [Effects({ puts: Str ~> Str })] := s ~> s",
-            "wide : (Str ~> Str) @ [Effects({ puts: Str ~> Str, fs: Str ~> Str })] := f",
+            ALGEBRA_STUB,
+            "PutStr := new Algebra { op: Str ~> Str }",
+            "FsWrite := new Algebra { op: Str ~> Str }",
+            "f : (Str ~> Str) @ [PutStr] := s ~> s",
+            "wide : (Str ~> Str) @ [PutStr, FsWrite] := f",
         ],
     );
     let result = typecheck(&lang, ast);
     assert!(
         !has_error(&result),
-        "narrower row must fit wider ascription, got {:?}",
+        "narrower mode set must fit wider ascription, got {:?}",
         diags_of(&result)
     );
 }

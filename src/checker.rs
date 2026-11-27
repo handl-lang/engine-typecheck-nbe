@@ -245,10 +245,10 @@ pub struct Checker {
     /// until the algebra bridge lands (E2+).
     pub algebra_heads: HashSet<String>,
     /// Effect-declaration fields of `new Algebra` heads (PL-0004
-    /// G0): `op` signatures and `requires` implications, populated
+    /// G0/G1): `op` signatures and `requires` implications, populated
     /// by `synth_new_decl`'s `Algebra` arm. Heads absent here (or
-    /// with `op: None`) keep the transition behavior — `perform`
-    /// falls back to the `Effects` row / `IO` mint.
+    /// with `op: None`) keep the honest bound — `perform` mints the
+    /// legacy `IO{op:T}` codomain form.
     pub algebra_effects: HashMap<String, AlgebraEffectDecl>,
 }
 
@@ -1330,7 +1330,7 @@ impl Checker {
 
     /// Run the algebra's `compose` field over two payloads. The field
     /// is data: a string opcode naming a builtin operation
-    /// (`canonical`, `row_union`, `add`, `eq` — `lang.globals` is pure
+    /// (`canonical`, `add`, `eq` — `lang.globals` is pure
     /// JSON and cannot hold closures, so user algebras arrive as named
     /// ops until the instance machinery lands). Anything else is the
     /// honest bound (the model's `mode_apply_compose_`).
@@ -1341,7 +1341,6 @@ impl Checker {
             .and_then(|c| c.as_str());
         match op {
             Some("canonical") => self.mode_canonical_compose(a, b),
-            Some("row_union") => self.mode_rows_union(a, b),
             Some("add") => self
                 .mode_num_add(a, b)
                 .unwrap_or_else(|| self.mode_honest("`add` needs numeric modes")),
@@ -1383,18 +1382,18 @@ impl Checker {
         self.mode_honest("no canonical rule for these mode values")
     }
 
-    /// Record-row union with the effects entry-merge rule (PL-0004
-    /// E0; design/effects-ambient-modes.md §2): disjoint keys union;
-    /// a shared key keeps its entry iff the two entries *unify*
-    /// (`conv` — metas inside the entries solve as a side effect, a
-    /// decided failure rolls the store back); a decided conflict
-    /// degrades *that entry* to a fresh meta — the honest bound —
-    /// never a silent pick and never a whole-row bound that would
-    /// discard the disjoint ops. Non-record operands are the honest
-    /// bound.
+    /// Record-row union for the canonical default algebra (bare
+    /// record mode payloads — PL-0004 G1 retired the `Effects`-specific
+    /// `row_union`/`row_width` opcodes and the E0 entry-merge rule with
+    /// the row encoding): disjoint keys union; a shared key keeps its
+    /// entry iff the two entries are structurally equal — a decided
+    /// conflict degrades *that entry* to a fresh meta (the honest
+    /// bound), never a silent pick and never a whole-row bound that
+    /// would discard the disjoint keys. Non-record operands are the
+    /// honest bound.
     fn mode_rows_union(&mut self, a: &Val, b: &Val) -> Val {
-        // Clone the record maps out before merging — `mode_merge_entry`
-        // mutates the meta store, which the `force_head` borrows hold.
+        // Clone the record maps out before merging — the fresh-meta
+        // mint mutates the meta store the `force_head` borrows hold.
         let (x, y) = {
             let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
             match (fa, fb) {
@@ -1411,33 +1410,20 @@ impl Checker {
                     merged.insert(k.clone(), v.clone());
                 }
                 Some(w) if handl_value::eq(w, v) => {}
-                Some(w) => {
-                    let entry = self.mode_merge_entry(w, v);
-                    merged.insert(k.clone(), entry);
+                Some(_) => {
+                    self.mode_warnings.push(
+                        "mode compose: record rows conflict on a shared key — entry is a fresh meta"
+                            .into(),
+                    );
+                    let m = self.fresh_meta(Val::Universe(0));
+                    merged.insert(
+                        k.clone(),
+                        nbe::quote(&self.metas, self.lvl(), &self.meta_val(m)),
+                    );
                 }
             }
         }
         Val::Const(TaggedValue::Obj(Rc::new(merged)))
-    }
-
-    /// Merge one shared row entry (PL-0004 E0): `w ≡ v` under `conv`
-    /// keeps `w` (the left/actual entry — meta solutions made by the
-    /// check live in the store); a decided mismatch restores the meta
-    /// store and yields a fresh-meta entry — the per-entry honest
-    /// bound — with a warning recorded.
-    fn mode_merge_entry(&mut self, w: &TaggedValue, v: &TaggedValue) -> TaggedValue {
-        let lvl = self.lvl();
-        let (wa, wb) = (lift(lvl, w), lift(lvl, v));
-        let mark = self.store_mark();
-        if self.conv(&wa, &wb) {
-            return w.clone();
-        }
-        self.store_restore(mark);
-        self.mode_warnings.push(
-            "mode compose: record rows conflict on a shared key — entry is a fresh meta".into(),
-        );
-        let m = self.fresh_meta(Val::Universe(0));
-        nbe::quote(&self.metas, lvl, &self.meta_val(m))
     }
 
     /// `a + b` on literal numeric modes — `Int` stays `Int` when the
@@ -1667,7 +1653,7 @@ impl Checker {
     /// Run the algebra's `order` field over `(actual, expected)`
     /// payloads — the M3 counterpart of [`Checker::mode_apply_compose`].
     /// `order` is data: a string opcode naming a builtin operation
-    /// (`eq`, `row_width`); open modes (`Flex`/`Rigid`/`Unfold`) are
+    /// (`eq`); open modes (`Flex`/`Rigid`/`Unfold`) are
     /// undecidable by convention, and anything else — a Handl closure
     /// the `Val` domain cannot apply, a missing field — is the honest
     /// bound.
@@ -1694,7 +1680,6 @@ impl Checker {
                     ModeOrd::No
                 }
             }
-            Some("row_width") => self.mode_row_width(a, b),
             Some(other) => {
                 self.mode_warnings
                     .push(format!("mode order: unknown algebra order op `{other}`"));
@@ -1706,33 +1691,6 @@ impl Checker {
                 ModeOrd::Unknown
             }
         }
-    }
-
-    /// `row_width` order — the `mode.algebra.Effects` instance
-    /// (PL-0004 E0; effects-ambient-modes.md §2): record-row subsumption in the
-    /// `io_headed` direction — `actual ≤ expected` iff every key the
-    /// actual row names is present in the expected row with an equal
-    /// payload (the expected row supplies *at least* what the actual
-    /// consumes). Equal payloads pass; non-record operands fall back
-    /// to equality, anything else is the honest bound.
-    fn mode_row_width(&mut self, a: &Val, b: &Val) -> ModeOrd {
-        if self.mode_val_eq(a, b) {
-            return ModeOrd::Yes;
-        }
-        let (fa, fb) = (self.metas.force_head(a), self.metas.force_head(b));
-        if let (Val::Const(TaggedValue::Obj(x)), Val::Const(TaggedValue::Obj(y))) = (fa, fb) {
-            for (k, v) in x.iter() {
-                match y.get(k.as_ref()) {
-                    None => return ModeOrd::No,
-                    Some(w) if !handl_value::eq(v, w) => return ModeOrd::No,
-                    _ => {}
-                }
-            }
-            return ModeOrd::Yes;
-        }
-        self.mode_warnings
-            .push("mode order: `row_width` needs record modes".into());
-        ModeOrd::Unknown
     }
 
     /// `id_k(x)` — the identity cell at level `k` (ADR-0153 §2): the
@@ -2132,8 +2090,6 @@ fn lift_list(lvl: Lvl, tv: &TaggedValue) -> Vec<Val> {
 
 #[cfg(test)]
 mod tests {
-    use rustc_hash::FxHashMap;
-
     use super::*;
 
     fn number() -> Rc<Sym> {
@@ -2988,10 +2944,6 @@ mod tests {
         serde_json::json!({"compose": "canonical", "unit": null, "order": "eq"})
     }
 
-    fn alg_effects() -> serde_json::Value {
-        serde_json::json!({"compose": "row_union", "unit": {}, "order": "row_width"})
-    }
-
     #[test]
     fn mode_subsumption_eq_order() {
         let mut c = Checker::new();
@@ -3018,153 +2970,44 @@ mod tests {
         assert!(!c.subtype(&hp, &h3));
     }
 
+    /// PL-0004 G1 — the `Effects`-row opcodes are retired: a
+    /// `mode.algebra.*` record still naming `row_union`/`row_width`
+    /// (legacy `globals.yaml` data) takes the honest bound — unknown
+    /// op warning + undecided compose/order — never a silent row
+    /// merge or width check.
     #[test]
-    fn mode_subsumption_row_width() {
+    fn mode_retired_row_opcodes_honest_bound() {
         let mut c = Checker::new();
-        c.mode_algebras
-            .insert("mode.algebra.Effects".into(), alg_effects());
-        let row = |fields: serde_json::Value| {
-            let tv = TaggedValue::from(fields);
-            call_mode("Effects", Val::Const(tv.clone()))
-        };
-        let narrow = row(serde_json::json!({"io": "S"}));
-        let wide = row(serde_json::json!({"io": "S", "fs": "P"}));
-        let conflict = row(serde_json::json!({"io": "T"}));
-        let h_narrow = hom_mode1(&mut c, Some(narrow));
-        let h_wide = hom_mode1(&mut c, Some(wide));
-        let h_conflict = hom_mode1(&mut c, Some(conflict));
-        // `{io} ≤ {io, fs}` — the expected row supplies at least what
-        // the actual consumes (the `io_headed` direction).
-        assert!(c.subtype(&h_narrow, &h_wide));
-        // `{io, fs} ≰ {io}` — directed rejection even though the modes
-        // are *compatible* (conv accepts either direction).
-        assert!(c.conv(&h_wide, &h_narrow));
-        assert!(!c.subtype(&h_wide, &h_narrow));
-        // A shared-key conflict is decided `No` in both directions.
-        assert!(!c.conv(&h_narrow, &h_conflict));
-        assert!(!c.subtype(&h_narrow, &h_conflict));
-        // The empty row is the algebra `unit`: an ungraded cell
-        // satisfies an `Effects`-graded position — `order({}, S)`
-        // holds because `{} ⊆ S` under `row_width`.
-        let h_plain = hom_mode1(&mut c, None);
-        assert!(c.subtype(&h_plain, &h_wide));
-    }
-
-    /// Extract the record payload of an `Effects(…)` mode descriptor
-    /// minted by [`Checker::mode_compose_vals`] — `args[1]` of the
-    /// `type.mode` former.
-    fn composed_row(c: &Checker, m: &Val) -> Rc<FxHashMap<Rc<str>, TaggedValue>> {
-        let Val::Former { args, .. } = c.metas.force_head(m) else {
-            panic!("composite mode is a descriptor, got {}", c.show(m))
-        };
-        assert_eq!(args.len(), 3, "type.mode descriptor arity");
-        let Val::Const(TaggedValue::Obj(obj)) = c.metas.force_head(&args[1]) else {
-            panic!("composed payload is a record, got {}", c.show(&args[1]))
-        };
-        obj.clone()
-    }
-
-    /// PL-0004 E0 — the canonical `Effects` algebra end-to-end through
-    /// the mode machinery: `compose` = row union with the entry-merge
-    /// rule (`{puts} ⋄ {fs} = {puts, fs}`), `unit` = `{}`,
-    /// `order` = `row_width`.
-    #[test]
-    fn mode_compose_effects_row_union() {
-        let mut c = Checker::new();
-        c.mode_algebras
-            .insert("mode.algebra.Effects".into(), alg_effects());
-        c.mode_algebras
-            .insert("mode.algebra.default".into(), alg_default());
+        c.mode_algebras.insert(
+            "mode.algebra.Effects".into(),
+            serde_json::json!({"compose": "row_union", "unit": {}, "order": "row_width"}),
+        );
         let eff =
             |fields: serde_json::Value| call_mode("Effects", Val::Const(TaggedValue::from(fields)));
-        // Disjoint rows union — the E2 demo shape.
         let comp = c.mode_compose_vals(
             &eff(serde_json::json!({"puts": "P"})),
             &eff(serde_json::json!({"fs": "F"})),
         );
-        let row = composed_row(&c, &comp);
-        assert!(row.contains_key("puts") && row.contains_key("fs"));
-        assert!(!c.mode_warnings.iter().any(|w| w.contains("shared key")));
-
-        // Shared key, equal entries — kept, no warning.
-        let comp = c.mode_compose_vals(
-            &eff(serde_json::json!({"puts": "P", "fs": "F"})),
-            &eff(serde_json::json!({"puts": "P", "io": "I"})),
-        );
-        let row = composed_row(&c, &comp);
-        assert_eq!(row.len(), 3);
-        assert!(matches!(
-            row.get("puts"),
-            Some(TaggedValue::Str(s)) if s.as_ref() == "P"
-        ));
-        assert!(!c.mode_warnings.iter().any(|w| w.contains("shared key")));
-
-        // Shared key, decided conflict — *that entry* degrades to a
-        // fresh meta (the honest bound); the disjoint ops still union.
-        let comp = c.mode_compose_vals(
-            &eff(serde_json::json!({"puts": "P1", "fs": "F"})),
-            &eff(serde_json::json!({"puts": "P2", "io": "I"})),
-        );
-        let row = composed_row(&c, &comp);
-        assert_eq!(row.len(), 3, "fs/io union survives the conflict");
-        assert!(row.contains_key("fs") && row.contains_key("io"));
-        // The conflicted entry is a quoted fresh meta — the
-        // `{"__neutral__": {"head": "meta", …}}` encoding `lift`
-        // reads back as `Val::Flex`.
-        let Some(TaggedValue::Obj(entry)) = row.get("puts") else {
-            panic!(
-                "conflicted entry should be a meta object, got {:?}",
-                row.get("puts")
-            )
-        };
-        assert!(
-            entry.get("__neutral__").is_some(),
-            "conflicted entry is a fresh meta: {entry:?}"
-        );
         assert!(
             c.mode_warnings
                 .iter()
-                .any(|w| w.contains("conflict on a shared key")),
+                .any(|w| w.contains("unknown algebra compose op `row_union`")),
             "warnings: {:?}",
             c.mode_warnings
         );
-    }
-
-    /// The merge rule's unify arm: a shared entry that is an unsolved
-    /// mode meta *unifies* with the other side's entry — `conv`
-    /// solves the meta and the left entry is kept (no fresh-meta
-    /// bound, no warning).
-    #[test]
-    fn mode_compose_effects_entry_unifies() {
-        let mut c = Checker::new();
-        c.mode_algebras
-            .insert("mode.algebra.Effects".into(), alg_effects());
-        let lvl = c.lvl();
-        // A domain meta quoted into the row-entry encoding — `lift`
-        // reads `{"__neutral__": {"head": "meta", …}}` back as `Flex`.
-        let m = c.fresh_meta(Val::Universe(0));
-        let meta_entry = handl_value::tagged_to_value(&nbe::quote(&c.metas, lvl, &c.meta_val(m)));
-        let eff =
-            |fields: serde_json::Value| call_mode("Effects", Val::Const(TaggedValue::from(fields)));
-        let comp = c.mode_compose_vals(
-            &eff(serde_json::json!({"puts": meta_entry})),
-            &eff(serde_json::json!({"puts": "P"})),
-        );
-        composed_row(&c, &comp);
-        // The meta entry was kept and solved to `"P"` — no conflict
-        // warning fired.
+        // Order: `row_width` is unknown → `Unknown` → subsumption
+        // passes with a warning, never a decided row-width rejection.
+        let h_a = hom_mode1(&mut c, Some(eff(serde_json::json!({"io": "S"}))));
+        let h_b = hom_mode1(&mut c, Some(eff(serde_json::json!({"io": "S", "fs": "P"}))));
+        assert!(c.subtype(&h_a, &h_b));
         assert!(
-            !c.mode_warnings.iter().any(|w| w.contains("shared key")),
+            c.mode_warnings
+                .iter()
+                .any(|w| w.contains("unknown algebra order op `row_width`")),
             "warnings: {:?}",
             c.mode_warnings
         );
-        let mv = c.meta_val(m);
-        let solved = c.metas.force_head(&mv);
-        assert!(
-            matches!(solved, Val::Const(TaggedValue::Str(s)) if s.as_ref() == "P"),
-            "meta should be solved to the other entry, got {}",
-            c.show(solved)
-        );
+        let _ = comp;
     }
 
     #[test]
