@@ -5066,12 +5066,14 @@ impl NbeTypecheckEngine {
             // sort `Nat` a bare var resolves to in type position.
             if matches!(node.kind.as_str(), "call" | "index_app" | "dimension") {
                 let kids = children_of(node).cloned().unwrap_or_default();
+                // `var` and qualified `field-access` callees both name a
+                // head — `Nat.succ` resolves through the `F.c`
+                // `type.ctor_sig` binding `synth_data` registers.
                 let callee_name = kids
                     .first()
                     .and_then(Value::as_u64)
                     .and_then(|i| ast.get(AstRef::new(i as usize)))
-                    .filter(|n| n.kind == "var")
-                    .and_then(node_name);
+                    .and_then(|n| qualified_head_name(ast, n));
                 if let Some(cname) = callee_name {
                     // Ctor-telescope scope: a family-param callee means its
                     // `__fam_<name>` binding — and must never hit an outer
@@ -5101,6 +5103,20 @@ impl NbeTypecheckEngine {
             // is not an index term.
             if node.kind == "var"
                 && let Some(cname) = node_name(node)
+            {
+                let cname = fam_scoped(&cname, ctx);
+                if ctx
+                    .lookup(&cname)
+                    .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                {
+                    return Ok(var_term(&cname));
+                }
+            }
+            // The qualified spelling of the same case: `Nat.zero` in
+            // `Vec(Nat.zero, a)` is a `field-access` node naming the
+            // `F.c` ctor_sig — the index atom `var{F.c}`.
+            if matches!(node.kind.as_str(), "field-access" | "field_access")
+                && let Some(cname) = qualified_head_name(ast, node)
             {
                 let cname = fam_scoped(&cname, ctx);
                 if ctx
@@ -5166,15 +5182,32 @@ impl NbeTypecheckEngine {
                     .map(|n| self.node_to_index_term(_lang, ast, n, ctx))
                     .unwrap_or(Value::Null),
                 "value" | "lit" => node.payload.clone(),
+                // Qualified `F.c` naming a declared ctor (`Nat.zero`,
+                // `Maybe.nothing`) is the index atom `var{F.c}` — the
+                // qualified `type.ctor_sig` binding `synth_data`
+                // registers; `eval_index`'s `F.c` ctor_proj then reads
+                // it exactly like the bare spelling. A field-access
+                // that names no ctor stays `Null`, the pre-qualified
+                // reading.
+                "field-access" | "field_access" => qualified_head_name(ast, node)
+                    .map(|c| fam_scoped(&c, ctx))
+                    .filter(|c| {
+                        ctx.lookup(c)
+                            .is_some_and(|b| tag_of(b) == Some("type.ctor_sig"))
+                    })
+                    .map(|c| var_term(&c))
+                    .unwrap_or(Value::Null),
                 // `f(i⃗)`/`f<i⃗>` as an index term — an opaque `App` on the
                 // callee's `var` (constructor or results-bound function).
+                // A qualified `F.c(i⃗)` callee comes back dotted
+                // (`Nat.succ`); anything else keeps the bare-name read.
                 "call" | "index_app" | "dimension" => {
                     let kids = children_of(node).cloned().unwrap_or_default();
                     let callee = kids
                         .first()
                         .and_then(Value::as_u64)
                         .and_then(|i| ast.get(AstRef::new(i as usize)))
-                        .and_then(node_name)
+                        .and_then(|n| qualified_head_name(ast, n))
                         .map(|c| fam_scoped(&c, ctx))
                         .unwrap_or_default();
                     let args: Vec<Value> = kids
@@ -5532,29 +5565,34 @@ impl NbeTypecheckEngine {
             }
         }
         for s in &succ {
-            ctx.ctor_proj.insert(
-                (*s).to_string(),
-                CtorProj {
-                    arity: 1,
-                    template: bin_term(
-                        "binary.add",
-                        var_term(&format!("{CTOR_PROJ_HOLE}0")),
-                        Value::from(1),
-                    ),
-                },
-            );
+            let proj = CtorProj {
+                arity: 1,
+                template: bin_term(
+                    "binary.add",
+                    var_term(&format!("{CTOR_PROJ_HOLE}0")),
+                    Value::from(1),
+                ),
+            };
+            ctx.ctor_proj.insert((*s).to_string(), proj.clone());
+            // `Family.ctor` — the qualified spelling projects identically
+            // (`Nat.succ` ↦ `x + 1`), mirroring the `F.c` `type.ctor_sig`
+            // bindings `synth_data` registers.
+            if !name.is_empty() {
+                ctx.ctor_proj.insert(format!("{name}.{s}"), proj);
+            }
         }
         // The `0` projection only registers when the base is unique —
         // a `data Bool :: True | False` (two bare ctors, no successor)
         // must never equate `True ≡ False` at index level.
         if !succ.is_empty() && bare.len() == 1 {
-            ctx.ctor_proj.insert(
-                bare[0].to_string(),
-                CtorProj {
-                    arity: 0,
-                    template: Value::from(0),
-                },
-            );
+            let proj = CtorProj {
+                arity: 0,
+                template: Value::from(0),
+            };
+            ctx.ctor_proj.insert(bare[0].to_string(), proj.clone());
+            if !name.is_empty() {
+                ctx.ctor_proj.insert(format!("{name}.{}", bare[0]), proj);
+            }
         }
         let mut m = Map::new();
         Ok(make_tag(ctx, "type.unit", std::mem::take(&mut m)))
